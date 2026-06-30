@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -51,16 +52,18 @@ func AppendToolCallMessage(conversation *Conversation, callID string, name strin
 	})
 }
 
-func AppendToolResultMessage(conversation *Conversation, callID string, name string, status string, summary string, content string, errorCode string) {
+func AppendToolResultMessage(conversation *Conversation, callID string, name string, status string, summary string, content string, errorCode string, truncated bool, data json.RawMessage) {
 	appendToolMessage(conversation, Message{
-		Role:              RoleToolResult,
-		Content:           content,
-		ToolCallID:        callID,
-		ToolName:          name,
-		ToolResultContent: content,
-		ToolResultStatus:  status,
-		ToolResultSummary: summary,
-		ToolErrorCode:     errorCode,
+		Role:                RoleToolResult,
+		Content:             content,
+		ToolCallID:          callID,
+		ToolName:            name,
+		ToolResultContent:   content,
+		ToolResultStatus:    status,
+		ToolResultSummary:   summary,
+		ToolResultTruncated: truncated,
+		ToolResultData:      data,
+		ToolErrorCode:       errorCode,
 	})
 }
 

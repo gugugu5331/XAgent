@@ -31,11 +31,12 @@ const (
 )
 
 type StreamEvent struct {
-	Type     StreamEventType
-	Delta    string
-	Err      error
-	Usage    *Usage
-	ToolCall *tool.Call
+	Type      StreamEventType
+	Delta     string
+	Err       error
+	Usage     *Usage
+	ToolCall  *tool.Call
+	ToolCalls []tool.Call
 }
 
 type Provider interface {

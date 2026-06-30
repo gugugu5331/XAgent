@@ -1,6 +1,9 @@
 package conversation
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type MessageRole string
 
@@ -13,14 +16,16 @@ const (
 )
 
 type Message struct {
-	Role              MessageRole `json:"role"`
-	Content           string      `json:"content"`
-	CreatedAt         time.Time   `json:"created_at"`
-	ToolCallID        string      `json:"tool_call_id,omitempty"`
-	ToolName          string      `json:"tool_name,omitempty"`
-	RawToolArguments  string      `json:"raw_tool_arguments,omitempty"`
-	ToolResultContent string      `json:"tool_result_content,omitempty"`
-	ToolResultStatus  string      `json:"tool_result_status,omitempty"`
-	ToolResultSummary string      `json:"tool_result_summary,omitempty"`
-	ToolErrorCode     string      `json:"tool_error_code,omitempty"`
+	Role                MessageRole     `json:"role"`
+	Content             string          `json:"content"`
+	CreatedAt           time.Time       `json:"created_at"`
+	ToolCallID          string          `json:"tool_call_id,omitempty"`
+	ToolName            string          `json:"tool_name,omitempty"`
+	RawToolArguments    string          `json:"raw_tool_arguments,omitempty"`
+	ToolResultContent   string          `json:"tool_result_content,omitempty"`
+	ToolResultStatus    string          `json:"tool_result_status,omitempty"`
+	ToolResultSummary   string          `json:"tool_result_summary,omitempty"`
+	ToolResultTruncated bool            `json:"tool_result_truncated,omitempty"`
+	ToolResultData      json.RawMessage `json:"tool_result_data,omitempty"`
+	ToolErrorCode       string          `json:"tool_error_code,omitempty"`
 }

@@ -22,12 +22,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.confirmation != nil && m.confirmation.Confirmation != nil {
 				m.confirmation.Confirmation.Decision <- events.ToolConfirmationDecision{CallID: m.confirmation.Confirmation.CallID, Allowed: true}
 				m.confirmation = nil
+				m.status.WaitingConfirmation = false
 				return m, nil
 			}
 		case "n":
 			if m.confirmation != nil && m.confirmation.Confirmation != nil {
 				m.confirmation.Confirmation.Decision <- events.ToolConfirmationDecision{CallID: m.confirmation.Confirmation.CallID, Allowed: false}
 				m.confirmation = nil
+				m.status.WaitingConfirmation = false
 				return m, nil
 			}
 		case "enter":
@@ -66,6 +68,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetEnabled(false)
 			m.streaming = true
 			m.status.Streaming = true
+			m.status.WaitingConfirmation = false
 			m.status.Error = nil
 			return m, listen(events)
 		}
@@ -94,10 +97,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messages.UpsertTool(*eventMsg.event.Tool)
 			}
 			m.confirmation = &eventMsg.event
+			m.status.WaitingConfirmation = true
 		case EventDone:
 			m.messages.CommitAssistant()
 			m.streaming = false
 			m.status.Streaming = false
+			m.status.WaitingConfirmation = false
 			m.status.Duration = formatDuration(eventMsg.event.Duration)
 			m.input.SetEnabled(true)
 			m.confirmation = nil
@@ -105,6 +110,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case EventError:
 			m.streaming = false
 			m.status.Streaming = false
+			m.status.WaitingConfirmation = false
 			m.status.Error = eventMsg.event.Err
 			m.input.SetEnabled(true)
 			m.confirmation = nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"xagent/internal/config"
@@ -47,10 +46,10 @@ func TestOpenAIProviderParsesToolCallDeltas(t *testing.T) {
 	}
 }
 
-func TestOpenAIProviderRejectsMultipleToolCalls(t *testing.T) {
+func TestOpenAIProviderEmitsMultipleToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"Glob\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"Glob\",\"arguments\":\"{}\"}},{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()
@@ -60,13 +59,32 @@ func TestOpenAIProviderRejectsMultipleToolCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got string
+	var calls []tool.Call
 	for event := range stream {
-		if event.Type == StreamEventError && event.Err != nil {
-			got = event.Err.Error()
+		if event.Type == StreamEventToolCall {
+			calls = event.ToolCalls
+		}
+		if event.Type == StreamEventError {
+			t.Fatal(event.Err)
 		}
 	}
-	if !strings.Contains(got, tool.ErrMultipleToolCallsUnsupported) {
-		t.Fatalf("expected multiple tool call error, got %q", got)
+	if len(calls) != 2 {
+		t.Fatalf("expected two tool calls, got %#v", calls)
+	}
+	if calls[0].ID != "a" || calls[0].Name != "Read" || calls[1].ID != "b" || calls[1].Name != "Glob" {
+		t.Fatalf("unexpected calls: %#v", calls)
+	}
+}
+
+func TestAnthropicToolCallsAreSorted(t *testing.T) {
+	calls := anthropicToolCalls(map[int64]*anthropicToolCallState{
+		2: {ID: "b", Name: "Glob"},
+		1: {ID: "a", Name: "Read"},
+	})
+	if len(calls) != 2 {
+		t.Fatalf("expected two calls, got %#v", calls)
+	}
+	if calls[0].ID != "a" || calls[0].Name != "Read" || calls[1].ID != "b" || calls[1].Name != "Glob" {
+		t.Fatalf("unexpected calls: %#v", calls)
 	}
 }

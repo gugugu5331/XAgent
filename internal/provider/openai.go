@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"xagent/internal/config"
@@ -70,12 +71,8 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 		calls := map[int]*openAIToolCallState{}
 		for event := range ReadSSE(resp.Body) {
 			if event.Data == "[DONE]" {
-				if len(calls) > 1 {
-					out <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("%s", tool.ErrMultipleToolCallsUnsupported)}
-					return
-				}
-				for _, call := range calls {
-					out <- StreamEvent{Type: StreamEventToolCall, ToolCall: &tool.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments.String()}}
+				if len(calls) > 0 {
+					out <- newToolCallsEvent(openAIToolCalls(calls))
 					return
 				}
 				out <- StreamEvent{Type: StreamEventDone}
@@ -163,6 +160,32 @@ type openAIToolCallState struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+}
+
+func openAIToolCalls(calls map[int]*openAIToolCallState) []tool.Call {
+	indexes := make([]int, 0, len(calls))
+	for index := range calls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	toolCalls := make([]tool.Call, 0, len(indexes))
+	for _, index := range indexes {
+		call := calls[index]
+		if call == nil {
+			continue
+		}
+		toolCalls = append(toolCalls, tool.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments.String()})
+	}
+	return toolCalls
+}
+
+func newToolCallsEvent(toolCalls []tool.Call) StreamEvent {
+	event := StreamEvent{Type: StreamEventToolCall, ToolCalls: toolCalls}
+	if len(toolCalls) == 1 {
+		event.ToolCall = &event.ToolCalls[0]
+	}
+	return event
 }
 
 func openAITools(registry *tool.Registry) []tool.OpenAIDefinition {

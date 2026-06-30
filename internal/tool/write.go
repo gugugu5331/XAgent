@@ -44,6 +44,10 @@ func (t *WriteTool) Execute(ctx context.Context, input Input) Result {
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o700); err != nil {
 		return Failure(input, ErrNotFound, fmt.Sprintf("创建父目录失败: %v", err), true)
 	}
+	resolved, err = ResolveProjectPath(t.projectRoot, path)
+	if err != nil {
+		return Failure(input, errorCode(err), err.Error(), true)
+	}
 	if err := os.WriteFile(resolved, []byte(content), 0o600); err != nil {
 		return Failure(input, ErrNotFound, fmt.Sprintf("写入文件失败: %v", err), true)
 	}

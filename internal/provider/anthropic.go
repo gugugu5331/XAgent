@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -74,12 +74,8 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 					}
 				}
 			case anthropic.MessageStopEvent:
-				if len(toolCalls) > 1 {
-					out <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("%s", tool.ErrMultipleToolCallsUnsupported)}
-					return
-				}
-				for _, call := range toolCalls {
-					out <- StreamEvent{Type: StreamEventToolCall, ToolCall: &tool.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments.String()}}
+				if len(toolCalls) > 0 {
+					out <- newToolCallsEvent(anthropicToolCalls(toolCalls))
 					return
 				}
 				out <- StreamEvent{Type: StreamEventDone}
@@ -97,6 +93,24 @@ type anthropicToolCallState struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+}
+
+func anthropicToolCalls(calls map[int64]*anthropicToolCallState) []tool.Call {
+	indexes := make([]int64, 0, len(calls))
+	for index := range calls {
+		indexes = append(indexes, index)
+	}
+	sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+
+	toolCalls := make([]tool.Call, 0, len(indexes))
+	for _, index := range indexes {
+		call := calls[index]
+		if call == nil {
+			continue
+		}
+		toolCalls = append(toolCalls, tool.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments.String()})
+	}
+	return toolCalls
 }
 
 func reqModel(model string) string {

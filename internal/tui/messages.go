@@ -13,7 +13,6 @@ import (
 
 type MessagesView struct {
 	messages        []conversation.Message
-	tools           []events.ToolDisplay
 	assistantBuffer strings.Builder
 	thinkingBuffer  strings.Builder
 	showThinking    bool
@@ -25,7 +24,6 @@ func NewMessagesView(showThinking bool) MessagesView {
 
 func (v *MessagesView) SetMessages(messages []conversation.Message) {
 	v.messages = append([]conversation.Message(nil), messages...)
-	v.tools = nil
 }
 
 func (v *MessagesView) AppendUser(text string) {
@@ -45,16 +43,18 @@ func (v *MessagesView) AppendThinkingDelta(text string) {
 }
 
 func (v *MessagesView) UpsertTool(tool events.ToolDisplay) {
-	for index := range v.tools {
-		if v.tools[index].CallID == tool.CallID {
+	for index := range v.messages {
+		message := &v.messages[index]
+		if message.Role == conversation.RoleToolResult && message.ToolCallID == tool.CallID {
 			if strings.TrimSpace(tool.Arguments) == "" {
-				tool.Arguments = v.tools[index].Arguments
+				tool.Arguments = toolArgumentsForCall(v.messages, tool.CallID)
 			}
-			v.tools[index] = tool
+			applyToolDisplay(message, tool)
 			return
 		}
 	}
-	v.tools = append(v.tools, tool)
+	v.CommitAssistant()
+	v.messages = append(v.messages, toolResultMessage(tool))
 }
 
 func (v *MessagesView) CommitAssistant() {
@@ -79,10 +79,6 @@ func (v MessagesView) View() string {
 			continue
 		}
 		b.WriteString(renderMessage(message.Role, message.Content))
-		b.WriteString("\n\n")
-	}
-	for _, tool := range v.tools {
-		b.WriteString(renderToolDisplay(tool))
 		b.WriteString("\n\n")
 	}
 	if v.thinkingBuffer.Len() > 0 {
@@ -112,14 +108,37 @@ func renderMessage(role conversation.MessageRole, content string) string {
 
 func renderToolDisplay(tool events.ToolDisplay) string {
 	line := fmt.Sprintf("● %s(%s)", tool.Name, summarizeArguments(tool.Arguments))
+	status := toolStatusText(tool.Status)
 	if strings.TrimSpace(tool.Summary) != "" {
-		line += " — " + tool.Summary
+		status = tool.Summary
+	}
+	if strings.TrimSpace(status) != "" {
+		line += " — " + status
 	}
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	if tool.Status == events.ToolDisplayError || tool.Status == events.ToolDisplayDenied {
 		style = style.Foreground(lipgloss.Color("9"))
 	}
 	return style.Render(line)
+}
+
+func toolStatusText(status events.ToolDisplayStatus) string {
+	switch status {
+	case events.ToolDisplayPending:
+		return "准备执行"
+	case events.ToolDisplayWaitingConfirmation:
+		return "等待确认"
+	case events.ToolDisplayRunning:
+		return "执行中"
+	case events.ToolDisplaySuccess:
+		return "完成"
+	case events.ToolDisplayError:
+		return "失败"
+	case events.ToolDisplayDenied:
+		return "已拒绝"
+	default:
+		return ""
+	}
 }
 
 func summarizeArguments(raw string) string {
@@ -141,18 +160,68 @@ func summarizeArguments(raw string) string {
 	return text
 }
 
+func toolResultMessage(tool events.ToolDisplay) conversation.Message {
+	message := conversation.Message{Role: conversation.RoleToolResult, ToolCallID: tool.CallID, ToolName: tool.Name}
+	applyToolDisplay(&message, tool)
+	return message
+}
+
+func applyToolDisplay(message *conversation.Message, tool events.ToolDisplay) {
+	message.ToolName = tool.Name
+	message.ToolResultSummary = tool.Summary
+	message.ToolResultStatus = string(toolStatusResult(tool.Status))
+	message.RawToolArguments = tool.Arguments
+	message.Content = tool.Summary
+}
+
+func toolArgumentsForCall(messages []conversation.Message, callID string) string {
+	for _, message := range messages {
+		if message.ToolCallID == callID {
+			if strings.TrimSpace(message.RawToolArguments) != "" {
+				return message.RawToolArguments
+			}
+		}
+	}
+	return ""
+}
+
+func toolStatusResult(status events.ToolDisplayStatus) string {
+	switch status {
+	case events.ToolDisplaySuccess:
+		return "success"
+	case events.ToolDisplayError:
+		return "error"
+	case events.ToolDisplayDenied:
+		return "denied"
+	default:
+		return string(status)
+	}
+}
+
+func toolDisplayStatus(status string) events.ToolDisplayStatus {
+	switch status {
+	case "pending":
+		return events.ToolDisplayPending
+	case "waiting_confirmation":
+		return events.ToolDisplayWaitingConfirmation
+	case "running":
+		return events.ToolDisplayRunning
+	case "error":
+		return events.ToolDisplayError
+	case "denied":
+		return events.ToolDisplayDenied
+	default:
+		return events.ToolDisplaySuccess
+	}
+}
+
 func toolDisplayFromHistory(messages []conversation.Message, result conversation.Message) events.ToolDisplay {
 	display := events.ToolDisplay{
-		CallID:  result.ToolCallID,
-		Name:    result.ToolName,
-		Summary: result.ToolResultSummary,
-		Status:  events.ToolDisplaySuccess,
-	}
-	if result.ToolResultStatus != "success" {
-		display.Status = events.ToolDisplayError
-	}
-	if result.ToolResultStatus == "denied" {
-		display.Status = events.ToolDisplayDenied
+		CallID:    result.ToolCallID,
+		Name:      result.ToolName,
+		Arguments: result.RawToolArguments,
+		Summary:   result.ToolResultSummary,
+		Status:    toolDisplayStatus(result.ToolResultStatus),
 	}
 	for _, message := range messages {
 		if message.Role == conversation.RoleToolCall && message.ToolCallID == result.ToolCallID {

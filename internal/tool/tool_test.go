@@ -17,6 +17,97 @@ func TestResolveProjectPathRejectsOutsidePath(t *testing.T) {
 	}
 }
 
+func TestRelativeToRootUsesResolvedRootSymlink(t *testing.T) {
+	realRoot := t.TempDir()
+	linkParent := t.TempDir()
+	linkRoot := filepath.Join(linkParent, "root-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	file := filepath.Join(realRoot, "file.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := ResolveProjectPath(linkRoot, "file.txt")
+	if err != nil {
+		t.Fatalf("resolve via root symlink failed: %v", err)
+	}
+	realFile, err := filepath.EvalSymlinks(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != realFile {
+		t.Fatalf("expected resolved real file %q, got %q", realFile, resolved)
+	}
+	if rel := RelativeToRoot(linkRoot, resolved); rel != "file.txt" {
+		t.Fatalf("expected relative path through resolved root, got %q", rel)
+	}
+}
+
+func TestSymlinkEscapesAreRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("outside secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	insideFile := filepath.Join(root, "inside.txt")
+	if err := os.WriteFile(insideFile, []byte("inside content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(root, "secret-link.txt")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "outside-dir")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, time.Second, 1024)
+
+	read := executor.Execute(context.Background(), Call{ID: "read", Name: "Read", ArgumentsJSON: `{"path":"secret-link.txt"}`})
+	if read.Status != StatusError || read.Error.Code != ErrPathOutsideProject {
+		t.Fatalf("expected read to reject outside symlink, got %#v", read)
+	}
+
+	edit := executor.Execute(context.Background(), Call{ID: "edit", Name: "Edit", ArgumentsJSON: `{"path":"secret-link.txt","old_text":"outside","new_text":"changed"}`})
+	if edit.Status != StatusError || edit.Error.Code != ErrPathOutsideProject {
+		t.Fatalf("expected edit to reject outside symlink, got %#v", edit)
+	}
+	outsideData, err := os.ReadFile(outsideFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(outsideData) != "outside secret" {
+		t.Fatalf("outside file was modified through symlink: %q", outsideData)
+	}
+
+	grep := executor.Execute(context.Background(), Call{ID: "grep", Name: "Grep", ArgumentsJSON: `{"pattern":"outside secret","path":"."}`})
+	if grep.Status != StatusError || grep.Error.Code != ErrNoResults || strings.Contains(grep.Content, "outside secret") {
+		t.Fatalf("expected grep to skip outside symlink content, got %#v", grep)
+	}
+
+	write := executor.Execute(context.Background(), Call{ID: "write", Name: "Write", ArgumentsJSON: `{"path":"outside-dir/new/file.txt","content":"escaped"}`})
+	if write.Status != StatusError || write.Error.Code != ErrPathOutsideProject {
+		t.Fatalf("expected write to reject outside symlink directory, got %#v", write)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "new", "file.txt")); !os.IsNotExist(err) {
+		t.Fatalf("write created file outside project, stat err: %v", err)
+	}
+
+	glob := executor.Execute(context.Background(), Call{ID: "glob", Name: "Glob", ArgumentsJSON: `{"pattern":"*.txt"}`})
+	if glob.Status != StatusSuccess {
+		t.Fatalf("glob failed: %#v", glob)
+	}
+	if strings.Contains(glob.Content, "secret-link.txt") || strings.Contains(glob.Content, "secret.txt") {
+		t.Fatalf("glob returned escaping symlink path: %#v", glob)
+	}
+	if !strings.Contains(glob.Content, "inside.txt") {
+		t.Fatalf("glob should still return safe in-project file: %#v", glob)
+	}
+}
+
 func TestRegistryRejectsDuplicateTool(t *testing.T) {
 	root := t.TempDir()
 	registry, err := NewRegistry(root)

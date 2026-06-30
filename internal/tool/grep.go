@@ -81,7 +81,11 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 }
 
 func grepFile(path string, projectRoot string, pattern string, re *regexp.Regexp, useRegex bool, matches *[]string) error {
-	file, err := os.Open(path)
+	resolved, err := ResolveProjectPath(projectRoot, path)
+	if err != nil {
+		return nil
+	}
+	file, err := os.Open(resolved)
 	if err != nil {
 		return nil
 	}
@@ -96,7 +100,7 @@ func grepFile(path string, projectRoot string, pattern string, re *regexp.Regexp
 			matched = re.MatchString(line)
 		}
 		if matched {
-			rel := RelativeToRoot(projectRoot, path)
+			rel := RelativeToRoot(projectRoot, resolved)
 			*matches = append(*matches, fmt.Sprintf("%s:%d:%s", rel, lineNumber, strings.TrimSpace(line)))
 			if len(*matches) >= 200 {
 				return nil

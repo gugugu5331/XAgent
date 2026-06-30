@@ -9,16 +9,19 @@ import (
 )
 
 type Status struct {
-	Provider  string
-	Model     string
-	Streaming bool
-	Duration  time.Duration
-	Error     error
+	Provider            string
+	Model               string
+	Streaming           bool
+	WaitingConfirmation bool
+	Duration            time.Duration
+	Error               error
 }
 
 func (s Status) View() string {
 	parts := []string{fmt.Sprintf("Provider: %s", s.Provider), fmt.Sprintf("Model: %s", s.Model)}
-	if s.Streaming {
+	if s.WaitingConfirmation {
+		parts = append(parts, "等待工具确认")
+	} else if s.Streaming {
 		parts = append(parts, "正在响应...")
 	}
 	if s.Duration > 0 {
