@@ -1,0 +1,14 @@
+llm:
+  protocol: anthropic
+  model: claude-opus-4-7
+  base_url: https://api.anthropic.com
+  api_key: your-api-key
+  thinking:
+    enabled: true
+    show: false
+    budget_tokens: 4096
+ui:
+  show_response_timer: true
+  start_mode: list
+storage:
+  data_dir: .xagent/conversations

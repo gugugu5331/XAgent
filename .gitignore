@@ -1,0 +1,5 @@
+config.yaml
+.xagent/
+xagent
+.claude/settings.local.json
+.DS_Store

@@ -1,0 +1,14 @@
+llm:
+  protocol: openai
+  model: mock-model
+  base_url: http://127.0.0.1:18080
+  api_key: test-key
+  thinking:
+    enabled: false
+    show: false
+    budget_tokens: 4096
+ui:
+  show_response_timer: true
+  start_mode: new
+storage:
+  data_dir: .xagent/test-conversations
