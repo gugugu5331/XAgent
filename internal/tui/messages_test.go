@@ -92,3 +92,15 @@ func TestStatusShowsCacheUsageOnlyWhenPresent(t *testing.T) {
 		t.Fatalf("cache segment missing: %q", withCache)
 	}
 }
+
+func TestMessagesViewCanAppendAfterValueCopy(t *testing.T) {
+	view := NewMessagesView(true)
+	view.AppendAssistantDelta("hello")
+	copied := view
+	copied.AppendAssistantDelta(" world")
+	copied.AppendThinkingDelta("thinking")
+	output := copied.View()
+	if !strings.Contains(output, "hello world") || !strings.Contains(output, "thinking") {
+		t.Fatalf("unexpected copied view output: %q", output)
+	}
+}

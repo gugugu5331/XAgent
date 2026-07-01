@@ -13,8 +13,8 @@ import (
 
 type MessagesView struct {
 	messages        []conversation.Message
-	assistantBuffer strings.Builder
-	thinkingBuffer  strings.Builder
+	assistantBuffer string
+	thinkingBuffer  string
 	showThinking    bool
 }
 
@@ -28,17 +28,17 @@ func (v *MessagesView) SetMessages(messages []conversation.Message) {
 
 func (v *MessagesView) AppendUser(text string) {
 	v.messages = append(v.messages, conversation.Message{Role: conversation.RoleUser, Content: text})
-	v.assistantBuffer.Reset()
-	v.thinkingBuffer.Reset()
+	v.assistantBuffer = ""
+	v.thinkingBuffer = ""
 }
 
 func (v *MessagesView) AppendAssistantDelta(text string) {
-	v.assistantBuffer.WriteString(text)
+	v.assistantBuffer += text
 }
 
 func (v *MessagesView) AppendThinkingDelta(text string) {
 	if v.showThinking {
-		v.thinkingBuffer.WriteString(text)
+		v.thinkingBuffer += text
 	}
 }
 
@@ -58,14 +58,14 @@ func (v *MessagesView) UpsertTool(tool events.ToolDisplay) {
 }
 
 func (v *MessagesView) CommitAssistant() {
-	if v.thinkingBuffer.Len() > 0 {
-		v.messages = append(v.messages, conversation.Message{Role: conversation.RoleThinking, Content: v.thinkingBuffer.String()})
+	if v.thinkingBuffer != "" {
+		v.messages = append(v.messages, conversation.Message{Role: conversation.RoleThinking, Content: v.thinkingBuffer})
 	}
-	if v.assistantBuffer.Len() > 0 {
-		v.messages = append(v.messages, conversation.Message{Role: conversation.RoleAssistant, Content: v.assistantBuffer.String()})
+	if v.assistantBuffer != "" {
+		v.messages = append(v.messages, conversation.Message{Role: conversation.RoleAssistant, Content: v.assistantBuffer})
 	}
-	v.assistantBuffer.Reset()
-	v.thinkingBuffer.Reset()
+	v.assistantBuffer = ""
+	v.thinkingBuffer = ""
 }
 
 func (v MessagesView) View() string {
@@ -81,12 +81,12 @@ func (v MessagesView) View() string {
 		b.WriteString(renderMessage(message.Role, message.Content))
 		b.WriteString("\n\n")
 	}
-	if v.thinkingBuffer.Len() > 0 {
-		b.WriteString(renderMessage(conversation.RoleThinking, v.thinkingBuffer.String()))
+	if v.thinkingBuffer != "" {
+		b.WriteString(renderMessage(conversation.RoleThinking, v.thinkingBuffer))
 		b.WriteString("\n\n")
 	}
-	if v.assistantBuffer.Len() > 0 {
-		b.WriteString(renderMessage(conversation.RoleAssistant, v.assistantBuffer.String()))
+	if v.assistantBuffer != "" {
+		b.WriteString(renderMessage(conversation.RoleAssistant, v.assistantBuffer))
 		b.WriteString("\n\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
