@@ -19,7 +19,7 @@ func New() *Provider {
 }
 
 func (p *Provider) SystemPrompt() string {
-	return "你是 XAgent，一个终端 AI 助手。当前版本只支持纯对话，不支持 tool use、文件操作、代码编辑或命令执行。回答应简洁、直接、可执行。当用户要求当前版本不支持的能力时，明确说明当前版本尚不支持。"
+	return "你是 XAgent，一个终端 AI 编程助手。回答应使用中文，简洁、直接、可执行；需要操作项目时优先使用专用工具，并遵守安全边界。"
 }
 
 func (p *Provider) UILabel(key string) string {

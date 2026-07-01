@@ -10,18 +10,20 @@ import (
 	"xagent/internal/config"
 	"xagent/internal/conversation"
 	"xagent/internal/events"
+	"xagent/internal/prompt"
 	"xagent/internal/provider"
 	"xagent/internal/resources"
 	"xagent/internal/tool"
 )
 
 type Orchestrator struct {
-	provider  provider.Provider
-	store     conversation.ConversationStore
-	resources resources.PromptProvider
-	thinking  config.ThinkingConfig
-	registry  *tool.Registry
-	executor  *tool.Executor
+	provider         provider.Provider
+	store            conversation.ConversationStore
+	resources        resources.PromptProvider
+	thinking         config.ThinkingConfig
+	registry         *tool.Registry
+	readOnlyRegistry *tool.Registry
+	executor         *tool.Executor
 }
 
 func New(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
@@ -29,42 +31,81 @@ func New(provider provider.Provider, store conversation.ConversationStore, resou
 }
 
 func NewWithTools(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig, registry *tool.Registry, executor *tool.Executor) *Orchestrator {
-	return &Orchestrator{provider: provider, store: store, resources: resources, thinking: thinking, registry: registry, executor: executor}
+	var readOnlyRegistry *tool.Registry
+	if executor != nil {
+		readOnlyRegistry, _ = tool.NewReadOnlyRegistry(executor.ProjectRoot)
+	}
+	return &Orchestrator{provider: provider, store: store, resources: resources, thinking: thinking, registry: registry, readOnlyRegistry: readOnlyRegistry, executor: executor}
 }
 
 func (o *Orchestrator) Send(ctx context.Context, conv *conversation.Conversation, userText string) (<-chan events.Event, error) {
-	if strings.TrimSpace(userText) == "" {
-		return nil, fmt.Errorf("请输入非空内容")
-	}
-	out := make(chan events.Event)
-	conversation.AppendUserMessage(conv, userText)
-
-	stream, err := o.stream(ctx, conv, true)
+	req, err := parseRunRequest(userText)
 	if err != nil {
 		return nil, err
 	}
+	out := make(chan events.Event)
+	conversation.AppendUserMessage(conv, req.UserText)
 
 	go func() {
 		defer close(out)
 		start := time.Now()
-		out <- events.Event{Type: events.UserSubmitted, Text: userText}
-		if o.consumeStream(ctx, conv, out, stream, start, true) {
-			return
-		}
+		out <- events.Event{Type: events.UserSubmitted, Text: req.UserText}
+		o.runAgentLoop(ctx, conv, req, out, start)
 	}()
 	return out, nil
 }
 
-func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, includeTools bool) (<-chan provider.StreamEvent, error) {
+func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, mode RunMode, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
+	bundle := prompt.Build(prompt.BuildRequest{Mode: promptRunMode(mode), Iteration: iteration, ProjectRoot: o.projectRoot()})
 	request := provider.ChatRequest{
-		SystemPrompt: o.resources.SystemPrompt(),
-		Messages:     conversation.ContextMessages(conv),
-		Thinking:     o.thinking,
+		StableSystem:  providerStableBlocks(bundle.StableBlocks),
+		DynamicSystem: providerDynamicBlocks(bundle.DynamicBlocks),
+		Messages:      conversation.ContextMessages(conv),
+		Thinking:      o.thinking,
+		Cache:         provider.CachePolicy{EnablePromptCache: true},
 	}
 	if includeTools {
-		request.ToolDefs = o.registry
+		registry, err := o.registryForMode(mode)
+		if err != nil {
+			return nil, err
+		}
+		request.Tools = toolDefinitionsFromRegistry(registry)
 	}
 	return o.provider.StreamChat(ctx, request)
+}
+
+func (o *Orchestrator) projectRoot() string {
+	if o.executor == nil {
+		return ""
+	}
+	return o.executor.ProjectRoot
+}
+
+func promptRunMode(mode RunMode) prompt.RunMode {
+	switch mode {
+	case RunModePlan:
+		return prompt.RunModePlan
+	case RunModeDo:
+		return prompt.RunModeDo
+	default:
+		return prompt.RunModeDefault
+	}
+}
+
+func providerStableBlocks(blocks []prompt.Block) []provider.SystemBlock {
+	result := make([]provider.SystemBlock, 0, len(blocks))
+	for _, block := range blocks {
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: true})
+	}
+	return result
+}
+
+func providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
+	result := make([]provider.SystemBlock, 0, len(blocks))
+	for _, block := range blocks {
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: false})
+	}
+	return result
 }
 
 func (o *Orchestrator) consumeStream(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, stream <-chan provider.StreamEvent, start time.Time, allowTool bool) bool {
@@ -159,7 +200,7 @@ func (o *Orchestrator) handleToolCall(ctx context.Context, conv *conversation.Co
 }
 
 func (o *Orchestrator) finalReply(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, start time.Time) bool {
-	stream, err := o.stream(ctx, conv, false)
+	stream, err := o.stream(ctx, conv, RunModeDefault, false, 1)
 	if err != nil {
 		out <- events.Event{Type: events.Error, Err: err}
 		return true

@@ -62,8 +62,33 @@ func TestMessagesViewRendersPendingToolAsPending(t *testing.T) {
 	}
 }
 func TestStatusShowsWaitingConfirmation(t *testing.T) {
-	output := Status{Provider: "fake", Model: "test", Streaming: true, WaitingConfirmation: true}.View()
-	if !strings.Contains(output, "等待工具确认") || strings.Contains(output, "正在响应") {
+	output := Status{Provider: "fake", Model: "test", Streaming: true, WaitingConfirmation: true, AgentIteration: 3, AgentMaxIterations: 10}.View()
+	if !strings.Contains(output, "等待工具确认") || strings.Contains(output, "第 3/10 轮") {
 		t.Fatalf("unexpected status: %q", output)
+	}
+}
+
+func TestStatusShowsAgentProgress(t *testing.T) {
+	output := Status{Provider: "fake", Model: "test", Streaming: true, AgentIteration: 3, AgentMaxIterations: 10}.View()
+	if !strings.Contains(output, "第 3/10 轮") {
+		t.Fatalf("unexpected status: %q", output)
+	}
+}
+
+func TestStatusShowsStopReasonAndUsage(t *testing.T) {
+	output := Status{Provider: "fake", Model: "test", StopReason: "max_iterations", InputTokens: 12, OutputTokens: 34}.View()
+	if !strings.Contains(output, "达到迭代上限") || !strings.Contains(output, "Tokens: 12 in / 34 out") {
+		t.Fatalf("unexpected status: %q", output)
+	}
+}
+
+func TestStatusShowsCacheUsageOnlyWhenPresent(t *testing.T) {
+	withoutCache := Status{Provider: "fake", Model: "test", InputTokens: 12, OutputTokens: 34}.View()
+	if strings.Contains(withoutCache, "Cache:") {
+		t.Fatalf("cache segment should be hidden when zero: %q", withoutCache)
+	}
+	withCache := Status{Provider: "fake", Model: "test", CacheCreationInputTokens: 56, CacheReadInputTokens: 78}.View()
+	if !strings.Contains(withCache, "Cache: 56 create / 78 read") {
+		t.Fatalf("cache segment missing: %q", withCache)
 	}
 }

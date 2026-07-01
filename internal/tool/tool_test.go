@@ -108,6 +108,26 @@ func TestSymlinkEscapesAreRejected(t *testing.T) {
 	}
 }
 
+func TestReadOnlyRegistryContainsOnlyReadTools(t *testing.T) {
+	registry, err := NewReadOnlyRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Read", "Glob", "Grep"} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("expected read-only registry to contain %s", name)
+		}
+	}
+	for _, name := range []string{"Write", "Edit", "Bash"} {
+		if _, ok := registry.Get(name); ok {
+			t.Fatalf("read-only registry should not contain %s", name)
+		}
+	}
+	if len(registry.AnthropicDefinitions()) != 3 || len(registry.OpenAIDefinitions()) != 3 {
+		t.Fatalf("expected three read-only tool definitions")
+	}
+}
+
 func TestRegistryRejectsDuplicateTool(t *testing.T) {
 	root := t.TempDir()
 	registry, err := NewRegistry(root)
@@ -214,5 +234,37 @@ func TestExecutorTruncatesOutput(t *testing.T) {
 	read := executor.Execute(context.Background(), Call{ID: "2", Name: "Read", ArgumentsJSON: `{"path":"long.txt"}`})
 	if !read.Truncated {
 		t.Fatalf("expected truncated read, got %#v", read)
+	}
+}
+
+func TestToolDescriptionsReinforcePromptRules(t *testing.T) {
+	registry, err := NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string][]string{
+		"Read":  {"dedicated tool", "editing", "project"},
+		"Write": {"Read", "project"},
+		"Edit":  {"Read", "project"},
+		"Bash":  {"Prefer dedicated tools", "not sandboxed", "cautiously"},
+		"Glob":  {"dedicated tool", "project"},
+		"Grep":  {"dedicated tool", "editing", "project"},
+	}
+	for name, wants := range checks {
+		tool, ok := registry.Get(name)
+		if !ok {
+			t.Fatalf("missing tool %s", name)
+		}
+		description := tool.Description()
+		for _, want := range wants {
+			if !strings.Contains(description, want) {
+				t.Fatalf("%s description missing %q: %s", name, want, description)
+			}
+		}
+		for _, forbidden := range []string{"bypass confirmation", "skip confirmation", "destructive"} {
+			if strings.Contains(description, forbidden) {
+				t.Fatalf("%s description contains unsafe phrase %q: %s", name, forbidden, description)
+			}
+		}
 	}
 }

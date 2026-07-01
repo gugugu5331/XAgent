@@ -18,7 +18,7 @@ func NewEditTool(projectRoot string) Tool {
 func (t *EditTool) Name() string { return "Edit" }
 
 func (t *EditTool) Description() string {
-	return "Replace one unique text occurrence in a project file."
+	return "Replace one unique text occurrence in a project file. Read the file first so old_text matches exactly; paths must stay within the project."
 }
 
 func (t *EditTool) Risk() Risk { return RiskDangerous }

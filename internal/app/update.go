@@ -69,6 +69,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streaming = true
 			m.status.Streaming = true
 			m.status.WaitingConfirmation = false
+			m.status.AgentIteration = 0
+			m.status.AgentMaxIterations = 0
+			m.status.StopReason = ""
+			m.status.StopMessage = ""
+			m.status.InputTokens = 0
+			m.status.OutputTokens = 0
+			m.status.CacheCreationInputTokens = 0
+			m.status.CacheReadInputTokens = 0
 			m.status.Error = nil
 			return m, listen(events)
 		}
@@ -98,6 +106,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.confirmation = &eventMsg.event
 			m.status.WaitingConfirmation = true
+		case EventAgentProgress:
+			if eventMsg.event.Progress != nil {
+				m.status.AgentIteration = eventMsg.event.Progress.Iteration
+				m.status.AgentMaxIterations = eventMsg.event.Progress.Max
+				m.status.StopReason = eventMsg.event.Progress.StopReason
+				m.status.StopMessage = eventMsg.event.Progress.Message
+			}
+		case EventUsageUpdated:
+			if eventMsg.event.Usage != nil {
+				m.status.InputTokens += eventMsg.event.Usage.InputTokens
+				m.status.OutputTokens += eventMsg.event.Usage.OutputTokens
+				m.status.CacheCreationInputTokens += eventMsg.event.Usage.CacheCreationInputTokens
+				m.status.CacheReadInputTokens += eventMsg.event.Usage.CacheReadInputTokens
+			}
 		case EventDone:
 			m.messages.CommitAssistant()
 			m.streaming = false
@@ -108,6 +130,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmation = nil
 			return m, nil
 		case EventError:
+			m.messages.CommitAssistant()
 			m.streaming = false
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false

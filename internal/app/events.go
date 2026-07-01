@@ -16,6 +16,8 @@ const (
 	EventToolSuccess             = events.ToolSuccess
 	EventToolError               = events.ToolError
 	EventToolDenied              = events.ToolDenied
+	EventAgentProgress           = events.AgentProgressed
+	EventUsageUpdated            = events.UsageUpdated
 	EventDone                    = events.Done
 	EventError                   = events.Error
 )

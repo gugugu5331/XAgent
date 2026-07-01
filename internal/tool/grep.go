@@ -21,7 +21,7 @@ func NewGrepTool(projectRoot string) Tool {
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {
-	return "Search text content in project files by plain text or regular expression."
+	return "Search text content in project files by plain text or regular expression. Use this dedicated tool to inspect project content before editing; searched paths must stay within the project."
 }
 
 func (t *GrepTool) Risk() Risk { return RiskSafe }

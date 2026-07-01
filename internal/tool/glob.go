@@ -17,7 +17,9 @@ func NewGlobTool(projectRoot string) Tool {
 
 func (t *GlobTool) Name() string { return "Glob" }
 
-func (t *GlobTool) Description() string { return "Find project files matching a glob pattern." }
+func (t *GlobTool) Description() string {
+	return "Find project files matching a glob pattern. Use this dedicated tool to discover project paths before reading or editing; matches must stay within the project."
+}
 
 func (t *GlobTool) Risk() Risk { return RiskSafe }
 

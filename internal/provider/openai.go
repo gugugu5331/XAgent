@@ -34,10 +34,11 @@ func (p *OpenAIProvider) Name() string {
 func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
 	out := make(chan StreamEvent)
 	body, err := json.Marshal(openAIRequest{
-		Model:    p.cfg.Model,
-		Stream:   true,
-		Messages: toOpenAIMessages(req),
-		Tools:    openAITools(req.ToolDefs),
+		Model:         p.cfg.Model,
+		Stream:        true,
+		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
+		Messages:      toOpenAIMessages(req),
+		Tools:         openAITools(req),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("构造 OpenAI 请求失败: %w", err)
@@ -83,6 +84,9 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 				out <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("解析 OpenAI 流式响应失败: %w", err)}
 				return
 			}
+			if chunk.Usage != nil {
+				out <- StreamEvent{Type: StreamEventUsage, Usage: &Usage{InputTokens: int64(chunk.Usage.PromptTokens), OutputTokens: int64(chunk.Usage.CompletionTokens)}}
+			}
 			for _, choice := range chunk.Choices {
 				if choice.Delta.Content != "" {
 					out <- StreamEvent{Type: StreamEventTextDelta, Delta: choice.Delta.Content}
@@ -114,10 +118,15 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 }
 
 type openAIRequest struct {
-	Model    string                  `json:"model"`
-	Stream   bool                    `json:"stream"`
-	Messages []openAIMessage         `json:"messages"`
-	Tools    []tool.OpenAIDefinition `json:"tools,omitempty"`
+	Model         string                  `json:"model"`
+	Stream        bool                    `json:"stream"`
+	StreamOptions *openAIStreamOptions    `json:"stream_options,omitempty"`
+	Messages      []openAIMessage         `json:"messages"`
+	Tools         []tool.OpenAIDefinition `json:"tools,omitempty"`
+}
+
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openAIMessage struct {
@@ -154,6 +163,10 @@ type openAIChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
 type openAIToolCallState struct {
@@ -188,17 +201,26 @@ func newToolCallsEvent(toolCalls []tool.Call) StreamEvent {
 	return event
 }
 
-func openAITools(registry *tool.Registry) []tool.OpenAIDefinition {
-	if registry == nil {
+func openAITools(req ChatRequest) []tool.OpenAIDefinition {
+	definitions := toolDefinitions(req)
+	if len(definitions) == 0 {
 		return nil
 	}
-	return registry.OpenAIDefinitions()
+	tools := make([]tool.OpenAIDefinition, 0, len(definitions))
+	for _, definition := range definitions {
+		tools = append(tools, tool.OpenAIDefinition{
+			Type:     "function",
+			Function: tool.OpenAIFunction{Name: definition.Name, Description: definition.Description, Parameters: definition.Schema},
+		})
+	}
+	return tools
 }
 
 func toOpenAIMessages(req ChatRequest) []openAIMessage {
 	messages := make([]openAIMessage, 0, len(req.Messages)+1)
-	if strings.TrimSpace(req.SystemPrompt) != "" {
-		messages = append(messages, openAIMessage{Role: "system", Content: req.SystemPrompt})
+	system := joinedSystemBlocks(req)
+	if system != "" {
+		messages = append(messages, openAIMessage{Role: "system", Content: system})
 	}
 	for _, message := range req.Messages {
 		switch message.Role {

@@ -16,7 +16,9 @@ func NewReadTool(projectRoot string) Tool {
 
 func (t *ReadTool) Name() string { return "Read" }
 
-func (t *ReadTool) Description() string { return "Read a text file inside the project." }
+func (t *ReadTool) Description() string {
+	return "Read a text file inside the project. Use this dedicated tool before editing or when the user asks to inspect file content; paths must stay within the project."
+}
 
 func (t *ReadTool) Risk() Risk { return RiskSafe }
 

@@ -14,6 +14,8 @@ const (
 	ToolSuccess             Type = "tool_success"
 	ToolError               Type = "tool_error"
 	ToolDenied              Type = "tool_denied"
+	AgentProgressed         Type = "agent_progress"
+	UsageUpdated            Type = "usage_updated"
 	Done                    Type = "done"
 	Error                   Type = "error"
 )
@@ -50,6 +52,20 @@ type ToolConfirmationDecision struct {
 	Allowed bool
 }
 
+type AgentProgress struct {
+	Iteration  int
+	Max        int
+	StopReason string
+	Message    string
+}
+
+type UsageDisplay struct {
+	InputTokens              int64
+	OutputTokens             int64
+	CacheCreationInputTokens int64
+	CacheReadInputTokens     int64
+}
+
 type Event struct {
 	Type         Type
 	Text         string
@@ -57,4 +73,6 @@ type Event struct {
 	Err          error
 	Tool         *ToolDisplay
 	Confirmation *ToolConfirmationRequest
+	Progress     *AgentProgress
+	Usage        *UsageDisplay
 }

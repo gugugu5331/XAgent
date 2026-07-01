@@ -38,10 +38,8 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 		Model:     anthropic.Model(reqModel(p.cfg.Model)),
 		MaxTokens: 64000,
 		Messages:  toAnthropicMessages(req.Messages),
-		Tools:     toAnthropicTools(req.ToolDefs),
-	}
-	if req.SystemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{{Text: req.SystemPrompt}}
+		Tools:     toAnthropicTools(req),
+		System:    toAnthropicSystemBlocks(req),
 	}
 	if req.Thinking.Enabled {
 		adaptive := anthropic.ThinkingConfigAdaptiveParam{}
@@ -73,6 +71,13 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 						state.Arguments.WriteString(delta.PartialJSON)
 					}
 				}
+			case anthropic.MessageDeltaEvent:
+				out <- StreamEvent{Type: StreamEventUsage, Usage: &Usage{
+					InputTokens:              value.Usage.InputTokens,
+					OutputTokens:             value.Usage.OutputTokens,
+					CacheCreationInputTokens: value.Usage.CacheCreationInputTokens,
+					CacheReadInputTokens:     value.Usage.CacheReadInputTokens,
+				}}
 			case anthropic.MessageStopEvent:
 				if len(toolCalls) > 0 {
 					out <- newToolCallsEvent(anthropicToolCalls(toolCalls))
@@ -142,22 +147,46 @@ func toAnthropicMessages(messages []conversation.Message) []anthropic.MessagePar
 	return result
 }
 
-func toAnthropicTools(registry *tool.Registry) []anthropic.ToolUnionParam {
-	if registry == nil {
+func toAnthropicSystemBlocks(req ChatRequest) []anthropic.TextBlockParam {
+	blocks := systemBlocks(req)
+	if len(blocks) == 0 {
 		return nil
 	}
-	definitions := registry.AnthropicDefinitions()
+	params := make([]anthropic.TextBlockParam, 0, len(blocks))
+	lastCacheable := -1
+	for _, block := range blocks {
+		param := anthropic.TextBlockParam{Text: block.Content}
+		if block.Cacheable {
+			lastCacheable = len(params)
+		}
+		params = append(params, param)
+	}
+	if req.Cache.EnablePromptCache && lastCacheable >= 0 {
+		params[lastCacheable].CacheControl = anthropic.NewCacheControlEphemeralParam()
+	}
+	return params
+}
+
+func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
+	definitions := toolDefinitions(req)
+	if len(definitions) == 0 {
+		return nil
+	}
 	tools := make([]anthropic.ToolUnionParam, 0, len(definitions))
 	for _, definition := range definitions {
 		param := anthropic.ToolParam{
 			Name:        definition.Name,
 			Description: anthropic.String(definition.Description),
 			InputSchema: anthropic.ToolInputSchemaParam{
-				Properties: definition.InputSchema.Properties,
-				Required:   definition.InputSchema.Required,
+				Properties: definition.Schema.Properties,
+				Required:   definition.Schema.Required,
 			},
 		}
 		tools = append(tools, anthropic.ToolUnionParam{OfTool: &param})
+	}
+	if req.Cache.EnablePromptCache {
+		last := len(tools) - 1
+		tools[last].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}
 	return tools
 }

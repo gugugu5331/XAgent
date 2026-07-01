@@ -42,6 +42,21 @@ func NewRegistry(projectRoot string) (*Registry, error) {
 	return registry, nil
 }
 
+func NewReadOnlyRegistry(projectRoot string) (*Registry, error) {
+	registry := &Registry{tools: map[string]Tool{}}
+	defaults := []Tool{
+		NewReadTool(projectRoot),
+		NewGlobTool(projectRoot),
+		NewGrepTool(projectRoot),
+	}
+	for _, tool := range defaults {
+		if err := registry.Register(tool); err != nil {
+			return nil, err
+		}
+	}
+	return registry, nil
+}
+
 func (r *Registry) Register(tool Tool) error {
 	if tool == nil {
 		return fmt.Errorf("工具不能为空")

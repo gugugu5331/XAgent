@@ -19,7 +19,7 @@ func NewBashTool(projectRoot string) Tool {
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {
-	return "Run a shell command with the project root as working directory. This is not a sandbox."
+	return "Run a shell command with the project root as working directory. Prefer dedicated tools for reading, searching, and editing; commands are not sandboxed and must be chosen cautiously."
 }
 
 func (t *BashTool) Risk() Risk { return RiskDangerous }

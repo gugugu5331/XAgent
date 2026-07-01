@@ -17,7 +17,9 @@ func NewWriteTool(projectRoot string) Tool {
 
 func (t *WriteTool) Name() string { return "Write" }
 
-func (t *WriteTool) Description() string { return "Write text content to a file inside the project." }
+func (t *WriteTool) Description() string {
+	return "Write text content to a file inside the project. Read the target or related file first when modifying existing content; paths must stay within the project."
+}
 
 func (t *WriteTool) Risk() Risk { return RiskDangerous }
 
