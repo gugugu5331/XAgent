@@ -11,6 +11,16 @@ import (
 	"xagent/internal/provider"
 )
 
+func TestParseIndexKeepsEntrySummary(t *testing.T) {
+	index, err := ParseIndex(ScopeProject, []byte("# Memory Index\n\n- [用户姓名](name.md) — 用户的名字是罗新新。\n"))
+	if err != nil {
+		t.Fatalf("parse index: %v", err)
+	}
+	if len(index.Entries) != 1 || index.Entries[0].Body != "用户的名字是罗新新。" {
+		t.Fatalf("index summary was not preserved: %#v", index.Entries)
+	}
+}
+
 func TestUpdateAsyncQueueLimitsAndTimeouts(t *testing.T) {
 	manager := NewManager(ManagerOptions{ProjectDir: t.TempDir(), UpdateQueueSize: 1, UpdateConcurrency: 1, UpdateTimeoutMS: 10, MaxCandidateBytes: 8, Provider: fakeMemoryProvider{response: `{"action":"ignore"}`}})
 	manager.UpdateAsync(UpdateInput{Scope: ScopeProject, Candidate: strings.Repeat("x", 20), Now: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)})

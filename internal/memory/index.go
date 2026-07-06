@@ -107,11 +107,15 @@ func ParseIndex(scope Scope, data []byte) (Index, error) {
 		}
 		title := line[3:titleEnd]
 		path := line[titleEnd+2 : pathEnd]
+		body := ""
+		if _, rest, ok := strings.Cut(line[pathEnd+1:], "—"); ok {
+			body = strings.TrimSpace(rest)
+		}
 		id := strings.TrimSuffix(strings.TrimSuffix(path, ".md"), filepathSuffix(path))
 		if id == "" {
 			id = safeID(strings.TrimSuffix(path, ".md"))
 		}
-		index.Entries = append(index.Entries, IndexEntry{ID: id, Title: title, Scope: scope, Path: path})
+		index.Entries = append(index.Entries, IndexEntry{ID: id, Title: title, Scope: scope, Path: path, Body: body})
 	}
 	return index, nil
 }
