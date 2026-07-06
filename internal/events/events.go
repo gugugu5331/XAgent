@@ -29,6 +29,7 @@ const (
 	ToolDisplaySuccess             ToolDisplayStatus = "success"
 	ToolDisplayError               ToolDisplayStatus = "error"
 	ToolDisplayDenied              ToolDisplayStatus = "denied"
+	ToolDisplayCancelled           ToolDisplayStatus = "cancelled"
 )
 
 type ToolDisplay struct {
@@ -40,16 +41,28 @@ type ToolDisplay struct {
 }
 
 type ToolConfirmationRequest struct {
-	CallID    string
-	Name      string
-	Arguments string
-	Prompt    string
-	Decision  chan ToolConfirmationDecision
+	CallID         string
+	Name           string
+	Arguments      string
+	Prompt         string
+	AllowPermanent bool
+	Decision       chan ToolConfirmationDecision
 }
+
+type PermissionAction string
+
+const (
+	PermissionDeny           PermissionAction = "deny"
+	PermissionAllowOnce      PermissionAction = "allow_once"
+	PermissionAllowSession   PermissionAction = "allow_session"
+	PermissionAllowPermanent PermissionAction = "allow_permanent"
+	PermissionCancel         PermissionAction = "cancel"
+)
 
 type ToolConfirmationDecision struct {
 	CallID  string
 	Allowed bool
+	Action  PermissionAction
 }
 
 type AgentProgress struct {

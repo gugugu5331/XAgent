@@ -224,7 +224,7 @@ func toOpenAIMessages(req ChatRequest) []openAIMessage {
 	}
 	for _, message := range req.Messages {
 		switch message.Role {
-		case conversation.RoleUser:
+		case conversation.RoleUser, conversation.RoleContextSummary, conversation.RoleContextBoundary:
 			messages = append(messages, openAIMessage{Role: "user", Content: message.Content})
 		case conversation.RoleAssistant:
 			messages = append(messages, openAIMessage{Role: "assistant", Content: message.Content})

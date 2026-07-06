@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"xagent/internal/permission"
 )
 
 type Executor struct {
@@ -28,6 +30,21 @@ func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 func (e *Executor) NeedsConfirmation(call Call) bool {
 	tool, ok := e.Registry.Get(call.Name)
 	return ok && tool.Risk() == RiskDangerous
+}
+
+func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, grant permission.Grant) Result {
+	permissionCall := permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
+	normalized, err := permission.NormalizeCall(permissionCall, e.ProjectRoot)
+	if err != nil {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
+	}
+	if grant.Tool != call.Name || grant.Fingerprint != permission.Fingerprint(normalized) {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Permission grant does not match this tool call.", Recoverable: true})
+	}
+	if grant.CallID != "" && grant.CallID != call.ID && grant.Scope == permission.GrantOnce {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Permission grant does not match this tool call.", Recoverable: true})
+	}
+	return e.Execute(ctx, call)
 }
 
 func (e *Executor) Execute(ctx context.Context, call Call) Result {
@@ -75,6 +92,19 @@ func (e *Executor) Execute(ctx context.Context, call Call) Result {
 		}
 	case result := <-resultCh:
 		return e.truncate(result)
+	}
+}
+
+func (e *Executor) permissionDenied(call Call, decision permission.Decision) Result {
+	message := permission.DeniedModelMessage(decision)
+	return Result{
+		CallID:  call.ID,
+		Name:    call.Name,
+		Status:  StatusDenied,
+		Summary: "Permission denied before executing " + call.Name,
+		Content: message,
+		Data:    permission.DeniedResultData(decision),
+		Error:   &Error{Code: ErrPermissionDenied, Message: message, Recoverable: true},
 	}
 }
 

@@ -81,16 +81,11 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 }
 
 func grepFile(path string, projectRoot string, pattern string, re *regexp.Regexp, useRegex bool, matches *[]string) error {
-	resolved, err := ResolveProjectPath(projectRoot, path)
+	resolved, fileContent, err := ReadProjectFile(projectRoot, path)
 	if err != nil {
 		return nil
 	}
-	file, err := os.Open(resolved)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(strings.NewReader(string(fileContent)))
 	lineNumber := 0
 	for scanner.Scan() {
 		lineNumber++

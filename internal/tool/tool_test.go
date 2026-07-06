@@ -2,11 +2,14 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"xagent/internal/permission"
 )
 
 func TestResolveProjectPathRejectsOutsidePath(t *testing.T) {
@@ -236,6 +239,80 @@ func TestExecutorTruncatesOutput(t *testing.T) {
 		t.Fatalf("expected truncated read, got %#v", read)
 	}
 }
+
+func TestExecuteAuthorizedRejectsMismatchedGrant(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, time.Second, 1024)
+	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
+	result := executor.ExecuteAuthorized(context.Background(), call, permission.Grant{CallID: "1", Tool: "Write", Fingerprint: "Write:other.txt", Scope: permission.GrantOnce})
+	if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied {
+		t.Fatalf("expected permission denied, got %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(root, "a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("mismatched grant executed write, stat err: %v", err)
+	}
+}
+
+func TestExecuteAuthorizedAllowsMatchingGrant(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, time.Second, 1024)
+	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
+	normalized, err := permission.NormalizeCall(permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := executor.ExecuteAuthorized(context.Background(), call, permission.Grant{CallID: "1", Tool: "Write", Fingerprint: permission.Fingerprint(normalized), Scope: permission.GrantOnce})
+	if result.Status != StatusSuccess {
+		t.Fatalf("expected authorized write success, got %#v", result)
+	}
+}
+
+func TestSchemaRawJSONIsPreserved(t *testing.T) {
+	raw := json.RawMessage(`{"type":"object","properties":{"nested":{"type":"object","properties":{"items":{"type":"array","items":{"type":"number"}},"choice":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}},"additionalProperties":false}`)
+	data, err := json.Marshal(Schema{Raw: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(raw) {
+		t.Fatalf("raw schema changed:\n%s", data)
+	}
+}
+
+func TestProviderDefinitionsUseRawSchema(t *testing.T) {
+	raw := json.RawMessage(`{"type":"object","properties":{"items":{"type":"array","items":{"type":"integer"}}},"required":["items"],"additionalProperties":false}`)
+	registry := &Registry{tools: map[string]Tool{}}
+	if err := registry.Register(fakeTool{schema: Schema{Raw: raw}}); err != nil {
+		t.Fatal(err)
+	}
+
+	anthropic, err := json.Marshal(registry.AnthropicDefinitions()[0].InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(anthropic) != string(raw) {
+		t.Fatalf("anthropic input_schema changed:\n%s", anthropic)
+	}
+
+	openai, err := json.Marshal(registry.OpenAIDefinitions()[0].Function.Parameters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(openai) != string(raw) {
+		t.Fatalf("openai parameters changed:\n%s", openai)
+	}
+}
+
+type fakeTool struct {
+	schema Schema
+}
+
+func (f fakeTool) Name() string                          { return "Fake" }
+func (f fakeTool) Description() string                   { return "fake tool" }
+func (f fakeTool) Schema() Schema                        { return f.schema }
+func (f fakeTool) Risk() Risk                            { return RiskSafe }
+func (f fakeTool) Execute(context.Context, Input) Result { return Result{} }
 
 func TestToolDescriptionsReinforcePromptRules(t *testing.T) {
 	registry, err := NewRegistry(t.TempDir())

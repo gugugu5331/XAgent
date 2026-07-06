@@ -3,8 +3,6 @@ package tool
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
 type WriteTool struct {
@@ -39,19 +37,9 @@ func (t *WriteTool) Execute(ctx context.Context, input Input) Result {
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "content 参数必须是字符串", true)
 	}
-	resolved, err := ResolveProjectPath(t.projectRoot, path)
+	resolved, err := WriteProjectFile(t.projectRoot, path, []byte(content))
 	if err != nil {
-		return Failure(input, errorCode(err), err.Error(), true)
-	}
-	if err := os.MkdirAll(filepath.Dir(resolved), 0o700); err != nil {
-		return Failure(input, ErrNotFound, fmt.Sprintf("创建父目录失败: %v", err), true)
-	}
-	resolved, err = ResolveProjectPath(t.projectRoot, path)
-	if err != nil {
-		return Failure(input, errorCode(err), err.Error(), true)
-	}
-	if err := os.WriteFile(resolved, []byte(content), 0o600); err != nil {
-		return Failure(input, ErrNotFound, fmt.Sprintf("写入文件失败: %v", err), true)
+		return Failure(input, errorCode(err), fmt.Sprintf("写入文件失败: %v", err), true)
 	}
 	rel := RelativeToRoot(t.projectRoot, resolved)
 	return Success(input, fmt.Sprintf("Wrote %s (%d bytes)", rel, len(content)), fmt.Sprintf("Wrote %d bytes to %s", len(content), rel), map[string]any{

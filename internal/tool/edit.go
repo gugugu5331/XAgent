@@ -3,7 +3,6 @@ package tool
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -44,13 +43,9 @@ func (t *EditTool) Execute(ctx context.Context, input Input) Result {
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "new_text 参数必须是字符串", true)
 	}
-	resolved, err := ResolveProjectPath(t.projectRoot, path)
+	resolved, data, err := ReadProjectFile(t.projectRoot, path)
 	if err != nil {
-		return Failure(input, errorCode(err), err.Error(), true)
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return Failure(input, ErrNotFound, fmt.Sprintf("读取文件失败: %v", err), true)
+		return Failure(input, errorCode(err), fmt.Sprintf("读取文件失败: %v", err), true)
 	}
 	content := string(data)
 	count := strings.Count(content, oldText)
@@ -61,7 +56,7 @@ func (t *EditTool) Execute(ctx context.Context, input Input) Result {
 		return Failure(input, ErrMultipleMatches, fmt.Sprintf("old_text 匹配到 %d 次，必须唯一匹配", count), true)
 	}
 	updated := strings.Replace(content, oldText, newText, 1)
-	if err := os.WriteFile(resolved, []byte(updated), 0o600); err != nil {
+	if _, err := WriteProjectFile(t.projectRoot, path, []byte(updated)); err != nil {
 		return Failure(input, ErrNotFound, fmt.Sprintf("写回文件失败: %v", err), true)
 	}
 	rel := RelativeToRoot(t.projectRoot, resolved)

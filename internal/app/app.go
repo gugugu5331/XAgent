@@ -13,6 +13,8 @@ import (
 	"xagent/internal/config"
 	"xagent/internal/conversation"
 	"xagent/internal/orchestrator"
+	"xagent/internal/permission"
+	"xagent/internal/redact"
 	"xagent/internal/tui"
 )
 
@@ -39,9 +41,23 @@ type Model struct {
 func New(deps Deps) Model {
 	ctx := context.Background()
 	conversations, _ := deps.Store.List(ctx)
+	orch := orchestrator.NewWithOptions(orchestrator.OrchestratorOptions{
+		Provider:       deps.Provider,
+		Store:          deps.Store,
+		Resources:      deps.Resources,
+		Thinking:       deps.Config.LLM.Thinking,
+		Registry:       deps.Registry,
+		Executor:       deps.Executor,
+		ContextManager: deps.ContextManager,
+		SessionContext: deps.SessionContext,
+		Memory:         deps.Memory,
+	})
+	if mode, ok := permission.ParseMode(deps.Config.Permission.Mode); ok {
+		orch.SetPermissionMode(mode)
+	}
 	model := Model{
 		deps:         deps,
-		orchestrator: orchestrator.NewWithTools(deps.Provider, deps.Store, deps.Resources, deps.Config.LLM.Thinking, deps.Registry, deps.Executor),
+		orchestrator: orch,
 		screen:       screenList,
 		list:         tui.NewConversationList(conversations),
 		input:        tui.NewInput(deps.Resources.UILabel("input_prompt")),
@@ -51,6 +67,7 @@ func New(deps Deps) Model {
 			Model:    deps.Config.LLM.Model,
 		},
 	}
+	model.refreshMCPStatus()
 	if deps.Config.UI.StartMode == config.StartModeNew {
 		model.startNewConversation()
 	}
@@ -85,14 +102,68 @@ func (m *Model) startNewConversation() {
 }
 
 func (m *Model) loadConversation(id string) {
-	conv, err := m.deps.Store.Load(context.Background(), id)
+	conv, report, err := m.recoverOrLoadConversation(id)
 	if err != nil {
 		m.status.Error = err
 		return
 	}
 	m.conversation = conv
 	m.messages.SetMessages(conv.Messages)
+	m.status.Notice = recoveryNotice(report)
 	m.screen = screenChat
+}
+
+func (m *Model) recoverOrLoadConversation(id string) (*conversation.Conversation, conversation.RecoveryReport, error) {
+	ctx := context.Background()
+	if recovering, ok := m.deps.Store.(conversation.RecoveringStore); ok {
+		conv, report, err := recovering.Recover(ctx, id)
+		return conv, report, err
+	}
+	conv, err := m.deps.Store.Load(ctx, id)
+	return conv, conversation.RecoveryReport{}, err
+}
+
+func recoveryNotice(report conversation.RecoveryReport) string {
+	parts := []string{}
+	if report.SkippedLines > 0 {
+		parts = append(parts, fmt.Sprintf("跳过 %d 行损坏会话记录", report.SkippedLines))
+	}
+	if report.TruncatedFromMessage >= 0 {
+		parts = append(parts, fmt.Sprintf("从第 %d 条未闭合工具调用处截断", report.TruncatedFromMessage))
+	}
+	if report.TimeGapReminder {
+		parts = append(parts, "已插入会话时间跨度提醒")
+	}
+	for _, diagnostic := range report.Diagnostics {
+		text := strings.TrimSpace(diagnostic.Safe(redact.Text).Text())
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "恢复提示: " + strings.Join(parts, "；")
+}
+
+func (m *Model) close() {
+	if m.conversation != nil {
+		_ = m.deps.Store.Save(context.Background(), m.conversation)
+	}
+	if m.deps.Closer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := m.deps.Closer.Close(ctx); err != nil {
+			m.status.Error = fmt.Errorf("MCP close: %w", err)
+		}
+	}
+	m.refreshMCPStatus()
+}
+
+func (m *Model) refreshMCPStatus() {
+	if m.deps.MCPStatus != nil {
+		m.status.MCP = m.deps.MCPStatus.StatusLine()
+	}
 }
 
 func listen(events <-chan Event) tea.Cmd {

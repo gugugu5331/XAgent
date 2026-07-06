@@ -3,7 +3,6 @@ package tool
 import (
 	"context"
 	"fmt"
-	"os"
 )
 
 type ReadTool struct {
@@ -33,13 +32,9 @@ func (t *ReadTool) Execute(ctx context.Context, input Input) Result {
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "path 参数不能为空", true)
 	}
-	resolved, err := ResolveProjectPath(t.projectRoot, path)
+	resolved, data, err := ReadProjectFile(t.projectRoot, path)
 	if err != nil {
-		return Failure(input, errorCode(err), err.Error(), true)
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return Failure(input, ErrNotFound, fmt.Sprintf("读取文件失败: %v", err), true)
+		return Failure(input, errorCode(err), fmt.Sprintf("读取文件失败: %v", err), true)
 	}
 	rel := RelativeToRoot(t.projectRoot, resolved)
 	return Success(input, fmt.Sprintf("Read %s (%d bytes)", rel, len(data)), string(data), map[string]any{

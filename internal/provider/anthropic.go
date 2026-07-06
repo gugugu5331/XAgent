@@ -9,6 +9,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 
 	"xagent/internal/config"
 	"xagent/internal/conversation"
@@ -129,7 +130,7 @@ func toAnthropicMessages(messages []conversation.Message) []anthropic.MessagePar
 	result := make([]anthropic.MessageParam, 0, len(messages))
 	for _, message := range messages {
 		switch message.Role {
-		case conversation.RoleUser:
+		case conversation.RoleUser, conversation.RoleContextSummary, conversation.RoleContextBoundary:
 			result = append(result, anthropic.NewUserMessage(anthropic.NewTextBlock(message.Content)))
 		case conversation.RoleAssistant:
 			result = append(result, anthropic.NewAssistantMessage(anthropic.NewTextBlock(message.Content)))
@@ -177,10 +178,7 @@ func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
 		param := anthropic.ToolParam{
 			Name:        definition.Name,
 			Description: anthropic.String(definition.Description),
-			InputSchema: anthropic.ToolInputSchemaParam{
-				Properties: definition.Schema.Properties,
-				Required:   definition.Schema.Required,
-			},
+			InputSchema: toAnthropicInputSchema(definition.Schema),
 		}
 		tools = append(tools, anthropic.ToolUnionParam{OfTool: &param})
 	}
@@ -189,4 +187,48 @@ func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
 		tools[last].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}
 	return tools
+}
+
+func toAnthropicInputSchema(schema tool.Schema) anthropic.ToolInputSchemaParam {
+	if len(schema.Raw) == 0 {
+		return anthropic.ToolInputSchemaParam{
+			Properties: schema.Properties,
+			Required:   schema.Required,
+		}
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(schema.Raw, &raw); err != nil {
+		return anthropic.ToolInputSchemaParam{
+			Properties: schema.Properties,
+			Required:   schema.Required,
+		}
+	}
+
+	param := anthropic.ToolInputSchemaParam{ExtraFields: map[string]any{}}
+	for key, value := range raw {
+		switch key {
+		case "properties":
+			param.Properties = value
+		case "required":
+			if required, ok := value.([]any); ok {
+				param.Required = make([]string, 0, len(required))
+				for _, item := range required {
+					if name, ok := item.(string); ok {
+						param.Required = append(param.Required, name)
+					}
+				}
+			}
+		case "type":
+			if value == "object" {
+				param.Type = constant.Object("object")
+			}
+		default:
+			param.ExtraFields[key] = value
+		}
+	}
+	if len(param.ExtraFields) == 0 {
+		param.ExtraFields = nil
+	}
+	return param
 }

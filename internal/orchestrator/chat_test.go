@@ -10,10 +10,15 @@ import (
 	"time"
 
 	"xagent/internal/config"
+	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
 	"xagent/internal/events"
+	"xagent/internal/memory"
+	"xagent/internal/permission"
+	"xagent/internal/prompt"
 	"xagent/internal/provider"
 	"xagent/internal/resources"
+	"xagent/internal/sessionctx"
 	"xagent/internal/tool"
 )
 
@@ -340,6 +345,25 @@ func TestCollectProviderStreamForwardsAndCollects(t *testing.T) {
 	}
 }
 
+func TestMCPArgumentsAreRedactedInHistoryAndPermissionPrompt(t *testing.T) {
+	call := tool.Call{ID: "mcp", Name: "mcp__github__search", ArgumentsJSON: `{"api_key":"secret-value","nested":{"Authorization":"Bearer secret-value"},"query":"hello"}`}
+	redacted := redactedArguments(call)
+	if strings.Contains(redacted, "secret-value") || strings.Contains(redacted, "Bearer") {
+		t.Fatalf("mcp arguments leaked secret: %s", redacted)
+	}
+	if !strings.Contains(redacted, "[redacted]") || !strings.Contains(redacted, "hello") {
+		t.Fatalf("mcp arguments not redacted as expected: %s", redacted)
+	}
+	decision := permission.Decision{Prompt: &permission.ConfirmationPrompt{Reason: "default mode requires confirmation", Mode: permission.ModeDefault}}
+	prompt := formatPermissionPrompt(call, decision)
+	if !strings.Contains(prompt, "server=github") || !strings.Contains(prompt, "tool=search") {
+		t.Fatalf("mcp prompt missing server/tool info: %s", prompt)
+	}
+	if strings.Contains(prompt, "secret-value") || strings.Contains(prompt, "Bearer") {
+		t.Fatalf("mcp prompt leaked secret: %s", prompt)
+	}
+}
+
 func TestCollectProviderStreamReturnsOnToolCall(t *testing.T) {
 	stream := make(chan provider.StreamEvent, 2)
 	stream <- provider.StreamEvent{Type: provider.StreamEventToolCall, ToolCalls: []tool.Call{{ID: "call_1", Name: "Read", ArgumentsJSON: `{}`}}}
@@ -363,20 +387,65 @@ func TestCollectProviderStreamTreatsClosedStreamAsProviderError(t *testing.T) {
 	}
 }
 
-func TestFilterToolCallBlocksPlanWriteAndUnknown(t *testing.T) {
+func TestFilterToolCallBlocksUnknownAndAuthorizerBlocksPlanWrite(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := tool.NewRegistry(root)
 	executor := tool.NewExecutor(registry, root, time.Second, 1024)
 	orch := NewWithTools(&fakeProvider{}, nil, resources.New(), config.ThinkingConfig{}, registry, executor)
 
-	if result, blocked := orch.filterToolCall(RunModePlan, tool.Call{ID: "write", Name: "Write", ArgumentsJSON: `{}`}); !blocked || result.Status != tool.StatusDenied {
-		t.Fatalf("expected plan write to be blocked, got blocked=%v result=%#v", blocked, result)
+	decision := orch.authorizer.Decide(permissionCall(tool.Call{ID: "write", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"x"}`}), orch.permissionContext(RunModePlan))
+	if decision.Kind != permission.DecisionDeny || decision.Reason != permission.ReasonPlanMode {
+		t.Fatalf("expected plan write to be denied by authorizer, got %#v", decision)
 	}
 	if _, blocked := orch.filterToolCall(RunModePlan, tool.Call{ID: "read", Name: "Read", ArgumentsJSON: `{}`}); blocked {
 		t.Fatal("expected plan read to be allowed")
 	}
 	if result, blocked := orch.filterToolCall(RunModeDefault, tool.Call{ID: "missing", Name: "Missing", ArgumentsJSON: `{}`}); !blocked || result.Error == nil || result.Error.Code != tool.ErrToolNotFound {
 		t.Fatalf("expected unknown tool to be blocked, got blocked=%v result=%#v", blocked, result)
+	}
+}
+
+func TestFormatToolConfirmationRedactsSensitiveValues(t *testing.T) {
+	prompt := formatToolConfirmation(tool.Call{ID: "call", Name: "Bash", ArgumentsJSON: `{"command":"API_KEY=secret TOKEN=abc git status"}`})
+	if strings.Contains(prompt, "secret") || strings.Contains(prompt, "abc") {
+		t.Fatalf("prompt leaked sensitive value: %s", prompt)
+	}
+	if !strings.Contains(prompt, "[REDACTED]") {
+		t.Fatalf("prompt did not show redaction marker: %s", prompt)
+	}
+}
+
+func TestToolDisplayAndConversationUseRedactedArguments(t *testing.T) {
+	call := tool.Call{ID: "call", Name: "Bash", ArgumentsJSON: `{"command":"API_KEY=secret git status"}`}
+	display := newToolDisplay(call, events.ToolDisplayPending, "")
+	if strings.Contains(display.Arguments, "secret") {
+		t.Fatalf("tool display leaked secret: %s", display.Arguments)
+	}
+	conv := conversation.NewConversation("c", time.Now())
+	orch := &Orchestrator{}
+	orch.appendToolMessages(conv, call, tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusDenied, Summary: "denied"})
+	if strings.Contains(conv.Messages[0].RawToolArguments, "secret") {
+		t.Fatalf("conversation leaked secret args: %#v", conv.Messages[0])
+	}
+}
+
+func TestPermissionActionMapping(t *testing.T) {
+	cases := []struct {
+		decision events.ToolConfirmationDecision
+		want     permission.UserAction
+	}{
+		{decision: events.ToolConfirmationDecision{Action: events.PermissionAllowOnce, Allowed: true}, want: permission.ActionAllowOnce},
+		{decision: events.ToolConfirmationDecision{Action: events.PermissionAllowSession, Allowed: true}, want: permission.ActionAllowSession},
+		{decision: events.ToolConfirmationDecision{Action: events.PermissionAllowPermanent, Allowed: true}, want: permission.ActionAllowPermanent},
+		{decision: events.ToolConfirmationDecision{Action: events.PermissionCancel}, want: permission.ActionCancel},
+		{decision: events.ToolConfirmationDecision{Action: events.PermissionDeny}, want: permission.ActionDeny},
+		{decision: events.ToolConfirmationDecision{Allowed: true}, want: permission.ActionAllowOnce},
+		{decision: events.ToolConfirmationDecision{Allowed: false}, want: permission.ActionDeny},
+	}
+	for _, tc := range cases {
+		if got := permissionAction(tc.decision); got != tc.want {
+			t.Fatalf("permissionAction(%#v) = %s, want %s", tc.decision, got, tc.want)
+		}
 	}
 }
 
@@ -401,6 +470,42 @@ func TestMakeToolBatchesPreservesRiskOrder(t *testing.T) {
 	if !batches[2].Concurrent || batches[2].Calls[0].Call.ID != "read2" {
 		t.Fatalf("expected trailing safe batch, got %#v", batches[2])
 	}
+}
+
+func TestExecuteToolBatchesDoesNotRunAllowedToolBeforeAskResolved(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	orch := NewWithTools(&fakeProvider{}, nil, resources.New(), config.ThinkingConfig{}, registry, executor)
+	batch := ToolBatch{Concurrent: true, Calls: []indexedToolCall{
+		{Call: tool.Call{ID: "read", Name: "Read", ArgumentsJSON: `{"path":"a.txt"}`}, Index: 0},
+		{Call: tool.Call{ID: "write", Name: "Write", ArgumentsJSON: `{"path":"b.txt","content":"b"}`}, Index: 1},
+	}}
+	out := make(chan events.Event, 16)
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = orch.executeToolBatches(context.Background(), RunModeDefault, []ToolBatch{batch}, out)
+		close(done)
+	}()
+	var confirmation *events.ToolConfirmationRequest
+	for confirmation == nil {
+		select {
+		case event := <-out:
+			if event.Type == events.ToolRunning {
+				t.Fatalf("tool started running before ask resolved: %#v", event.Tool)
+			}
+			if event.Confirmation != nil {
+				confirmation = event.Confirmation
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for confirmation")
+		}
+	}
+	confirmation.Decision <- events.ToolConfirmationDecision{Action: events.PermissionDeny}
+	<-done
 }
 
 func TestExecuteToolBatchesReturnsResultsInOriginalOrder(t *testing.T) {
@@ -805,4 +910,100 @@ func requestStableText(req provider.ChatRequest) string {
 		out += block.Content + "\n"
 	}
 	return out
+}
+
+func TestStreamPreparesSessionContextBeforeProviderRequest(t *testing.T) {
+	root := t.TempDir()
+	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := store.Create(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &captureProvider{}
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	prep := &fakeSessionContext{sections: []prompt.Section{{Name: "session", Priority: 1000, Content: "session context section", Stable: true}}, changed: true}
+	orch := NewWithOptions(OrchestratorOptions{Provider: provider, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, SessionContext: prep})
+	stream, err := orch.Send(context.Background(), conv, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range stream {
+		if event.Type == events.Error {
+			t.Fatal(event.Err)
+		}
+	}
+	if prep.calls != 1 {
+		t.Fatalf("Prepare calls = %d, want 1", prep.calls)
+	}
+	var stable string
+	for _, block := range provider.request.StableSystem {
+		stable += block.Content
+	}
+	if !strings.Contains(stable, "session context section") {
+		t.Fatalf("provider stable system missing session section: %#v", provider.request.StableSystem)
+	}
+}
+
+func TestMemoryUpdatesOnlyAfterCompletedAgentLoop(t *testing.T) {
+	root := t.TempDir()
+	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := store.Create(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	mem := &fakeMemoryUpdater{}
+	completedProvider := &fakeProvider{events: [][]provider.StreamEvent{{{Type: provider.StreamEventTextDelta, Delta: "完成回复"}, {Type: provider.StreamEventDone}}}}
+	orch := NewWithOptions(OrchestratorOptions{Provider: completedProvider, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, Memory: mem})
+	stream, err := orch.Send(context.Background(), conv, "记住偏好")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range stream {
+		if event.Type == events.Error {
+			t.Fatal(event.Err)
+		}
+	}
+	if len(mem.inputs) != 1 || !strings.Contains(mem.inputs[0].Candidate, "记住偏好") || !strings.Contains(mem.inputs[0].Candidate, "完成回复") {
+		t.Fatalf("memory update not triggered with candidate: %#v", mem.inputs)
+	}
+
+	errorMem := &fakeMemoryUpdater{}
+	errorProvider := &errorProvider{}
+	conv2, _ := store.Create(context.Background())
+	orch = NewWithOptions(OrchestratorOptions{Provider: errorProvider, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, Memory: errorMem})
+	stream, err = orch.Send(context.Background(), conv2, "失败不记忆")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range stream {
+	}
+	if len(errorMem.inputs) != 0 {
+		t.Fatalf("memory update should not trigger after provider error: %#v", errorMem.inputs)
+	}
+}
+
+type fakeSessionContext struct {
+	sections []prompt.Section
+	changed  bool
+	calls    int
+}
+
+func (f *fakeSessionContext) Prepare(ctx context.Context, conv *conversation.Conversation, mode sessionctx.PrepareMode) (sessionctx.PreparedContext, error) {
+	f.calls++
+	return sessionctx.PreparedContext{StableSections: f.sections, MessagesChanged: f.changed, ContextResult: contextmgr.Result{Changed: f.changed}}, nil
+}
+
+type fakeMemoryUpdater struct{ inputs []memory.UpdateInput }
+
+func (f *fakeMemoryUpdater) UpdateAsync(input memory.UpdateInput) {
+	f.inputs = append(f.inputs, input)
 }

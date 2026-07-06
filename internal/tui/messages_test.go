@@ -35,6 +35,18 @@ func TestMessagesViewRestoresToolDisplayFromHistory(t *testing.T) {
 	}
 }
 
+func TestMessagesViewRestoresCancelledToolFromHistory(t *testing.T) {
+	view := NewMessagesView(false)
+	view.SetMessages([]conversation.Message{
+		{Role: conversation.RoleToolCall, ToolCallID: "call_1", ToolName: "Bash", RawToolArguments: `{"command":"git status"}`},
+		{Role: conversation.RoleToolResult, ToolCallID: "call_1", ToolName: "Bash", ToolResultStatus: "cancelled", ToolResultSummary: "用户取消工具确认"},
+	})
+	output := view.View()
+	if !strings.Contains(output, "● Bash(git status)") || !strings.Contains(output, "用户取消工具确认") {
+		t.Fatalf("unexpected output: %q", output)
+	}
+}
+
 func TestMessagesViewKeepsLiveToolInTimeline(t *testing.T) {
 	view := NewMessagesView(false)
 	view.AppendUser("读文件")
@@ -90,6 +102,13 @@ func TestStatusShowsCacheUsageOnlyWhenPresent(t *testing.T) {
 	withCache := Status{Provider: "fake", Model: "test", CacheCreationInputTokens: 56, CacheReadInputTokens: 78}.View()
 	if !strings.Contains(withCache, "Cache: 56 create / 78 read") {
 		t.Fatalf("cache segment missing: %q", withCache)
+	}
+}
+
+func TestStatusShowsMCPStatus(t *testing.T) {
+	output := Status{Provider: "fake", Model: "test", MCP: "1 ready, 1 failed, bad: timeout"}.View()
+	if !strings.Contains(output, "MCP: 1 ready, 1 failed, bad: timeout") {
+		t.Fatalf("unexpected status: %q", output)
 	}
 }
 

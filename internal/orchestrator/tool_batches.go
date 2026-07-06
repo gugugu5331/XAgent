@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"sync"
 
 	"xagent/internal/events"
+	"xagent/internal/permission"
 	"xagent/internal/tool"
 )
 
@@ -19,6 +19,7 @@ type ToolExecution struct {
 	Call       tool.Call
 	Result     tool.Result
 	Index      int
+	Grant      *permission.Grant
 	StopReason StopReason
 	Err        error
 }
@@ -49,14 +50,7 @@ func (o *Orchestrator) filterToolCall(mode RunMode, call tool.Call) (tool.Result
 		}, true
 	}
 	if mode == RunModePlan && !isReadOnlyTool(call.Name) {
-		return tool.Result{
-			CallID:  call.ID,
-			Name:    call.Name,
-			Status:  tool.StatusDenied,
-			Summary: "Plan Mode 不允许执行非只读工具",
-			Content: "Plan Mode 只允许 Read、Glob、Grep。",
-			Error:   &tool.Error{Code: tool.ErrPermissionDenied, Message: "Plan Mode 不允许执行非只读工具", Recoverable: true},
-		}, true
+		return tool.Result{}, false
 	}
 	_ = registeredTool
 	return tool.Result{}, false
@@ -96,32 +90,21 @@ func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, bat
 			return executions, StopReasonCancelled, ctx.Err()
 		default:
 		}
-		if batch.Concurrent {
-			results := make([]ToolExecution, len(batch.Calls))
-			var wg sync.WaitGroup
-			for i, indexed := range batch.Calls {
-				wg.Add(1)
-				go func(i int, indexed indexedToolCall) {
-					defer wg.Done()
-					results[i] = o.executeOneTool(ctx, mode, indexed, out)
-				}(i, indexed)
-			}
-			wg.Wait()
-			executions = append(executions, results...)
-			for _, result := range results {
-				if result.Err != nil {
-					return executions, result.StopReason, result.Err
-				}
-			}
-			continue
-		}
+		prepared := make([]ToolExecution, 0, len(batch.Calls))
 		for _, indexed := range batch.Calls {
-			select {
-			case <-ctx.Done():
-				return executions, StopReasonCancelled, ctx.Err()
-			default:
+			execution := o.prepareToolExecution(ctx, mode, indexed, out)
+			prepared = append(prepared, execution)
+			if execution.Err != nil {
+				executions = append(executions, prepared...)
+				return executions, execution.StopReason, execution.Err
 			}
-			execution := o.executeOneTool(ctx, mode, indexed, out)
+		}
+		for _, execution := range prepared {
+			if execution.Result.CallID != "" {
+				executions = append(executions, execution)
+				continue
+			}
+			execution = o.executePreparedTool(ctx, execution, out)
 			executions = append(executions, execution)
 			if execution.Err != nil {
 				return executions, execution.StopReason, execution.Err
@@ -132,7 +115,7 @@ func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, bat
 	return executions, "", nil
 }
 
-func (o *Orchestrator) executeOneTool(ctx context.Context, mode RunMode, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
+func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
 	call := indexed.Call
 	out <- events.Event{Type: events.ToolPending, Tool: newToolDisplay(call, events.ToolDisplayPending, "")}
 	if result, blocked := o.filterToolCall(mode, call); blocked {
@@ -150,14 +133,32 @@ func (o *Orchestrator) executeOneTool(ctx context.Context, mode RunMode, indexed
 		out <- toolResultEvent(result)
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	}
-	if o.executor.NeedsConfirmation(call) {
+	if o.authorizer == nil {
+		result := tool.Result{
+			CallID:  call.ID,
+			Name:    call.Name,
+			Status:  tool.StatusError,
+			Summary: "权限系统不可用",
+			Error:   &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true},
+		}
+		out <- toolResultEvent(result)
+		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
+	}
+	decision := o.authorizer.Decide(permissionCall(call), o.permissionContext(mode))
+	switch decision.Kind {
+	case permission.DecisionDeny:
+		result := permissionDeniedResult(call, decision)
+		out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
+		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
+	case permission.DecisionAsk:
 		decisionCh := make(chan events.ToolConfirmationDecision, 1)
 		confirmation := &events.ToolConfirmationRequest{
-			CallID:    call.ID,
-			Name:      call.Name,
-			Arguments: call.ArgumentsJSON,
-			Prompt:    formatToolConfirmation(call) + " 需要确认，按 y 允许，按 n 拒绝。",
-			Decision:  decisionCh,
+			CallID:         call.ID,
+			Name:           call.Name,
+			Arguments:      redactedArguments(call),
+			Prompt:         formatPermissionPrompt(call, decision),
+			AllowPermanent: decision.Prompt != nil && decision.Prompt.AllowPermanent,
+			Decision:       decisionCh,
 		}
 		out <- events.Event{Type: events.ToolWaitingConfirmation, Tool: newToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}
 		select {
@@ -165,18 +166,73 @@ func (o *Orchestrator) executeOneTool(ctx context.Context, mode RunMode, indexed
 			result := tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具执行已取消", Error: &tool.Error{Code: tool.ErrTimeout, Message: ctx.Err().Error(), Recoverable: true}}
 			out <- toolResultEvent(result)
 			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-		case decision := <-decisionCh:
-			if !decision.Allowed {
-				result := o.executor.Denied(call)
+		case userDecision := <-decisionCh:
+			decision = o.authorizer.ResolveUserDecision(permissionCall(call), o.permissionContext(mode), permissionAction(userDecision))
+			if decision.Kind == permission.DecisionDeny {
+				result := permissionDeniedResult(call, decision)
 				out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
 				return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 			}
 		}
 	}
+	return ToolExecution{Call: call, Index: indexed.Index, Grant: decision.Grant}
+}
+
+func (o *Orchestrator) executePreparedTool(ctx context.Context, execution ToolExecution, out chan<- events.Event) ToolExecution {
+	call := execution.Call
 	out <- events.Event{Type: events.ToolRunning, Tool: newToolDisplay(call, events.ToolDisplayRunning, "执行中")}
-	result := o.executor.Execute(ctx, call)
+	result := o.executor.ExecuteAuthorized(ctx, call, *execution.Grant)
 	out <- toolResultEvent(result)
-	return ToolExecution{Call: call, Result: result, Index: indexed.Index}
+	execution.Result = result
+	return execution
+}
+
+func permissionAction(decision events.ToolConfirmationDecision) permission.UserAction {
+	switch decision.Action {
+	case events.PermissionAllowOnce:
+		return permission.ActionAllowOnce
+	case events.PermissionAllowSession:
+		return permission.ActionAllowSession
+	case events.PermissionAllowPermanent:
+		return permission.ActionAllowPermanent
+	case events.PermissionCancel:
+		return permission.ActionCancel
+	case events.PermissionDeny:
+		return permission.ActionDeny
+	}
+	if decision.Allowed {
+		return permission.ActionAllowOnce
+	}
+	return permission.ActionDeny
+}
+
+func (o *Orchestrator) permissionContext(mode RunMode) permission.Context {
+	permissionMode := o.permissionMode
+	if permissionMode == "" {
+		permissionMode = permission.ModeDefault
+	}
+	return permission.Context{ProjectRoot: o.projectRoot(), Mode: permissionMode, PlanMode: mode == RunModePlan}
+}
+
+func permissionCall(call tool.Call) permission.Call {
+	return permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
+}
+
+func permissionDeniedResult(call tool.Call, decision permission.Decision) tool.Result {
+	message := permission.DeniedModelMessage(decision)
+	summary := "Permission denied before executing " + call.Name
+	if decision.UserMessage != "" {
+		summary = decision.UserMessage
+	}
+	return tool.Result{
+		CallID:  call.ID,
+		Name:    call.Name,
+		Status:  tool.StatusDenied,
+		Summary: summary,
+		Content: message,
+		Data:    permission.DeniedResultData(decision),
+		Error:   &tool.Error{Code: tool.ErrPermissionDenied, Message: message, Recoverable: true},
+	}
 }
 
 func isReadOnlyTool(name string) bool {

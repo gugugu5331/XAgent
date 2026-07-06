@@ -116,7 +116,7 @@ func renderToolDisplay(tool events.ToolDisplay) string {
 		line += " — " + status
 	}
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	if tool.Status == events.ToolDisplayError || tool.Status == events.ToolDisplayDenied {
+	if tool.Status == events.ToolDisplayError || tool.Status == events.ToolDisplayDenied || tool.Status == events.ToolDisplayCancelled {
 		style = style.Foreground(lipgloss.Color("9"))
 	}
 	return style.Render(line)
@@ -136,6 +136,8 @@ func toolStatusText(status events.ToolDisplayStatus) string {
 		return "失败"
 	case events.ToolDisplayDenied:
 		return "已拒绝"
+	case events.ToolDisplayCancelled:
+		return "已取消"
 	default:
 		return ""
 	}
@@ -193,6 +195,8 @@ func toolStatusResult(status events.ToolDisplayStatus) string {
 		return "error"
 	case events.ToolDisplayDenied:
 		return "denied"
+	case events.ToolDisplayCancelled:
+		return "cancelled"
 	default:
 		return string(status)
 	}
@@ -210,6 +214,8 @@ func toolDisplayStatus(status string) events.ToolDisplayStatus {
 		return events.ToolDisplayError
 	case "denied":
 		return events.ToolDisplayDenied
+	case "cancelled":
+		return events.ToolDisplayCancelled
 	default:
 		return events.ToolDisplaySuccess
 	}

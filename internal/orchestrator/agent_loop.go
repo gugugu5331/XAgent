@@ -2,10 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"xagent/internal/conversation"
 	"xagent/internal/events"
+	"xagent/internal/memory"
 	"xagent/internal/tool"
 )
 
@@ -20,6 +22,9 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 			return true
 		}
 		collector, reason, err := collectProviderStream(ctx, stream, out)
+		if o.contextManager != nil {
+			o.contextManager.UpdateUsage(conv, collector.Usage)
+		}
 		if o.thinking.Show {
 			conversation.AppendThinkingMessage(conv, collector.ThinkingText.String())
 		}
@@ -35,6 +40,7 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 				out <- events.Event{Type: events.Error, Err: err}
 				return true
 			}
+			o.updateMemoryAfterCompleted(req, collector.AssistantText.String())
 			out <- progressEvent(iteration, options.MaxIterations, string(StopReasonCompleted), "已完成")
 			out <- events.Event{Type: events.Done, Duration: time.Since(start)}
 			return true
@@ -78,6 +84,17 @@ func (o *Orchestrator) saveAfterStop(ctx context.Context, conv *conversation.Con
 	}
 	out <- progressEvent(iteration, max, string(reason), message)
 	return nil
+}
+
+func (o *Orchestrator) updateMemoryAfterCompleted(req RunRequest, assistantText string) {
+	if o.memory == nil {
+		return
+	}
+	candidate := strings.TrimSpace("用户请求:\n" + req.UserText + "\n\n最终回复:\n" + assistantText)
+	if candidate == "" {
+		return
+	}
+	o.memory.UpdateAsync(memory.UpdateInput{Scope: memory.ScopeProject, Candidate: candidate, Source: "agent_loop_completed", Now: time.Now()})
 }
 
 func progressEvent(iteration int, max int, reason string, message string) events.Event {

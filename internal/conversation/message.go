@@ -8,11 +8,13 @@ import (
 type MessageRole string
 
 const (
-	RoleUser       MessageRole = "user"
-	RoleAssistant  MessageRole = "assistant"
-	RoleThinking   MessageRole = "thinking"
-	RoleToolCall   MessageRole = "tool_call"
-	RoleToolResult MessageRole = "tool_result"
+	RoleUser            MessageRole = "user"
+	RoleAssistant       MessageRole = "assistant"
+	RoleThinking        MessageRole = "thinking"
+	RoleToolCall        MessageRole = "tool_call"
+	RoleToolResult      MessageRole = "tool_result"
+	RoleContextSummary  MessageRole = "context_summary"
+	RoleContextBoundary MessageRole = "context_boundary"
 )
 
 type Message struct {
@@ -27,5 +29,10 @@ type Message struct {
 	ToolResultSummary   string          `json:"tool_result_summary,omitempty"`
 	ToolResultTruncated bool            `json:"tool_result_truncated,omitempty"`
 	ToolResultData      json.RawMessage `json:"tool_result_data,omitempty"`
+	ToolResultError     json.RawMessage `json:"tool_result_error,omitempty"`
 	ToolErrorCode       string          `json:"tool_error_code,omitempty"`
+	Externalized        bool            `json:"externalized,omitempty"`
+	ExternalPath        string          `json:"external_path,omitempty"`
+	ExternalBytes       int64           `json:"external_bytes,omitempty"`
+	ExternalPreview     string          `json:"external_preview,omitempty"`
 }

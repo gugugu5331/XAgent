@@ -1,6 +1,9 @@
 package tool
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 type Tool interface {
 	Name() string
@@ -11,9 +14,18 @@ type Tool interface {
 }
 
 type Schema struct {
-	Type       string                    `json:"type"`
+	Type       string                    `json:"type,omitempty"`
 	Properties map[string]SchemaProperty `json:"properties,omitempty"`
 	Required   []string                  `json:"required,omitempty"`
+	Raw        json.RawMessage           `json:"-"`
+}
+
+func (s Schema) MarshalJSON() ([]byte, error) {
+	if len(s.Raw) > 0 {
+		return s.Raw, nil
+	}
+	type schema Schema
+	return json.Marshal(schema(s))
 }
 
 type SchemaProperty struct {

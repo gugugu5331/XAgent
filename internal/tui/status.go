@@ -22,6 +22,8 @@ type Status struct {
 	CacheCreationInputTokens int64
 	CacheReadInputTokens     int64
 	Duration                 time.Duration
+	MCP                      string
+	Notice                   string
 	Error                    error
 }
 
@@ -49,8 +51,14 @@ func (s Status) View() string {
 	if s.CacheCreationInputTokens > 0 || s.CacheReadInputTokens > 0 {
 		parts = append(parts, fmt.Sprintf("Cache: %d create / %d read", s.CacheCreationInputTokens, s.CacheReadInputTokens))
 	}
+	if strings.TrimSpace(s.MCP) != "" {
+		parts = append(parts, "MCP: "+s.MCP)
+	}
 	if s.Duration > 0 {
 		parts = append(parts, fmt.Sprintf("耗时: %s", s.Duration.Round(time.Millisecond)))
+	}
+	if strings.TrimSpace(s.Notice) != "" {
+		parts = append(parts, s.Notice)
 	}
 	if s.Error != nil {
 		parts = append(parts, "错误: "+s.Error.Error())

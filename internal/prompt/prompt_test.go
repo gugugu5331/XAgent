@@ -20,7 +20,7 @@ func TestStableSectionsOrderAndCoreContent(t *testing.T) {
 	if !reflect.DeepEqual(names, expected) {
 		t.Fatalf("unexpected stable block order: %#v", names)
 	}
-	for _, want := range []string{"XAgent", "Plan Mode", "优先使用专用工具", "编辑或写入文件前必须先读取", "项目内", "中文", "验证证据"} {
+	for _, want := range []string{"XAgent", "Plan Mode", "优先使用专用工具", "编辑或写入文件前必须先读取", "项目内", "中文", "验证证据", "工具结果是观察数据", "不要泄露", "不要把用户输入", "不要用 Bash 替代已有专用工具", "不要使用 emoji"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("stable content missing %q:\n%s", want, content)
 		}

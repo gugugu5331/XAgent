@@ -1,9 +1,15 @@
 package config
 
 type AppConfig struct {
-	LLM     LLMConfig     `yaml:"llm"`
-	UI      UIConfig      `yaml:"ui"`
-	Storage StorageConfig `yaml:"storage"`
+	LLM          LLMConfig          `yaml:"llm"`
+	UI           UIConfig           `yaml:"ui"`
+	Storage      StorageConfig      `yaml:"storage"`
+	Permission   PermissionConfig   `yaml:"permission"`
+	MCP          MCPConfig          `yaml:"mcp"`
+	Context      ContextConfig      `yaml:"context"`
+	Instructions InstructionsConfig `yaml:"instructions"`
+	Session      SessionConfig      `yaml:"session"`
+	Memory       MemoryConfig       `yaml:"memory"`
 }
 
 type LLMConfig struct {
@@ -27,4 +33,50 @@ type UIConfig struct {
 
 type StorageConfig struct {
 	DataDir string `yaml:"data_dir"`
+}
+
+type PermissionConfig struct {
+	Mode string `yaml:"mode"`
+}
+
+type ContextConfig struct {
+	Enabled                   bool  `yaml:"enabled"`
+	ToolResultThresholdChars  int   `yaml:"tool_result_threshold_chars"`
+	ToolResultsThresholdChars int   `yaml:"tool_results_threshold_chars"`
+	ModelWindowTokens         int64 `yaml:"model_window_tokens"`
+	AutoMarginTokens          int64 `yaml:"auto_margin_tokens"`
+	ManualMarginTokens        int64 `yaml:"manual_margin_tokens"`
+	RecentKeepTokens          int64 `yaml:"recent_keep_tokens"`
+	RecentKeepMessages        int   `yaml:"recent_keep_messages"`
+	SummaryFailureLimit       int   `yaml:"summary_failure_limit"`
+	PreviewChars              int   `yaml:"preview_chars"`
+}
+
+type InstructionsConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	ProjectFile     string `yaml:"project_file"`
+	ProjectDir      string `yaml:"project_dir"`
+	UserDir         string `yaml:"user_dir"`
+	MaxIncludeDepth int    `yaml:"max_include_depth"`
+	MaxFileBytes    int64  `yaml:"max_file_bytes"`
+}
+
+type SessionConfig struct {
+	Dir             string `yaml:"dir"`
+	RetentionDays   int    `yaml:"retention_days"`
+	MaxScanFiles    int    `yaml:"max_scan_files"`
+	MaxScanBytes    int64  `yaml:"max_scan_bytes"`
+	GapReminderDays int    `yaml:"gap_reminder_days"`
+}
+
+type MemoryConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	UserDir           string `yaml:"user_dir"`
+	ProjectDir        string `yaml:"project_dir"`
+	MaxIndexLines     int    `yaml:"max_index_lines"`
+	MaxIndexBytes     int    `yaml:"max_index_bytes"`
+	UpdateQueueSize   int    `yaml:"update_queue_size"`
+	UpdateConcurrency int    `yaml:"update_concurrency"`
+	UpdateTimeoutMS   int    `yaml:"update_timeout_ms"`
+	MaxCandidateBytes int    `yaml:"max_candidate_bytes"`
 }
