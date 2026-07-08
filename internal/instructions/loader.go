@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"xagent/internal/config"
 	"xagent/internal/diagnostics"
@@ -41,6 +43,25 @@ type Loader struct {
 	Config      config.InstructionsConfig
 }
 
+type CachedLoader struct {
+	Loader Loader
+	mu     sync.RWMutex
+	cache  *loaderCache
+}
+
+type loaderCache struct {
+	sections     []prompt.Section
+	diagnostics  []diagnostics.Diagnostic
+	dependencies []fileDependency
+}
+
+type fileDependency struct {
+	path    string
+	modTime time.Time
+	size    int64
+	missing bool
+}
+
 type candidate struct {
 	name        string
 	path        string
@@ -50,7 +71,12 @@ type candidate struct {
 }
 
 func (l Loader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
-	sources, items := l.LoadSources(ctx)
+	result := l.load(ctx, false)
+	return result.sections, result.diagnostics
+}
+
+func (l Loader) load(ctx context.Context, trackDeps bool) loaderCache {
+	sources, items, deps := l.loadSources(ctx, trackDeps)
 	sections := make([]prompt.Section, 0, len(sources))
 	for _, source := range sources {
 		content := strings.TrimSpace(source.Content)
@@ -64,13 +90,19 @@ func (l Loader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagn
 			Stable:   true,
 		})
 	}
-	return sections, items
+	return loaderCache{sections: sections, diagnostics: items, dependencies: deps}
 }
 
 func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagnostic) {
+	sources, items, _ := l.loadSources(ctx, false)
+	return sources, items
+}
+
+func (l Loader) loadSources(ctx context.Context, trackDeps bool) ([]Source, []diagnostics.Diagnostic, []fileDependency) {
 	cfg := normalizedConfig(l.Config)
 	candidates, items := l.candidates(cfg)
 	sources := make([]Source, 0, len(candidates))
+	var deps []fileDependency
 
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -81,10 +113,13 @@ func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		if diag != nil {
 			items = append(items, *diag)
 		}
+		if trackDeps {
+			deps = append(deps, instructionDependency(candidate.path, actualPath, ok))
+		}
 		if !ok {
 			continue
 		}
-		expanded, includeDiagnostics := expandIncludes(ctx, includeRequest{
+		expanded, includeDiagnostics, includeDeps := expandIncludesWithDeps(ctx, includeRequest{
 			content:     string(content),
 			baseDir:     filepath.Dir(actualPath),
 			allowedRoot: candidate.allowedRoot,
@@ -94,6 +129,11 @@ func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 			visited:     map[string]bool{actualPath: true},
 		})
 		items = append(items, includeDiagnostics...)
+		if trackDeps {
+			for _, depPath := range includeDeps {
+				deps = append(deps, instructionDependency(depPath, depPath, true))
+			}
+		}
 		sources = append(sources, Source{
 			Name:     candidate.name,
 			Path:     actualPath,
@@ -109,7 +149,85 @@ func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		}
 		return sources[i].Priority < sources[j].Priority
 	})
-	return sources, items
+	return sources, items, deps
+}
+
+func (l *CachedLoader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
+	if l == nil {
+		return nil, nil
+	}
+	if cached, ok := l.cached(); ok {
+		return cloneSections(cached.sections), cloneDiagnostics(cached.diagnostics)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cache != nil && dependenciesFresh(l.cache.dependencies) {
+		return cloneSections(l.cache.sections), cloneDiagnostics(l.cache.diagnostics)
+	}
+	loaded := l.Loader.load(ctx, true)
+	l.cache = &loaderCache{sections: cloneSections(loaded.sections), diagnostics: cloneDiagnostics(loaded.diagnostics), dependencies: cloneDependencies(loaded.dependencies)}
+	return loaded.sections, loaded.diagnostics
+}
+
+func (l *CachedLoader) cached() (loaderCache, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.cache == nil || !dependenciesFresh(l.cache.dependencies) {
+		return loaderCache{}, false
+	}
+	return loaderCache{sections: cloneSections(l.cache.sections), diagnostics: cloneDiagnostics(l.cache.diagnostics), dependencies: cloneDependencies(l.cache.dependencies)}, true
+}
+
+func instructionDependency(requestedPath string, actualPath string, exists bool) fileDependency {
+	path := requestedPath
+	if exists && actualPath != "" {
+		path = actualPath
+	}
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileDependency{path: path, missing: true}
+	}
+	return fileDependency{path: path, modTime: info.ModTime(), size: info.Size()}
+}
+
+func dependenciesFresh(deps []fileDependency) bool {
+	for _, dep := range deps {
+		info, err := os.Stat(dep.path)
+		if dep.missing {
+			if err == nil {
+				return false
+			}
+			continue
+		}
+		if err != nil || info.Size() != dep.size || !info.ModTime().Equal(dep.modTime) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneSections(sections []prompt.Section) []prompt.Section {
+	items := make([]prompt.Section, len(sections))
+	copy(items, sections)
+	return items
+}
+
+func cloneDiagnostics(items []diagnostics.Diagnostic) []diagnostics.Diagnostic {
+	copyItems := make([]diagnostics.Diagnostic, len(items))
+	copy(copyItems, items)
+	return copyItems
+}
+
+func cloneDependencies(deps []fileDependency) []fileDependency {
+	items := make([]fileDependency, len(deps))
+	copy(items, deps)
+	return items
 }
 
 func (l Loader) candidates(cfg config.InstructionsConfig) ([]candidate, []diagnostics.Diagnostic) {
@@ -119,17 +237,25 @@ func (l Loader) candidates(cfg config.InstructionsConfig) ([]candidate, []diagno
 	candidates := make([]candidate, 0, 3)
 
 	if projectRoot != "" {
-		rootPath := filepath.Join(projectRoot, cfg.ProjectFile)
+		for offset, projectFile := range projectFiles(cfg) {
+			priority := PriorityProjectRoot + offset
+			candidates = append(candidates, candidate{name: "项目根指令", path: filepath.Join(projectRoot, projectFile), allowedRoot: projectRoot, priority: priority, scope: ScopeProjectRoot})
+		}
 		projectDirPath := filepath.Join(projectRoot, cfg.ProjectDir, cfg.ProjectFile)
-		candidates = append(candidates,
-			candidate{name: "项目根指令", path: rootPath, allowedRoot: projectRoot, priority: PriorityProjectRoot, scope: ScopeProjectRoot},
-			candidate{name: "项目目录指令", path: projectDirPath, allowedRoot: projectRoot, priority: PriorityProjectDir, scope: ScopeProjectDir},
-		)
+		candidates = append(candidates, candidate{name: "项目目录指令", path: projectDirPath, allowedRoot: projectRoot, priority: PriorityProjectDir, scope: ScopeProjectDir})
 	}
 	if userDir != "" {
 		candidates = append(candidates, candidate{name: "用户指令", path: filepath.Join(userDir, cfg.ProjectFile), allowedRoot: userDir, priority: PriorityUserDir, scope: ScopeUserDir})
 	}
 	return candidates, items
+}
+
+func projectFiles(cfg config.InstructionsConfig) []string {
+	projectFile := strings.TrimSpace(cfg.ProjectFile)
+	if projectFile == "" || projectFile == "MEWCODE.md" {
+		return []string{"MEWCODE.md", "CLAUDE.md", "AGENTS.md"}
+	}
+	return []string{projectFile}
 }
 
 func (l Loader) userDir(cfg config.InstructionsConfig) string {

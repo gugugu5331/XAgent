@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"xagent/internal/permission"
 )
@@ -237,6 +238,70 @@ func TestExecutorTruncatesOutput(t *testing.T) {
 	read := executor.Execute(context.Background(), Call{ID: "2", Name: "Read", ArgumentsJSON: `{"path":"long.txt"}`})
 	if !read.Truncated {
 		t.Fatalf("expected truncated read, got %#v", read)
+	}
+}
+
+func TestExecutorUsesConfiguredLimits(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, 10*time.Millisecond, 12)
+
+	if got := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"sleep 1"}`}); got.Status != StatusTimeout {
+		t.Fatalf("expected configured timeout, got %#v", got)
+	}
+	if got := executor.Execute(context.Background(), Call{ID: "2", Name: "Write", ArgumentsJSON: `{"path":"long.txt","content":"abcdefghijklmnopqrstuvwxyz"}`}); got.Status != StatusSuccess {
+		t.Fatalf("write failed: %#v", got)
+	}
+	read := executor.Execute(context.Background(), Call{ID: "3", Name: "Read", ArgumentsJSON: `{"path":"long.txt"}`})
+	if !read.Truncated || !strings.Contains(read.Summary, "截断") {
+		t.Fatalf("expected configured max output truncation, got %#v", read)
+	}
+}
+
+func TestBashToolFailureContentIncludesRedactedStdoutAndStderr(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, time.Second, 4096)
+
+	result := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"printf 'api_key=secret-key'; printf 'Authorization: Bearer abc123' >&2; exit 7"}`})
+	if result.Status != StatusError || result.Error.Code != ErrCommandFailed {
+		t.Fatalf("expected command_failed, got %#v", result)
+	}
+	if !strings.Contains(result.Content, "exit_code: 7") || !strings.Contains(result.Content, "stdout:") || !strings.Contains(result.Content, "stderr:") {
+		t.Fatalf("failure content missing stdout/stderr summary: %q", result.Content)
+	}
+	if strings.Contains(result.Content, "secret-key") || strings.Contains(result.Content, "abc123") {
+		t.Fatalf("failure content leaked secret: %q", result.Content)
+	}
+	if stdout, _ := result.Data["stdout"].(string); strings.Contains(stdout, "secret-key") {
+		t.Fatalf("stdout data leaked secret: %q", stdout)
+	}
+	if stderr, _ := result.Data["stderr"].(string); strings.Contains(stderr, "abc123") {
+		t.Fatalf("stderr data leaked secret: %q", stderr)
+	}
+}
+
+func TestBashToolSuccessRedactsStdout(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := NewRegistry(root)
+	executor := NewExecutor(registry, root, time.Second, 4096)
+
+	result := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"printf 'api_key=secret-key'"}`})
+	if result.Status != StatusSuccess {
+		t.Fatalf("expected success, got %#v", result)
+	}
+	if strings.Contains(result.Content, "secret-key") {
+		t.Fatalf("success content leaked secret: %q", result.Content)
+	}
+}
+
+func TestExecutorTruncatesUTF8Safely(t *testing.T) {
+	value, truncated := truncateString("你好世界", 5)
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if !utf8.ValidString(value) {
+		t.Fatalf("truncated string is invalid utf8: %q", value)
 	}
 }
 

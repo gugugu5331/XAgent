@@ -61,6 +61,9 @@ func TestStdioTransportRecordsMalformedStdoutAndStderr(t *testing.T) {
 	if !strings.Contains(diagnostics, "fake stderr diagnostic") {
 		t.Fatalf("missing stderr diagnostic: %q", diagnostics)
 	}
+	if strings.Contains(diagnostics, "secret-key") || strings.Contains(diagnostics, "abc123") {
+		t.Fatalf("stderr diagnostic leaked secret: %q", diagnostics)
+	}
 }
 
 func TestStdioTransportCloseStopsProcess(t *testing.T) {
@@ -133,7 +136,7 @@ func main() {
 		runMCP()
 		return
 	}
-	fmt.Fprintln(os.Stderr, "fake stderr diagnostic")
+	fmt.Fprintln(os.Stderr, "fake stderr diagnostic api_key=secret-key Authorization: Bearer abc123")
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var req request

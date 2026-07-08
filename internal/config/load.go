@@ -42,9 +42,18 @@ const (
 	DefaultMemoryUpdateConcurrency     = 1
 	DefaultMemoryUpdateTimeoutMS       = 30000
 	DefaultMemoryMaxCandidateBytes     = 64 * 1024
+	DefaultAgentMaxIterations          = 10
+	DefaultAgentMaxUnknownToolCalls    = 2
+	DefaultToolTimeoutMS               = 30000
+	DefaultToolMaxOutputBytes          = 32768
+	DefaultLLMRequestTimeoutMS         = 120000
 )
 
 func Load(path string) (*AppConfig, error) {
+	return LoadWithOptions(path, LoadOptions{})
+}
+
+func LoadWithOptions(path string, options LoadOptions) (*AppConfig, error) {
 	if path == "" {
 		path = DefaultConfigFile
 	}
@@ -66,6 +75,9 @@ func Load(path string) (*AppConfig, error) {
 	}
 
 	applyDefaults(cfg)
+	if err := expandSensitiveConfig(cfg, options); err != nil {
+		return nil, err
+	}
 	if err := Validate(cfg); err != nil {
 		return nil, err
 	}
@@ -76,6 +88,9 @@ func Load(path string) (*AppConfig, error) {
 func loadSingle(path string) (*AppConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("无法读取配置文件 %q: %w；请复制 config.example.yaml 到 config.yaml 并填写 llm 配置", path, err)
+		}
 		return nil, fmt.Errorf("无法读取配置文件 %q: %w", path, err)
 	}
 
@@ -118,17 +133,65 @@ func applyDefaults(cfg *AppConfig) {
 	if cfg.Storage.DataDir == "" {
 		cfg.Storage.DataDir = DefaultDataDir
 	}
+	if cfg.LLM.RequestTimeoutMS == 0 {
+		cfg.LLM.RequestTimeoutMS = DefaultLLMRequestTimeoutMS
+	}
 	if cfg.LLM.Thinking.BudgetTokens <= 0 {
 		cfg.LLM.Thinking.BudgetTokens = DefaultThinkingBudget
 	}
+	applyAgentDefaults(&cfg.Agent)
+	applyToolDefaults(&cfg.Tool)
 	applyContextDefaults(&cfg.Context)
 	applyInstructionsDefaults(&cfg.Instructions)
 	applySessionDefaults(&cfg.Session)
 	applyMemoryDefaults(&cfg.Memory)
 }
 
+func applyAgentDefaults(cfg *AgentConfig) {
+	if cfg.MaxIterations <= 0 {
+		cfg.MaxIterations = DefaultAgentMaxIterations
+	}
+	if cfg.MaxUnknownToolCalls <= 0 {
+		cfg.MaxUnknownToolCalls = DefaultAgentMaxUnknownToolCalls
+	}
+}
+
+func applyToolDefaults(cfg *ToolConfig) {
+	if cfg.TimeoutMS <= 0 {
+		cfg.TimeoutMS = DefaultToolTimeoutMS
+	}
+	if cfg.MaxOutputBytes <= 0 {
+		cfg.MaxOutputBytes = DefaultToolMaxOutputBytes
+	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func Enabled(value *bool, defaultValue bool) bool {
+	if value == nil {
+		return defaultValue
+	}
+	return *value
+}
+
+func expandSensitiveConfig(cfg *AppConfig, options LoadOptions) error {
+	expanded, err := expandConfigValue(cfg.LLM.APIKey)
+	if err != nil {
+		return fmt.Errorf("llm.api_key: %w", err)
+	}
+	cfg.LLM.APIKey = expanded
+	if options.Redactor != nil {
+		options.Redactor.RegisterSecret(expanded)
+	}
+	return nil
+}
+
 func applyInstructionsDefaults(cfg *InstructionsConfig) {
-	cfg.Enabled = true
+	if cfg.Enabled == nil {
+		cfg.Enabled = boolPtr(true)
+	}
 	if cfg.ProjectFile == "" {
 		cfg.ProjectFile = DefaultInstructionsProjectFile
 	}
@@ -165,7 +228,9 @@ func applySessionDefaults(cfg *SessionConfig) {
 }
 
 func applyMemoryDefaults(cfg *MemoryConfig) {
-	cfg.Enabled = true
+	if cfg.Enabled == nil {
+		cfg.Enabled = boolPtr(true)
+	}
 	if cfg.UserDir == "" {
 		cfg.UserDir = DefaultMemoryUserDir
 	}
@@ -193,7 +258,9 @@ func applyMemoryDefaults(cfg *MemoryConfig) {
 }
 
 func applyContextDefaults(cfg *ContextConfig) {
-	cfg.Enabled = true
+	if cfg.Enabled == nil {
+		cfg.Enabled = boolPtr(true)
+	}
 	if cfg.ToolResultThresholdChars <= 0 {
 		cfg.ToolResultThresholdChars = DefaultContextToolResultThreshold
 	}

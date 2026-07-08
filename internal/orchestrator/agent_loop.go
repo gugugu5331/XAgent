@@ -12,7 +12,10 @@ import (
 )
 
 func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conversation, req RunRequest, out chan<- events.Event, start time.Time) bool {
-	options := defaultRunOptions()
+	options := o.runOptions
+	if options.MaxIterations <= 0 || options.MaxUnknownToolCalls <= 0 {
+		options = defaultRunOptions()
+	}
 	unknownToolCalls := 0
 	for iteration := 1; iteration <= options.MaxIterations; iteration++ {
 		out <- progressEvent(iteration, options.MaxIterations, "", "")

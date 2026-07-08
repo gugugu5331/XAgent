@@ -10,10 +10,15 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"xagent/internal/config"
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
 	"xagent/internal/events"
+	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
+	"xagent/internal/provider"
+	"xagent/internal/redact"
+	"xagent/internal/tool"
 	"xagent/internal/tui"
 )
 
@@ -44,6 +49,19 @@ func TestLoadConversationUsesRecoveringStoreAndShowsDiagnostics(t *testing.T) {
 	}
 	if strings.Contains(model.status.Notice, "secret") {
 		t.Fatalf("recovery notice leaked secret: %q", model.status.Notice)
+	}
+}
+
+func TestDiagnosticsCommandDisplaysRedactedLocalDiagnostics(t *testing.T) {
+	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redact.Text})
+	collector.Add(diagnostics.New("mcp_missing_env", diagnostics.SeverityWarning, "token=secret-token").WithSource("server"))
+	model := Model{screen: screenChat, input: tui.NewInput(""), diagnostics: collector, deps: Deps{Diagnostics: collector}}
+	model = submitLocalCommand(t, model, "/diagnostics")
+	if !strings.Contains(model.status.Notice, "本地诊断") || !strings.Contains(model.status.Notice, "mcp_missing_env") {
+		t.Fatalf("diagnostics notice missing details: %q", model.status.Notice)
+	}
+	if strings.Contains(model.status.Notice, "secret-token") {
+		t.Fatalf("diagnostics command leaked secret: %q", model.status.Notice)
 	}
 }
 
@@ -106,6 +124,78 @@ func TestMemoryCommandsAreHandledLocally(t *testing.T) {
 	model = submitMemoryCommand(t, model, "/memory rebuild nope")
 	if model.status.Error == nil || !strings.Contains(model.status.Error.Error(), "user 或 project") {
 		t.Fatalf("invalid scope did not produce local status error: %#v", model.status.Error)
+	}
+}
+
+func TestModelTracksRequestSessionLifecycle(t *testing.T) {
+	cancelled := false
+	model := Model{streaming: true, request: &RequestSession{Cancel: func() { cancelled = true }}, input: tui.NewInput("")}
+	updated, _ := model.Update(keyMsg("esc"))
+	model = updated.(Model)
+	if !cancelled || model.request != nil || model.streaming || model.status.Streaming || !model.input.Text.Focused() {
+		t.Fatalf("request was not cancelled and cleared: cancelled=%v model=%#v", cancelled, model)
+	}
+
+	model = Model{streaming: true, request: &RequestSession{Cancel: func() {}}, input: tui.NewInput("")}
+	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	model = updated.(Model)
+	if model.request != nil || model.streaming || model.status.Streaming {
+		t.Fatalf("done did not clear request session: %#v", model)
+	}
+}
+
+func TestStreamingKeysCancelBeforeQuit(t *testing.T) {
+	cancelled := false
+	closer := &fakeCloser{}
+	model := Model{streaming: true, request: &RequestSession{Cancel: func() { cancelled = true }}, input: tui.NewInput(""), deps: Deps{Closer: closer}}
+	updated, cmd := model.Update(keyMsg("ctrl+c"))
+	model = updated.(Model)
+	if cmd != nil || closer.closed {
+		t.Fatalf("ctrl+c during streaming should cancel, not quit: cmd=%v closer=%#v", cmd, closer)
+	}
+	if !cancelled || model.streaming || model.request != nil || !strings.Contains(model.status.Notice, "取消") {
+		t.Fatalf("streaming ctrl+c did not cancel request: cancelled=%v model=%#v", cancelled, model)
+	}
+}
+
+func TestNewSyncsMCPDiagnosticsToCollector(t *testing.T) {
+	store := &fakeRecoveringStore{}
+	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redact.Text})
+	status := &fakeCloser{summary: mcpclient.StatusSummary{Configured: 1, Failed: 1, Diagnostics: []mcpclient.Diagnostic{{Server: "srv", Message: "api_key=secret-key"}}}}
+	deps := Deps{Config: testAppConfig(), Provider: fakeProvider{name: "fake"}, Store: store, Resources: fakeResources{}, Diagnostics: collector, MCPStatus: status}
+	model := New(deps)
+	if model.diagnostics.Count() != 1 {
+		t.Fatalf("expected one MCP diagnostic in collector, got %d", model.diagnostics.Count())
+	}
+	items := model.diagnostics.List()
+	if items[0].Code != "mcp_status" || items[0].Source != "srv" || strings.Contains(items[0].Message, "secret-key") {
+		t.Fatalf("unexpected synced diagnostic: %#v", items[0])
+	}
+}
+
+func TestMCPStatusCommandDisplaysRedactedDetails(t *testing.T) {
+	status := &fakeCloser{summary: mcpclient.StatusSummary{Configured: 2, Ready: 1, Failed: 1, Diagnostics: []mcpclient.Diagnostic{{Server: "server", Message: "Authorization: Bearer abc123"}}}}
+	model := Model{screen: screenChat, input: tui.NewInput(""), deps: Deps{MCPStatus: status}}
+	model = submitLocalCommand(t, model, "/mcp status")
+	if !strings.Contains(model.status.Notice, "本地 MCP 状态") || !strings.Contains(model.status.Notice, "failed=1") {
+		t.Fatalf("mcp status missing summary: %q", model.status.Notice)
+	}
+	if strings.Contains(model.status.Notice, "abc123") {
+		t.Fatalf("mcp status leaked secret: %q", model.status.Notice)
+	}
+}
+
+func TestPermissionsStatusCommandHandledLocally(t *testing.T) {
+	root := t.TempDir()
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	deps := Deps{Config: testAppConfig(), Provider: fakeProvider{name: "fake"}, Store: &fakeRecoveringStore{}, Resources: fakeResources{}, Registry: registry, Executor: executor}
+	model := New(deps)
+	model.screen = screenChat
+	model.input = tui.NewInput("")
+	model = submitLocalCommand(t, model, "/permissions status")
+	if !strings.Contains(model.status.Notice, "本地权限状态") || !strings.Contains(model.status.Notice, "mode=default") {
+		t.Fatalf("permissions status missing details: %q", model.status.Notice)
 	}
 }
 
@@ -208,14 +298,19 @@ func TestCloseReportsMCPStatusAndCloseError(t *testing.T) {
 
 func submitMemoryCommand(t *testing.T, model Model, command string) Model {
 	t.Helper()
+	return submitLocalCommand(t, model, command)
+}
+
+func submitLocalCommand(t *testing.T, model Model, command string) Model {
+	t.Helper()
 	model.input.Text.SetValue(command)
 	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd != nil {
-		t.Fatalf("memory command returned async command, likely reached orchestrator")
+		t.Fatalf("local command returned async command, likely reached orchestrator")
 	}
 	model = updated.(Model)
 	if model.input.Value() != "" {
-		t.Fatalf("memory command input was not cleared: %q", model.input.Value())
+		t.Fatalf("local command input was not cleared: %q", model.input.Value())
 	}
 	return model
 }
@@ -263,9 +358,10 @@ func keyMsg(key string) tea.KeyMsg {
 }
 
 type fakeCloser struct {
-	closed bool
-	status string
-	err    error
+	closed  bool
+	status  string
+	summary mcpclient.StatusSummary
+	err     error
 }
 
 func (f *fakeCloser) Close(ctx context.Context) error {
@@ -275,6 +371,38 @@ func (f *fakeCloser) Close(ctx context.Context) error {
 
 func (f *fakeCloser) StatusLine() string {
 	return f.status
+}
+
+func (f *fakeCloser) Summary() mcpclient.StatusSummary {
+	return f.summary
+}
+
+func (f *fakeCloser) Diagnostics() []mcpclient.Diagnostic {
+	return f.summary.Diagnostics
+}
+
+type fakeProvider struct{ name string }
+
+func (f fakeProvider) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "fake"
+}
+
+func (f fakeProvider) StreamChat(ctx context.Context, req provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+	ch := make(chan provider.StreamEvent)
+	close(ch)
+	return ch, nil
+}
+
+type fakeResources struct{}
+
+func (fakeResources) SystemPrompt() string      { return "" }
+func (fakeResources) UILabel(key string) string { return key }
+
+func testAppConfig() *config.AppConfig {
+	return &config.AppConfig{LLM: config.LLMConfig{Model: "fake", RequestTimeoutMS: 1000}, UI: config.UIConfig{StartMode: config.StartModeList}}
 }
 
 func closedEvents() <-chan Event {

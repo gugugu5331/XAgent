@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"xagent/internal/permission"
 )
@@ -144,5 +145,9 @@ func truncateString(value string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(value) <= maxBytes {
 		return value, false
 	}
-	return value[:maxBytes] + "\n...[truncated]", true
+	truncated := value[:maxBytes]
+	for !utf8.ValidString(truncated) && len(truncated) > 0 {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + "\n...[truncated]", true
 }

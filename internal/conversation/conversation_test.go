@@ -24,8 +24,38 @@ func TestContextMessagesIncludeSummaryBoundaryAndExternalPreview(t *testing.T) {
 	if messages[0].Role != RoleContextSummary || messages[1].Role != RoleContextBoundary {
 		t.Fatalf("missing summary/boundary roles: %#v", messages)
 	}
-	if !strings.Contains(messages[2].ToolResultContent, "preview") || !strings.Contains(messages[2].ToolResultContent, "重新读取") {
+	if !strings.Contains(messages[2].ToolResultContent, "preview") || !strings.Contains(messages[2].ToolResultContent, "artifact_id") {
 		t.Fatalf("externalized result not represented safely: %#v", messages[2])
+	}
+	if strings.Contains(messages[2].ToolResultContent, conv.Messages[2].ExternalPath) {
+		t.Fatalf("externalized context leaked path: %#v", messages[2])
+	}
+}
+
+func TestOrdinaryConversationJSONLAllowsUserContentButRedactsDiagnostics(t *testing.T) {
+	conv := NewConversation("c1", time.Now())
+	AppendUserMessage(conv, "用户明确输入 token=ordinary-secret")
+	record := JSONLRecord{
+		Version:     JSONLVersion,
+		Type:        RecordTypeMessage,
+		SessionID:   conv.ID,
+		CreatedAt:   time.Now(),
+		Message:     &conv.Messages[0],
+		Diagnostics: []JSONLDiagnostic{newJSONLDiagnostic("jsonl_bad_line", "坏行 token=diagnostic-secret", JSONLSeverityWarning)},
+		Error:       "error api_key=error-secret",
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "ordinary-secret") {
+		t.Fatalf("ordinary user content should be preserved for session recovery: %s", text)
+	}
+	for _, secret := range []string{"diagnostic-secret", "error-secret"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("jsonl record leaked derived secret %q: %s", secret, text)
+		}
 	}
 }
 

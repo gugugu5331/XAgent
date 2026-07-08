@@ -12,6 +12,47 @@ import (
 	"xagent/internal/prompt"
 )
 
+func TestLoaderUsesInstructionFallbackFiles(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := testConfig()
+	writeInstructionFile(t, filepath.Join(projectRoot, "CLAUDE.md"), "claude instruction")
+	loader := Loader{ProjectRoot: projectRoot, Config: cfg}
+	sections, items := loader.Load(context.Background())
+	if len(items) != 0 {
+		t.Fatalf("diagnostics = %#v, want empty", items)
+	}
+	if len(sections) != 1 || sections[0].Content != "claude instruction" {
+		t.Fatalf("sections = %#v, want CLAUDE.md fallback", sections)
+	}
+
+	projectRoot = t.TempDir()
+	writeInstructionFile(t, filepath.Join(projectRoot, "AGENTS.md"), "agents instruction")
+	loader = Loader{ProjectRoot: projectRoot, Config: cfg}
+	sections, items = loader.Load(context.Background())
+	if len(items) != 0 {
+		t.Fatalf("diagnostics = %#v, want empty", items)
+	}
+	if len(sections) != 1 || sections[0].Content != "agents instruction" {
+		t.Fatalf("sections = %#v, want AGENTS.md fallback", sections)
+	}
+}
+
+func TestLoaderExplicitProjectFileOverridesFallbackFiles(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := testConfig()
+	cfg.ProjectFile = "CUSTOM.md"
+	writeInstructionFile(t, filepath.Join(projectRoot, "CUSTOM.md"), "custom instruction")
+	writeInstructionFile(t, filepath.Join(projectRoot, "CLAUDE.md"), "claude instruction")
+	loader := Loader{ProjectRoot: projectRoot, Config: cfg}
+	sections, items := loader.Load(context.Background())
+	if len(items) != 0 {
+		t.Fatalf("diagnostics = %#v, want empty", items)
+	}
+	if len(sections) != 1 || sections[0].Content != "custom instruction" {
+		t.Fatalf("sections = %#v, want only explicit project file", sections)
+	}
+}
+
 func TestLoaderOrdersInstructionScopes(t *testing.T) {
 	projectRoot := t.TempDir()
 	userRoot := t.TempDir()
@@ -183,6 +224,58 @@ func TestIncludeRejectsParentEscape(t *testing.T) {
 		t.Fatalf("parent escaped content leaked into sections: %#v", sections)
 	}
 	assertInstructionDiagnostic(t, items, "instructions_path_escape")
+}
+
+func TestCachedLoaderInvalidatesWhenRootInstructionChanges(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := testConfig()
+	path := filepath.Join(projectRoot, cfg.ProjectFile)
+	writeInstructionFile(t, path, "first")
+
+	loader := &CachedLoader{Loader: Loader{ProjectRoot: projectRoot, Config: cfg}}
+	sections, items := loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 1 || sections[0].Content != "first" {
+		t.Fatalf("initial load = %#v diagnostics=%#v", sections, items)
+	}
+	sections[0].Content = "polluted"
+	writeInstructionFile(t, path, "second")
+	sections, items = loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 1 || sections[0].Content != "second" {
+		t.Fatalf("reloaded sections = %#v diagnostics=%#v", sections, items)
+	}
+}
+
+func TestCachedLoaderInvalidatesWhenIncludeChanges(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := testConfig()
+	writeInstructionFile(t, filepath.Join(projectRoot, cfg.ProjectFile), "root\n@include inc.md")
+	writeInstructionFile(t, filepath.Join(projectRoot, "inc.md"), "first include")
+
+	loader := &CachedLoader{Loader: Loader{ProjectRoot: projectRoot, Config: cfg}}
+	sections, items := loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 1 || !strings.Contains(sections[0].Content, "first include") {
+		t.Fatalf("initial load = %#v diagnostics=%#v", sections, items)
+	}
+	writeInstructionFile(t, filepath.Join(projectRoot, "inc.md"), "second include")
+	sections, items = loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 1 || !strings.Contains(sections[0].Content, "second include") {
+		t.Fatalf("reloaded sections = %#v diagnostics=%#v", sections, items)
+	}
+}
+
+func TestCachedLoaderInvalidatesWhenMissingInstructionAppears(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := testConfig()
+	loader := &CachedLoader{Loader: Loader{ProjectRoot: projectRoot, Config: cfg}}
+	sections, items := loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 0 {
+		t.Fatalf("initial load = %#v diagnostics=%#v", sections, items)
+	}
+	writeInstructionFile(t, filepath.Join(projectRoot, cfg.ProjectFile), "created later")
+	sections, items = loader.Load(context.Background())
+	if len(items) != 0 || len(sections) != 1 || sections[0].Content != "created later" {
+		t.Fatalf("reloaded sections = %#v diagnostics=%#v", sections, items)
+	}
 }
 
 func testConfig() config.InstructionsConfig {

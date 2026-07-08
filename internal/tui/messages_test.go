@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -62,6 +63,47 @@ func TestMessagesViewKeepsLiveToolInTimeline(t *testing.T) {
 	after := strings.Index(output, "读取完成。")
 	if before < 0 || toolLine < 0 || after < 0 || !(before < toolLine && toolLine < after) {
 		t.Fatalf("unexpected timeline order: %q", output)
+	}
+}
+
+func TestMessagesViewRendersToolErrorDetails(t *testing.T) {
+	view := NewMessagesView(false)
+	view.UpsertTool(events.ToolDisplay{
+		CallID:            "call_1",
+		Name:              "Bash",
+		Arguments:         `{"command":"go test ./..."}`,
+		Summary:           "Command exited 1",
+		Status:            events.ToolDisplayError,
+		ErrorCode:         "command_failed",
+		Stdout:            "ok package",
+		Stderr:            "failed package",
+		Truncated:         true,
+		Recoverable:       true,
+		ArtifactID:        "call_1",
+		ArtifactBytes:     123,
+		ArtifactAvailable: true,
+	})
+	output := view.View()
+	for _, want := range []string{"● Bash(go test ./...)", "error: command_failed", "stdout: ok package", "stderr: failed package", "output truncated", "recoverable", "artifact: call_1 (123 bytes)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q: %q", want, output)
+		}
+	}
+}
+
+func TestMessagesViewRestoresToolErrorDetailsFromHistory(t *testing.T) {
+	data, _ := json.Marshal(map[string]any{"stdout": "ok package", "stderr": "failed package", "artifact_id": "call_1", "artifact_bytes": 123, "artifact_available": true})
+	errorData, _ := json.Marshal(map[string]any{"code": "command_failed", "recoverable": true})
+	view := NewMessagesView(false)
+	view.SetMessages([]conversation.Message{
+		{Role: conversation.RoleToolCall, ToolCallID: "call_1", ToolName: "Bash", RawToolArguments: `{"command":"go test ./..."}`},
+		{Role: conversation.RoleToolResult, ToolCallID: "call_1", ToolName: "Bash", ToolResultStatus: "error", ToolResultSummary: "Command exited 1", ToolErrorCode: "command_failed", ToolResultTruncated: true, ToolResultData: data, ToolResultError: errorData},
+	})
+	output := view.View()
+	for _, want := range []string{"error: command_failed", "stdout: ok package", "stderr: failed package", "output truncated", "recoverable", "artifact: call_1 (123 bytes)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q: %q", want, output)
+		}
 	}
 }
 

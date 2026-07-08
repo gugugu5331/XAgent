@@ -2,8 +2,11 @@ package permission
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+
+	"xagent/internal/redact"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +26,9 @@ func (w Writer) PreviewRule(normalized NormalizedCall) Rule {
 }
 
 func (w Writer) WriteLocal(rule Rule) error {
+	if ruleContainsSecret(rule) {
+		return fmt.Errorf("permission rule contains sensitive value")
+	}
 	if err := rule.Validate(); err != nil {
 		return err
 	}
@@ -93,6 +99,15 @@ func validateLocalRulePath(projectRoot string) error {
 		return err
 	}
 	return nil
+}
+
+func ruleContainsSecret(rule Rule) bool {
+	for _, value := range []string{rule.Pattern, rule.PathParam, rule.Description} {
+		if value != "" && redact.Text(value) != value {
+			return true
+		}
+	}
+	return false
 }
 
 func appendUniqueRule(rules []Rule, rule Rule) []Rule {

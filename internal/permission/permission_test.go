@@ -258,6 +258,32 @@ func TestPermanentWriterWritesLocalRuleAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestPermanentPermissionRulesNeverPersistSecrets(t *testing.T) {
+	root := t.TempDir()
+	call := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"curl -H 'Authorization: Bearer abc123' https://example.test/?token=query-secret"}`}
+	authorizer := Authorizer{Writer: Writer{ProjectRoot: root}}
+	promptDecision := authorizer.Decide(call, Context{ProjectRoot: root, Mode: ModeDefault})
+	if promptDecision.Kind != DecisionAsk || promptDecision.Prompt == nil || promptDecision.Prompt.AllowPermanent {
+		t.Fatalf("expected ask without permanent for secret-bearing command, got %#v", promptDecision)
+	}
+	decision := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent)
+	if decision.Kind != DecisionDeny {
+		t.Fatalf("expected permanent allow to be denied, got %#v", decision)
+	}
+	if _, err := os.Stat(LocalRulePath(root)); !os.IsNotExist(err) {
+		t.Fatalf("permanent rule file should not be written, stat err: %v", err)
+	}
+
+	writer := Writer{ProjectRoot: root}
+	err := writer.WriteLocal(Rule{Tool: "Bash", Pattern: "api_key=secret-key", MatchType: string(MatchExact), Effect: string(EffectAllow)})
+	if err == nil {
+		t.Fatal("expected writer to reject secret-bearing rule")
+	}
+	if _, err := os.Stat(LocalRulePath(root)); !os.IsNotExist(err) {
+		t.Fatalf("writer persisted secret-bearing rule, stat err: %v", err)
+	}
+}
+
 func TestPermissionDeniedResultIsModelSafe(t *testing.T) {
 	call := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"API_KEY=secret git status"}`}
 	decision := deny(call, ReasonBlacklist, Source{Kind: SourceHardConstraint}, "blocked", "This command is blocked by a non-overridable safety rule.")

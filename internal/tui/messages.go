@@ -115,11 +115,40 @@ func renderToolDisplay(tool events.ToolDisplay) string {
 	if strings.TrimSpace(status) != "" {
 		line += " — " + status
 	}
+	if detail := renderToolDetails(tool); detail != "" {
+		line += "\n" + detail
+	}
 	style := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	if tool.Status == events.ToolDisplayError || tool.Status == events.ToolDisplayDenied || tool.Status == events.ToolDisplayCancelled {
 		style = style.Foreground(lipgloss.Color("9"))
 	}
 	return style.Render(line)
+}
+
+func renderToolDetails(tool events.ToolDisplay) string {
+	var details []string
+	if strings.TrimSpace(tool.ErrorCode) != "" {
+		details = append(details, "error: "+tool.ErrorCode)
+	}
+	if tool.Truncated {
+		details = append(details, "output truncated")
+	}
+	if tool.Recoverable {
+		details = append(details, "recoverable")
+	}
+	if strings.TrimSpace(tool.Stdout) != "" {
+		details = append(details, "stdout: "+previewText(tool.Stdout, 160))
+	}
+	if strings.TrimSpace(tool.Stderr) != "" {
+		details = append(details, "stderr: "+previewText(tool.Stderr, 160))
+	}
+	if tool.ArtifactAvailable && strings.TrimSpace(tool.ArtifactID) != "" {
+		details = append(details, fmt.Sprintf("artifact: %s (%d bytes)", tool.ArtifactID, tool.ArtifactBytes))
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return "  " + strings.Join(details, "\n  ")
 }
 
 func toolStatusText(status events.ToolDisplayStatus) string {
@@ -141,6 +170,14 @@ func toolStatusText(status events.ToolDisplayStatus) string {
 	default:
 		return ""
 	}
+}
+
+func previewText(value string, limit int) string {
+	if len([]rune(value)) <= limit {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:limit]) + "..."
 }
 
 func summarizeArguments(raw string) string {
@@ -174,6 +211,10 @@ func applyToolDisplay(message *conversation.Message, tool events.ToolDisplay) {
 	message.ToolResultStatus = string(toolStatusResult(tool.Status))
 	message.RawToolArguments = tool.Arguments
 	message.Content = tool.Summary
+	message.ToolErrorCode = tool.ErrorCode
+	message.ToolResultTruncated = tool.Truncated
+	message.ToolResultData = toolDisplayData(tool)
+	message.ToolResultError = toolDisplayError(tool)
 }
 
 func toolArgumentsForCall(messages []conversation.Message, callID string) string {
@@ -223,11 +264,19 @@ func toolDisplayStatus(status string) events.ToolDisplayStatus {
 
 func toolDisplayFromHistory(messages []conversation.Message, result conversation.Message) events.ToolDisplay {
 	display := events.ToolDisplay{
-		CallID:    result.ToolCallID,
-		Name:      result.ToolName,
-		Arguments: result.RawToolArguments,
-		Summary:   result.ToolResultSummary,
-		Status:    toolDisplayStatus(result.ToolResultStatus),
+		CallID:            result.ToolCallID,
+		Name:              result.ToolName,
+		Arguments:         result.RawToolArguments,
+		Summary:           result.ToolResultSummary,
+		Status:            toolDisplayStatus(result.ToolResultStatus),
+		ErrorCode:         result.ToolErrorCode,
+		Truncated:         result.ToolResultTruncated,
+		Stdout:            stringToolData(result.ToolResultData, "stdout"),
+		Stderr:            stringToolData(result.ToolResultData, "stderr"),
+		ArtifactID:        stringToolData(result.ToolResultData, "artifact_id"),
+		ArtifactBytes:     int64ToolData(result.ToolResultData, "artifact_bytes"),
+		ArtifactAvailable: boolToolData(result.ToolResultData, "artifact_available"),
+		Recoverable:       recoverableToolError(result.ToolResultError),
 	}
 	for _, message := range messages {
 		if message.Role == conversation.RoleToolCall && message.ToolCallID == result.ToolCallID {
@@ -236,4 +285,86 @@ func toolDisplayFromHistory(messages []conversation.Message, result conversation
 		}
 	}
 	return display
+}
+
+func toolDisplayData(tool events.ToolDisplay) json.RawMessage {
+	data := map[string]any{}
+	if strings.TrimSpace(tool.Stdout) != "" {
+		data["stdout"] = tool.Stdout
+	}
+	if strings.TrimSpace(tool.Stderr) != "" {
+		data["stderr"] = tool.Stderr
+	}
+	if strings.TrimSpace(tool.ArtifactID) != "" {
+		data["artifact_id"] = tool.ArtifactID
+	}
+	if tool.ArtifactBytes > 0 {
+		data["artifact_bytes"] = tool.ArtifactBytes
+	}
+	if tool.ArtifactAvailable {
+		data["artifact_available"] = true
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func toolDisplayError(tool events.ToolDisplay) json.RawMessage {
+	if strings.TrimSpace(tool.ErrorCode) == "" && !tool.Recoverable {
+		return nil
+	}
+	encoded, err := json.Marshal(map[string]any{"code": tool.ErrorCode, "recoverable": tool.Recoverable})
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func stringToolData(raw json.RawMessage, key string) string {
+	var data map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return ""
+	}
+	value, _ := data[key].(string)
+	return value
+}
+
+func boolToolData(raw json.RawMessage, key string) bool {
+	var data map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return false
+	}
+	value, _ := data[key].(bool)
+	return value
+}
+
+func int64ToolData(raw json.RawMessage, key string) int64 {
+	var data map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return 0
+	}
+	switch value := data[key].(type) {
+	case float64:
+		return int64(value)
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	default:
+		return 0
+	}
+}
+
+func recoverableToolError(raw json.RawMessage) bool {
+	var data map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return false
+	}
+	value, _ := data["recoverable"].(bool)
+	return value
 }

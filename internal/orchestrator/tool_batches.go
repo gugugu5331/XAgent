@@ -152,14 +152,7 @@ func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, i
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	case permission.DecisionAsk:
 		decisionCh := make(chan events.ToolConfirmationDecision, 1)
-		confirmation := &events.ToolConfirmationRequest{
-			CallID:         call.ID,
-			Name:           call.Name,
-			Arguments:      redactedArguments(call),
-			Prompt:         formatPermissionPrompt(call, decision),
-			AllowPermanent: decision.Prompt != nil && decision.Prompt.AllowPermanent,
-			Decision:       decisionCh,
-		}
+		confirmation := confirmationRequest(call, decision, decisionCh)
 		out <- events.Event{Type: events.ToolWaitingConfirmation, Tool: newToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}
 		select {
 		case <-ctx.Done():

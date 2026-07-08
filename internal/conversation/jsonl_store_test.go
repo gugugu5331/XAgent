@@ -270,14 +270,25 @@ func TestJSONLStoreListScansRecordsWithoutMeta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list conversations: %v", err)
 	}
-	if len(conversations) != 2 {
-		t.Fatalf("len(conversations) = %d, want 2: %#v", len(conversations), conversations)
+	if len(conversations) != 3 {
+		t.Fatalf("len(conversations) = %d, want 3: %#v", len(conversations), conversations)
 	}
-	if conversations[0].ID != "newer" || conversations[1].ID != "older" {
-		t.Fatalf("list order = %q, %q; want newer, older", conversations[0].ID, conversations[1].ID)
+	ids := map[string]Conversation{}
+	for _, conversation := range conversations {
+		ids[conversation.ID] = conversation
 	}
-	if conversations[0].Title != "新会话" || len(conversations[0].Messages) != 1 {
-		t.Fatalf("newer summary reconstructed incorrectly: %#v", conversations[0])
+	if _, ok := ids["newer"]; !ok {
+		t.Fatalf("list missing newer: %#v", conversations)
+	}
+	if _, ok := ids["older"]; !ok {
+		t.Fatalf("list missing older: %#v", conversations)
+	}
+	broken, ok := ids["broken"]
+	if !ok || !strings.Contains(broken.Title, "可恢复") {
+		t.Fatalf("list should include recoverable broken placeholder: %#v", conversations)
+	}
+	if ids["newer"].Title != "新会话" || len(ids["newer"].Messages) != 1 {
+		t.Fatalf("newer summary reconstructed incorrectly: %#v", ids["newer"])
 	}
 }
 
@@ -425,6 +436,102 @@ func TestJSONLRecoverInsertsTimeGapReminder(t *testing.T) {
 	}
 	if lines := countJSONLLines(t, store.path(conversation.ID)); lines != 2 {
 		t.Fatalf("recovered reminder should be appendable, lines = %d, want 2", lines)
+	}
+}
+
+func TestListIncludesRecoverableCorruptJSONLWithoutLeakingLine(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewJSONLStore(JSONLStoreOptions{DataDir: t.TempDir(), Now: fixedClock(time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC))})
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	path := store.path("corrupt-list")
+	badLine := `{"version":1,"type":"message","message":{"role":"user","content":"token=should-not-leak"}`
+	writeRawText(t, path, badLine+"\n")
+
+	conversations, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("list conversations: %v", err)
+	}
+	var placeholder *Conversation
+	for index := range conversations {
+		if conversations[index].ID == "corrupt-list" {
+			placeholder = &conversations[index]
+			break
+		}
+	}
+	if placeholder == nil {
+		t.Fatalf("List 应包含损坏 JSONL 的可恢复占位: %#v", conversations)
+	}
+	if !strings.Contains(placeholder.Title, "可恢复") {
+		t.Fatalf("占位标题应提示可恢复: %#v", placeholder)
+	}
+	if placeholder.Context == nil || len(placeholder.Context.RecoveryDiagnostics) == 0 {
+		t.Fatalf("占位应包含恢复诊断: %#v", placeholder.Context)
+	}
+	data, err := json.Marshal(placeholder.Context.RecoveryDiagnostics)
+	if err != nil {
+		t.Fatalf("marshal diagnostics: %v", err)
+	}
+	text := string(data)
+	for _, leaked := range []string{"token=should-not-leak", badLine} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("恢复诊断不应包含坏行原文 %q: %s", leaked, text)
+		}
+	}
+	if !strings.Contains(text, "line") || !strings.Contains(text, "recoverable") {
+		t.Fatalf("恢复诊断应包含行号和可恢复状态: %s", text)
+	}
+}
+
+func TestRecoveredCorruptJSONLCanSaveAgain(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewJSONLStore(JSONLStoreOptions{DataDir: t.TempDir(), Now: fixedClock(time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC))})
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	conversation := NewConversation("corrupt-save", time.Date(2026, 7, 5, 10, 0, 0, 0, time.UTC))
+	AppendUserMessage(conversation, "恢复前")
+	appendRawRecord(t, store.path(conversation.ID), JSONLRecord{Version: JSONLVersion, Type: RecordTypeMessage, SessionID: conversation.ID, MessageIndex: 0, CreatedAt: time.Date(2026, 7, 5, 10, 0, 0, 0, time.UTC), ConversationTitle: conversation.Title, ConversationCreatedAt: conversation.CreatedAt, ConversationUpdatedAt: conversation.UpdatedAt, Message: &conversation.Messages[0]})
+	badLine := `{"version":1,"type":"message","message":{"role":"user","content":"password=bad-line-secret"}`
+	file, err := os.OpenFile(store.path(conversation.ID), os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open append bad line: %v", err)
+	}
+	if _, err := file.WriteString(badLine + "\n"); err != nil {
+		t.Fatalf("write bad line: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close bad line file: %v", err)
+	}
+
+	recovered, report, err := store.Recover(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.SkippedLines != 1 {
+		t.Fatalf("SkippedLines = %d, want 1", report.SkippedLines)
+	}
+	AppendAssistantMessage(recovered, "恢复后继续")
+	if err := store.Save(ctx, recovered); err != nil {
+		t.Fatalf("Recover 后 Save 不应被旧坏行阻断: %v", err)
+	}
+
+	records := readJSONLRecordsSkippingBadLines(t, store.path(conversation.ID))
+	last := records[len(records)-1]
+	if last.Type != RecordTypeSnapshot {
+		t.Fatalf("检测到旧坏行后应追加 repair snapshot，last = %q", last.Type)
+	}
+	assertHasDiagnostic(t, last.Diagnostics, "jsonl_repair_snapshot")
+	if last.Snapshot == nil || len(last.Snapshot.Messages) != 2 || last.Snapshot.Messages[1].Content != "恢复后继续" {
+		t.Fatalf("repair snapshot 应包含恢复后完整会话: %#v", last.Snapshot)
+	}
+	data, err := json.Marshal(last.Diagnostics)
+	if err != nil {
+		t.Fatalf("marshal diagnostics: %v", err)
+	}
+	if strings.Contains(string(data), "password=bad-line-secret") || strings.Contains(string(data), badLine) {
+		t.Fatalf("repair diagnostics 不应包含坏行原文: %s", data)
 	}
 }
 
@@ -577,6 +684,32 @@ func readJSONLRecords(t *testing.T, path string) []JSONLRecord {
 		var record JSONLRecord
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			t.Fatalf("unmarshal %s: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan %s: %v", path, err)
+	}
+	return records
+}
+
+func readJSONLRecordsSkippingBadLines(t *testing.T, path string) []JSONLRecord {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer file.Close()
+	var records []JSONLRecord
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var record JSONLRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue
 		}
 		records = append(records, record)
 	}

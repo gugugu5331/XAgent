@@ -17,14 +17,15 @@ type Conversation struct {
 }
 
 type ContextMetadata struct {
-	Summary                 string     `json:"summary,omitempty"`
-	LastBoundary            string     `json:"last_boundary,omitempty"`
-	LastCompressionAt       *time.Time `json:"last_compression_at,omitempty"`
-	SummaryFailureCount     int        `json:"summary_failure_count,omitempty"`
-	LastInputTokens         int64      `json:"last_input_tokens,omitempty"`
-	LastOutputTokens        int64      `json:"last_output_tokens,omitempty"`
-	LastEstimatedTokens     int64      `json:"last_estimated_tokens,omitempty"`
-	LastEstimatedCharacters int        `json:"last_estimated_characters,omitempty"`
+	Summary                 string            `json:"summary,omitempty"`
+	LastBoundary            string            `json:"last_boundary,omitempty"`
+	LastCompressionAt       *time.Time        `json:"last_compression_at,omitempty"`
+	SummaryFailureCount     int               `json:"summary_failure_count,omitempty"`
+	LastInputTokens         int64             `json:"last_input_tokens,omitempty"`
+	LastOutputTokens        int64             `json:"last_output_tokens,omitempty"`
+	LastEstimatedTokens     int64             `json:"last_estimated_tokens,omitempty"`
+	LastEstimatedCharacters int               `json:"last_estimated_characters,omitempty"`
+	RecoveryDiagnostics     []JSONLDiagnostic `json:"recovery_diagnostics,omitempty"`
 }
 
 func NewConversation(id string, now time.Time) *Conversation {
@@ -123,15 +124,31 @@ func externalizedContent(message Message) string {
 		builder.WriteString("\n\n")
 	}
 	builder.WriteString("[工具结果已外置保存")
+	if strings.TrimSpace(message.ToolCallID) != "" {
+		builder.WriteString(", artifact_id: ")
+		builder.WriteString(safeArtifactID(message.ToolCallID))
+	}
 	if message.ExternalBytes > 0 {
 		builder.WriteString(", 大小 ")
 		builder.WriteString(formatBytes(message.ExternalBytes))
 	}
-	if strings.TrimSpace(message.ExternalPath) != "" {
-		builder.WriteString(", 路径: ")
-		builder.WriteString(message.ExternalPath)
+	builder.WriteString("。如需完整细节，请由本地用户显式查看该 artifact，不要根据预览或摘要脑补。]")
+	return builder.String()
+}
+
+func safeArtifactID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "tool_result"
 	}
-	builder.WriteString("。如需完整细节，请重新读取该文件，不要根据预览或摘要脑补。]")
+	var builder strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			builder.WriteRune(r)
+		} else {
+			builder.WriteByte('_')
+		}
+	}
 	return builder.String()
 }
 

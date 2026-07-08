@@ -12,6 +12,7 @@ import (
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
+	"xagent/internal/diagnostics"
 	"xagent/internal/events"
 	"xagent/internal/memory"
 	"xagent/internal/permission"
@@ -429,6 +430,43 @@ func TestToolDisplayAndConversationUseRedactedArguments(t *testing.T) {
 	}
 }
 
+func TestToolDisplayExtractsRedactedFailureDetails(t *testing.T) {
+	display := resultDisplay(tool.Result{
+		CallID:    "call",
+		Name:      "Bash",
+		Status:    tool.StatusError,
+		Summary:   "Command exited 1",
+		Data:      map[string]any{"stdout": "api_key=secret-key", "stderr": "Authorization: Bearer abc123", "artifact_id": "call", "artifact_bytes": float64(42), "artifact_available": true},
+		Error:     &tool.Error{Code: tool.ErrCommandFailed, Recoverable: true},
+		Truncated: true,
+	})
+	if display.Status != events.ToolDisplayError || display.ErrorCode != tool.ErrCommandFailed || !display.Recoverable || !display.Truncated {
+		t.Fatalf("unexpected display metadata: %#v", display)
+	}
+	if strings.Contains(display.Stdout, "secret-key") || strings.Contains(display.Stderr, "abc123") {
+		t.Fatalf("display leaked secrets: %#v", display)
+	}
+	if display.ArtifactID != "call" || display.ArtifactBytes != 42 || !display.ArtifactAvailable {
+		t.Fatalf("unexpected artifact metadata: %#v", display)
+	}
+}
+
+func TestConfirmationRequestIncludesRiskScopeAndWarnings(t *testing.T) {
+	call := tool.Call{ID: "call", Name: "Bash", ArgumentsJSON: `{"command":"go test ./..."}`}
+	rule := permission.Rule{Tool: "Bash", Pattern: "go test ./...", MatchType: string(permission.MatchExact), Effect: string(permission.EffectAllow)}
+	decision := permission.Decision{Prompt: &permission.ConfirmationPrompt{Risk: permission.RiskHigh, Reason: "bash requires confirmation", Mode: permission.ModePermissive, RulePreview: &rule, AllowPermanent: false}}
+	decisionCh := make(chan events.ToolConfirmationDecision, 1)
+	request := confirmationRequest(call, decision, decisionCh)
+	if request.Risk != "high" || request.PermissionMode != "permissive" || request.ScopePreview == "" || request.Warning == "" || request.RevokeHint == "" || request.AllowPermanent {
+		t.Fatalf("confirmation request missing details: %#v", request)
+	}
+	for _, want := range []string{"风险: high", "模式: permissive", "范围:", "警告:", "不支持永久授权"} {
+		if !strings.Contains(request.Prompt, want) {
+			t.Fatalf("prompt missing %q: %s", want, request.Prompt)
+		}
+	}
+}
+
 func TestPermissionActionMapping(t *testing.T) {
 	cases := []struct {
 		decision events.ToolConfirmationDecision
@@ -657,6 +695,45 @@ func TestAgentLoopStopsAtMaxIterations(t *testing.T) {
 	}
 	if !sawReason || fp.calls != defaultRunOptions().MaxIterations {
 		t.Fatalf("expected max iteration stop, sawReason=%v calls=%d", sawReason, fp.calls)
+	}
+}
+
+func TestAgentOptionsControlLoopLimits(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := store.Create(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	fp := &fakeProvider{events: [][]provider.StreamEvent{
+		{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "call_1", Name: "Read", ArgumentsJSON: `{"path":"note.txt"}`}}},
+		{{Type: provider.StreamEventTextDelta, Delta: "不应到达"}, {Type: provider.StreamEventDone}},
+	}}
+	orch := NewWithOptions(OrchestratorOptions{Provider: fp, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, Agent: config.AgentConfig{MaxIterations: 1, MaxUnknownToolCalls: 1}})
+
+	stream, err := orch.Send(context.Background(), conv, "配置限制")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawReason bool
+	for event := range stream {
+		if event.Progress != nil && event.Progress.StopReason == string(StopReasonMaxIterations) {
+			sawReason = true
+		}
+		if event.Type == events.Error {
+			t.Fatal(event.Err)
+		}
+	}
+	if !sawReason || fp.calls != 1 {
+		t.Fatalf("expected configured max iteration stop after one call, sawReason=%v calls=%d", sawReason, fp.calls)
 	}
 }
 
@@ -948,6 +1025,41 @@ func TestStreamPreparesSessionContextBeforeProviderRequest(t *testing.T) {
 	}
 }
 
+func TestSessionContextDiagnosticsAreStoredNotSentToProvider(t *testing.T) {
+	root := t.TempDir()
+	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := store.Create(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &captureProvider{}
+	registry, _ := tool.NewRegistry(root)
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{})
+	prep := &fakeSessionContext{diagnostics: []diagnostics.Diagnostic{diagnostics.New("instructions_path_escape", diagnostics.SeverityWarning, "secret diagnostic body")}}
+	orch := NewWithOptions(OrchestratorOptions{Provider: provider, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, SessionContext: prep, Diagnostics: collector})
+	stream, err := orch.Send(context.Background(), conv, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range stream {
+		if event.Type == events.Error {
+			t.Fatal(event.Err)
+		}
+	}
+	if collector.Count() != 1 || collector.List()[0].Code != "instructions_path_escape" {
+		t.Fatalf("collector did not store diagnostic: %#v", collector.List())
+	}
+	for _, message := range provider.request.Messages {
+		if strings.Contains(message.Content, "secret diagnostic body") || strings.Contains(message.ToolResultContent, "secret diagnostic body") {
+			t.Fatalf("diagnostic leaked to provider messages: %#v", provider.request.Messages)
+		}
+	}
+}
+
 func TestMemoryUpdatesOnlyAfterCompletedAgentLoop(t *testing.T) {
 	root := t.TempDir()
 	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
@@ -992,14 +1104,15 @@ func TestMemoryUpdatesOnlyAfterCompletedAgentLoop(t *testing.T) {
 }
 
 type fakeSessionContext struct {
-	sections []prompt.Section
-	changed  bool
-	calls    int
+	sections    []prompt.Section
+	diagnostics []diagnostics.Diagnostic
+	changed     bool
+	calls       int
 }
 
 func (f *fakeSessionContext) Prepare(ctx context.Context, conv *conversation.Conversation, mode sessionctx.PrepareMode) (sessionctx.PreparedContext, error) {
 	f.calls++
-	return sessionctx.PreparedContext{StableSections: f.sections, MessagesChanged: f.changed, ContextResult: contextmgr.Result{Changed: f.changed}}, nil
+	return sessionctx.PreparedContext{StableSections: f.sections, Diagnostics: f.diagnostics, MessagesChanged: f.changed, ContextResult: contextmgr.Result{Changed: f.changed}}, nil
 }
 
 type fakeMemoryUpdater struct{ inputs []memory.UpdateInput }

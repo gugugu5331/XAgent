@@ -87,15 +87,17 @@ func TestHTTPTransportAcceptedNotificationHasNoResponse(t *testing.T) {
 
 func TestHTTPTransportStatusErrorsAndCancel(t *testing.T) {
 	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(headerContentType, contentTypeJSON)
 		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"Authorization: Bearer abc123 api_key=secret-key"}`))
 	}))
 	defer errorServer.Close()
 	transport, err := NewHTTPTransport(HTTPConfig{URL: errorServer.URL})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := transport.Send(context.Background(), RPCRequest{JSONRPC: "2.0", ID: NumberID(1), Method: "ping"}); err == nil || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("expected 401 error, got %v", err)
+	if err := transport.Send(context.Background(), RPCRequest{JSONRPC: "2.0", ID: NumberID(1), Method: "ping"}); err == nil || !strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "abc123") || strings.Contains(err.Error(), "secret-key") {
+		t.Fatalf("expected redacted 401 error, got %v", err)
 	}
 
 	serverError := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +110,20 @@ func TestHTTPTransportStatusErrorsAndCancel(t *testing.T) {
 	}
 	if err := transport.Send(context.Background(), RPCRequest{JSONRPC: "2.0", ID: NumberID(1), Method: "ping"}); err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("expected 500 error, got %v", err)
+	}
+
+	binaryError := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(headerContentType, "application/octet-stream")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("\x00secret\x01"))
+	}))
+	defer binaryError.Close()
+	transport, err = NewHTTPTransport(HTTPConfig{URL: binaryError.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.Send(context.Background(), RPCRequest{JSONRPC: "2.0", ID: NumberID(1), Method: "ping"}); err == nil || !strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "application/octet-stream") {
+		t.Fatalf("expected binary 403 error without body leak, got %v", err)
 	}
 
 	transport, err = NewHTTPTransport(HTTPConfig{

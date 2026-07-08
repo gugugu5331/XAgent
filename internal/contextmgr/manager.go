@@ -43,7 +43,7 @@ func New(provider provider.Provider, dataDir string, cfg config.ContextConfig) *
 
 func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, mode Mode) (Result, error) {
 	var result Result
-	if m == nil || conv == nil || !m.cfg.Enabled {
+	if m == nil || conv == nil || !config.Enabled(m.cfg.Enabled, true) {
 		return result, nil
 	}
 	externalized, err := m.externalizeLargeToolResults(conv)
@@ -365,7 +365,7 @@ func previewText(text string, limit int) string {
 }
 
 func conversationExternalMarker(message conversation.Message) string {
-	return "[工具结果已外置保存，路径: " + message.ExternalPath + "。如需完整细节，请重新读取该文件，不要根据预览或摘要脑补。]"
+	return fmt.Sprintf("[工具结果已外置保存，artifact_id: %s，bytes: %d。如需完整细节，请由本地用户显式查看该 artifact，不要根据预览或摘要脑补。]", safeFilePart(message.ToolCallID), message.ExternalBytes)
 }
 
 func safeFilePart(value string) string {

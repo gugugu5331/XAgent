@@ -52,6 +52,9 @@ func (m *Manager) UpdateAsync(input UpdateInput) {
 		m.addDiagnostic("memory_update_candidate_too_large", "候选记忆输入超过大小限制，已跳过", "")
 		return
 	}
+	if !ShouldUpdateMemory(input.Candidate) {
+		return
+	}
 	m.startWorkers()
 	select {
 	case m.updates <- input:
@@ -125,6 +128,23 @@ func (m *Manager) decideUpdate(ctx context.Context, input UpdateInput) (UpdateDe
 		}
 	}
 	return ParseUpdateDecision(builder.String())
+}
+
+func ShouldUpdateMemory(candidate string) bool {
+	text := strings.ToLower(strings.TrimSpace(candidate))
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"我叫", "我的名字", "我是", "记住", "以后", "以后都", "偏好", "喜欢", "不喜欢", "习惯", "纠正", "更正", "不是", "不要", "别再", "项目", "架构", "约定", "规范", "参考", "文档", "地址", "链接", "api", "配置", "deadline", "负责人",
+		"my name", "call me", "remember", "from now on", "prefer", "preference", "correction", "actually", "don't", "do not", "project", "architecture", "convention", "reference", "docs", "link", "config",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func BuildUpdatePrompt(input UpdateInput, index Index) string {

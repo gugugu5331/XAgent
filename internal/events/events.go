@@ -15,6 +15,7 @@ const (
 	ToolError               Type = "tool_error"
 	ToolDenied              Type = "tool_denied"
 	AgentProgressed         Type = "agent_progress"
+	DiagnosticEmitted      Type = "diagnostic_emitted"
 	UsageUpdated            Type = "usage_updated"
 	Done                    Type = "done"
 	Error                   Type = "error"
@@ -33,11 +34,28 @@ const (
 )
 
 type ToolDisplay struct {
-	CallID    string
-	Name      string
-	Arguments string
-	Summary   string
-	Status    ToolDisplayStatus
+	CallID            string
+	Name              string
+	Arguments         string
+	Summary           string
+	Status            ToolDisplayStatus
+	ErrorCode         string
+	Stdout            string
+	Stderr            string
+	Truncated         bool
+	Recoverable       bool
+	ArtifactID        string
+	ArtifactBytes     int64
+	ArtifactAvailable bool
+}
+
+type DiagnosticDisplay struct {
+	Code     string
+	Severity string
+	Source   string
+	Path     string
+	Message  string
+	Hint     string
 }
 
 type ToolConfirmationRequest struct {
@@ -45,6 +63,11 @@ type ToolConfirmationRequest struct {
 	Name           string
 	Arguments      string
 	Prompt         string
+	Risk           string
+	PermissionMode string
+	ScopePreview   string
+	Warning        string
+	RevokeHint     string
 	AllowPermanent bool
 	Decision       chan ToolConfirmationDecision
 }
@@ -86,6 +109,7 @@ type Event struct {
 	Err          error
 	Tool         *ToolDisplay
 	Confirmation *ToolConfirmationRequest
+	Diagnostic   *DiagnosticDisplay
 	Progress     *AgentProgress
 	Usage        *UsageDisplay
 }

@@ -25,23 +25,23 @@ func Validate(config *AppConfig) error {
 
 	protocol := strings.TrimSpace(config.LLM.Protocol)
 	if protocol != ProtocolAnthropic && protocol != ProtocolOpenAI {
-		return fmt.Errorf("llm.protocol 必须是 %q 或 %q", ProtocolAnthropic, ProtocolOpenAI)
+		return fmt.Errorf("llm.protocol 必须是 %q 或 %q；请在 config.yaml 的 llm.protocol 中配置 provider 协议", ProtocolAnthropic, ProtocolOpenAI)
 	}
 	config.LLM.Protocol = protocol
 
 	config.LLM.Model = strings.TrimSpace(config.LLM.Model)
 	if config.LLM.Model == "" {
-		return errors.New("llm.model 不能为空")
+		return errors.New("llm.model 不能为空；请配置要使用的模型名")
 	}
 
 	config.LLM.BaseURL = strings.TrimSpace(config.LLM.BaseURL)
 	if config.LLM.BaseURL == "" {
-		return errors.New("llm.base_url 不能为空")
+		return errors.New("llm.base_url 不能为空；请配置 provider API 地址")
 	}
 
 	config.LLM.APIKey = strings.TrimSpace(config.LLM.APIKey)
 	if config.LLM.APIKey == "" {
-		return errors.New("llm.api_key 不能为空")
+		return errors.New("llm.api_key 不能为空；建议使用 ${XAGENT_TEST_API_KEY} 或对应 provider 的环境变量")
 	}
 
 	config.UI.StartMode = strings.TrimSpace(config.UI.StartMode)
@@ -51,6 +51,20 @@ func Validate(config *AppConfig) error {
 
 	if config.LLM.Thinking.BudgetTokens <= 0 {
 		config.LLM.Thinking.BudgetTokens = DefaultThinkingBudget
+	}
+	if config.LLM.RequestTimeoutMS == 0 {
+		config.LLM.RequestTimeoutMS = DefaultLLMRequestTimeoutMS
+	}
+	if config.LLM.RequestTimeoutMS < 0 {
+		return errors.New("llm.request_timeout_ms 必须大于 0")
+	}
+	applyAgentDefaults(&config.Agent)
+	if err := validateAgent(&config.Agent); err != nil {
+		return err
+	}
+	applyToolDefaults(&config.Tool)
+	if err := validateTool(&config.Tool); err != nil {
+		return err
 	}
 
 	config.Permission.Mode = strings.TrimSpace(config.Permission.Mode)
@@ -81,6 +95,26 @@ func Validate(config *AppConfig) error {
 		return err
 	}
 
+	return nil
+}
+
+func validateAgent(agent *AgentConfig) error {
+	if agent.MaxIterations <= 0 {
+		return errors.New("agent.max_iterations 必须大于 0")
+	}
+	if agent.MaxUnknownToolCalls <= 0 {
+		return errors.New("agent.max_unknown_tool_calls 必须大于 0")
+	}
+	return nil
+}
+
+func validateTool(tool *ToolConfig) error {
+	if tool.TimeoutMS <= 0 {
+		return errors.New("tool.timeout_ms 必须大于 0")
+	}
+	if tool.MaxOutputBytes <= 0 {
+		return errors.New("tool.max_output_bytes 必须大于 0")
+	}
 	return nil
 }
 

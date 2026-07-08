@@ -69,12 +69,12 @@ func (s *JSONLStore) recoverFromPath(ctx context.Context, path string, fallbackI
 		}
 		var record JSONLRecord
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			report.add("jsonl_recovery_bad_line", fmt.Sprintf("跳过无法解析的 JSONL 行 %d", lineNumber), path)
+			report.Diagnostics = append(report.Diagnostics, recoverableJSONLDiagnostic("jsonl_recovery_bad_line", lineNumber).WithPath(path))
 			report.SkippedLines++
 			continue
 		}
 		if items := record.Validate(); hasJSONLErrors(items) {
-			report.Diagnostics = append(report.Diagnostics, items...)
+			report.Diagnostics = append(report.Diagnostics, withRecoveryPath(recoverableValidationDiagnostics(items, lineNumber), path)...)
 			report.SkippedLines++
 			continue
 		}
@@ -115,6 +115,13 @@ func (s *JSONLStore) recoverFromPath(ctx context.Context, path string, fallbackI
 
 func (r *RecoveryReport) add(code string, message string, path string) {
 	r.Diagnostics = append(r.Diagnostics, newJSONLDiagnostic(code, message, diagnostics.SeverityWarning).WithPath(path))
+}
+
+func withRecoveryPath(items []JSONLDiagnostic, path string) []JSONLDiagnostic {
+	for index := range items {
+		items[index] = items[index].WithPath(path)
+	}
+	return items
 }
 
 func hasOpenToolCall(messages []Message, callID string) bool {

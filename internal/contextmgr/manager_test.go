@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,8 @@ import (
 func TestPrepareExternalizesLargeToolResult(t *testing.T) {
 	conv := conversation.NewConversation("conv", time.Now())
 	conversation.AppendToolResultMessage(conv, "call", "Bash", "success", "ok", strings.Repeat("x", 80), "", false, nil, nil)
-	manager := New(&summaryProvider{summary: "unused"}, t.TempDir(), testConfig())
+	dataDir := t.TempDir()
+	manager := New(&summaryProvider{summary: "unused"}, dataDir, testConfig())
 	result, err := manager.Prepare(context.Background(), conv, ModeAuto)
 	if err != nil {
 		t.Fatal(err)
@@ -25,15 +27,32 @@ func TestPrepareExternalizesLargeToolResult(t *testing.T) {
 		t.Fatalf("expected one externalized result: %#v", result)
 	}
 	message := conv.Messages[0]
-	if !message.Externalized || message.ExternalPath == "" || !strings.Contains(message.ToolResultContent, "外置") {
+	if !message.Externalized || message.ExternalPath == "" || !strings.Contains(message.ToolResultContent, "artifact_id") {
 		t.Fatalf("message not externalized: %#v", message)
 	}
-	if _, err := os.Stat(message.ExternalPath); err != nil {
+	info, err := os.Stat(message.ExternalPath)
+	if err != nil {
 		t.Fatalf("external file missing: %v", err)
 	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("external file permissions = %v, want 0600", info.Mode().Perm())
+	}
+	dirInfo, err := os.Stat(filepath.Dir(message.ExternalPath))
+	if err != nil {
+		t.Fatalf("external dir missing: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("external dir permissions = %v, want 0700", dirInfo.Mode().Perm())
+	}
+	if !strings.HasPrefix(message.ExternalPath, dataDir) {
+		t.Fatalf("external path %q not under data dir %q", message.ExternalPath, dataDir)
+	}
 	contextMessages := conversation.ContextMessages(conv)
-	if !strings.Contains(contextMessages[0].ToolResultContent, "重新读取") {
-		t.Fatalf("context message missing reread hint: %#v", contextMessages[0])
+	if strings.Contains(contextMessages[0].ToolResultContent, message.ExternalPath) {
+		t.Fatalf("context message leaked external path: %#v", contextMessages[0])
+	}
+	if !strings.Contains(contextMessages[0].ToolResultContent, "artifact_id") {
+		t.Fatalf("context message missing artifact id hint: %#v", contextMessages[0])
 	}
 }
 
@@ -112,7 +131,7 @@ func TestSummaryFailureCircuitBreaker(t *testing.T) {
 
 func testConfig() config.ContextConfig {
 	return config.ContextConfig{
-		Enabled:                   true,
+		Enabled:                   boolPtr(true),
 		ToolResultThresholdChars:  40,
 		ToolResultsThresholdChars: 1000,
 		ModelWindowTokens:         100000,
@@ -123,6 +142,10 @@ func testConfig() config.ContextConfig {
 		SummaryFailureLimit:       3,
 		PreviewChars:              16,
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 type summaryProvider struct {

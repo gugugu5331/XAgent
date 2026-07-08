@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
+
+	"xagent/internal/redact"
 )
 
 type BashTool struct {
@@ -55,16 +58,38 @@ func (t *BashTool) Execute(ctx context.Context, input Input) Result {
 		exitCode = cmd.ProcessState.ExitCode()
 	}
 	data := map[string]any{
-		"stdout":    stdout.String(),
-		"stderr":    stderr.String(),
+		"stdout":    redact.Text(stdout.String()),
+		"stderr":    redact.Text(stderr.String()),
 		"exit_code": exitCode,
 		"timed_out": ctx.Err() == context.DeadlineExceeded,
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return Result{CallID: input.CallID, Name: input.Name, Status: StatusTimeout, Summary: "Command timed out", Content: stderr.String(), Data: data, Error: &Error{Code: ErrTimeout, Message: "命令执行超时", Recoverable: true}}
+		content := bashResultContent(exitCode, data["stdout"].(string), data["stderr"].(string), true)
+		return Result{CallID: input.CallID, Name: input.Name, Status: StatusTimeout, Summary: "Command timed out", Content: content, Data: data, Error: &Error{Code: ErrTimeout, Message: "命令执行超时", Recoverable: true}}
 	}
 	if err != nil {
-		return Result{CallID: input.CallID, Name: input.Name, Status: StatusError, Summary: fmt.Sprintf("Command exited %d", exitCode), Content: stderr.String(), Data: data, Error: &Error{Code: ErrCommandFailed, Message: err.Error(), Recoverable: true}}
+		content := bashResultContent(exitCode, data["stdout"].(string), data["stderr"].(string), false)
+		return Result{CallID: input.CallID, Name: input.Name, Status: StatusError, Summary: fmt.Sprintf("Command exited %d", exitCode), Content: content, Data: data, Error: &Error{Code: ErrCommandFailed, Message: err.Error(), Recoverable: true}}
 	}
-	return Success(input, fmt.Sprintf("Command exited %d", exitCode), stdout.String(), data)
+	return Success(input, fmt.Sprintf("Command exited %d", exitCode), data["stdout"].(string), data)
+}
+
+func bashResultContent(exitCode int, stdout string, stderr string, timedOut bool) string {
+	parts := []string{fmt.Sprintf("exit_code: %d", exitCode)}
+	if timedOut {
+		parts = append(parts, "timed_out: true")
+	}
+	parts = append(parts, "stdout:")
+	if strings.TrimSpace(stdout) == "" {
+		parts = append(parts, "(empty)")
+	} else {
+		parts = append(parts, stdout)
+	}
+	parts = append(parts, "stderr:")
+	if strings.TrimSpace(stderr) == "" {
+		parts = append(parts, "(empty)")
+	} else {
+		parts = append(parts, stderr)
+	}
+	return strings.Join(parts, "\n")
 }

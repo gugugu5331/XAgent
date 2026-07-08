@@ -100,7 +100,7 @@ func (t *HTTPTransport) Send(ctx context.Context, msg any) error {
 		return nil
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("mcp http status %d", response.StatusCode)
+		return fmt.Errorf("mcp http status %d: %s", response.StatusCode, httpErrorBodyPreview(response))
 	}
 	if response.ContentLength > maxResponseBytes(t.config.MaxResponseBytes) {
 		return fmt.Errorf("mcp http response exceeds max response size")
@@ -126,6 +126,27 @@ func (t *HTTPTransport) SessionID() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.sessionID
+}
+
+func httpErrorBodyPreview(response *http.Response) string {
+	contentType := response.Header.Get(headerContentType)
+	limit := int64(1024)
+	data, _ := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	truncated := int64(len(data)) > limit
+	if truncated {
+		data = data[:limit]
+	}
+	if !strings.Contains(contentType, "json") && !strings.HasPrefix(contentType, "text/") {
+		return fmt.Sprintf("body omitted content-type=%s bytes=%d", contentType, len(data))
+	}
+	preview := SanitizeMetadata(RedactText(string(data)), int(limit))
+	if truncated {
+		preview += " [truncated]"
+	}
+	if preview == "" {
+		return "empty body"
+	}
+	return preview
 }
 
 func (t *HTTPTransport) readJSON(body io.Reader) error {

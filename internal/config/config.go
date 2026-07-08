@@ -1,11 +1,15 @@
 package config
 
+import "xagent/internal/redact"
+
 type AppConfig struct {
 	LLM          LLMConfig          `yaml:"llm"`
 	UI           UIConfig           `yaml:"ui"`
 	Storage      StorageConfig      `yaml:"storage"`
 	Permission   PermissionConfig   `yaml:"permission"`
 	MCP          MCPConfig          `yaml:"mcp"`
+	Agent        AgentConfig        `yaml:"agent"`
+	Tool         ToolConfig         `yaml:"tool"`
 	Context      ContextConfig      `yaml:"context"`
 	Instructions InstructionsConfig `yaml:"instructions"`
 	Session      SessionConfig      `yaml:"session"`
@@ -13,11 +17,26 @@ type AppConfig struct {
 }
 
 type LLMConfig struct {
-	Protocol string         `yaml:"protocol"`
-	Model    string         `yaml:"model"`
-	BaseURL  string         `yaml:"base_url"`
-	APIKey   string         `yaml:"api_key"`
-	Thinking ThinkingConfig `yaml:"thinking"`
+	Protocol         string         `yaml:"protocol"`
+	Model            string         `yaml:"model"`
+	BaseURL          string         `yaml:"base_url"`
+	APIKey           string         `yaml:"api_key"`
+	RequestTimeoutMS int            `yaml:"request_timeout_ms"`
+	Thinking         ThinkingConfig `yaml:"thinking"`
+}
+
+type AgentConfig struct {
+	MaxIterations       int `yaml:"max_iterations"`
+	MaxUnknownToolCalls int `yaml:"max_unknown_tool_calls"`
+}
+
+type ToolConfig struct {
+	TimeoutMS      int `yaml:"timeout_ms"`
+	MaxOutputBytes int `yaml:"max_output_bytes"`
+}
+
+type LoadOptions struct {
+	Redactor *redact.RuntimeRedactor
 }
 
 type ThinkingConfig struct {
@@ -40,7 +59,7 @@ type PermissionConfig struct {
 }
 
 type ContextConfig struct {
-	Enabled                   bool  `yaml:"enabled"`
+	Enabled                   *bool `yaml:"enabled"`
 	ToolResultThresholdChars  int   `yaml:"tool_result_threshold_chars"`
 	ToolResultsThresholdChars int   `yaml:"tool_results_threshold_chars"`
 	ModelWindowTokens         int64 `yaml:"model_window_tokens"`
@@ -53,7 +72,7 @@ type ContextConfig struct {
 }
 
 type InstructionsConfig struct {
-	Enabled         bool   `yaml:"enabled"`
+	Enabled         *bool  `yaml:"enabled"`
 	ProjectFile     string `yaml:"project_file"`
 	ProjectDir      string `yaml:"project_dir"`
 	UserDir         string `yaml:"user_dir"`
@@ -70,7 +89,7 @@ type SessionConfig struct {
 }
 
 type MemoryConfig struct {
-	Enabled           bool   `yaml:"enabled"`
+	Enabled           *bool  `yaml:"enabled"`
 	UserDir           string `yaml:"user_dir"`
 	ProjectDir        string `yaml:"project_dir"`
 	MaxIndexLines     int    `yaml:"max_index_lines"`

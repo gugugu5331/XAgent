@@ -12,6 +12,7 @@ import (
 
 	"xagent/internal/config"
 	"xagent/internal/conversation"
+	"xagent/internal/diagnostics"
 	"xagent/internal/orchestrator"
 	"xagent/internal/permission"
 	"xagent/internal/redact"
@@ -25,6 +26,12 @@ const (
 	screenChat screen = "chat"
 )
 
+type RequestSession struct {
+	Cancel    context.CancelFunc
+	StartedAt time.Time
+	Timeout   time.Duration
+}
+
 type Model struct {
 	deps         Deps
 	orchestrator *orchestrator.Orchestrator
@@ -34,12 +41,17 @@ type Model struct {
 	messages     tui.MessagesView
 	status       tui.Status
 	conversation *conversation.Conversation
+	request      *RequestSession
+	diagnostics  *diagnostics.Collector
 	streaming    bool
 	confirmation *Event
 }
 
 func New(deps Deps) Model {
 	ctx := context.Background()
+	if deps.Diagnostics == nil {
+		deps.Diagnostics = diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redact.Text})
+	}
 	conversations, _ := deps.Store.List(ctx)
 	orch := orchestrator.NewWithOptions(orchestrator.OrchestratorOptions{
 		Provider:       deps.Provider,
@@ -51,6 +63,8 @@ func New(deps Deps) Model {
 		ContextManager: deps.ContextManager,
 		SessionContext: deps.SessionContext,
 		Memory:         deps.Memory,
+		Diagnostics:    deps.Diagnostics,
+		Agent:          deps.Config.Agent,
 	})
 	if mode, ok := permission.ParseMode(deps.Config.Permission.Mode); ok {
 		orch.SetPermissionMode(mode)
@@ -62,12 +76,14 @@ func New(deps Deps) Model {
 		list:         tui.NewConversationList(conversations),
 		input:        tui.NewInput(deps.Resources.UILabel("input_prompt")),
 		messages:     tui.NewMessagesView(deps.Config.LLM.Thinking.Show),
+		diagnostics:  deps.Diagnostics,
 		status: tui.Status{
 			Provider: deps.Provider.Name(),
 			Model:    deps.Config.LLM.Model,
 		},
 	}
 	model.refreshMCPStatus()
+	model.syncMCPDiagnostics()
 	if deps.Config.UI.StartMode == config.StartModeNew {
 		model.startNewConversation()
 	}
@@ -163,6 +179,15 @@ func (m *Model) close() {
 func (m *Model) refreshMCPStatus() {
 	if m.deps.MCPStatus != nil {
 		m.status.MCP = m.deps.MCPStatus.StatusLine()
+	}
+}
+
+func (m *Model) syncMCPDiagnostics() {
+	if m.diagnostics == nil || m.deps.MCPStatus == nil {
+		return
+	}
+	for _, item := range m.deps.MCPStatus.Diagnostics() {
+		m.diagnostics.Add(diagnostics.New("mcp_status", diagnostics.SeverityWarning, item.Message).WithSource(item.Server))
 	}
 }
 

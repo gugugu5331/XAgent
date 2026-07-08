@@ -4,19 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
+	"xagent/internal/diagnostics"
 	"xagent/internal/events"
 	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
 	"xagent/internal/permission"
 	"xagent/internal/prompt"
 	"xagent/internal/provider"
+	"xagent/internal/redact"
 	"xagent/internal/resources"
 	"xagent/internal/sessionctx"
 	"xagent/internal/tool"
@@ -32,6 +33,8 @@ type OrchestratorOptions struct {
 	ContextManager *contextmgr.Manager
 	SessionContext sessionPreparer
 	Memory         memoryUpdater
+	Diagnostics    *diagnostics.Collector
+	Agent          config.AgentConfig
 }
 
 type sessionPreparer interface {
@@ -54,7 +57,9 @@ type Orchestrator struct {
 	contextManager   *contextmgr.Manager
 	sessionContext   sessionPreparer
 	memory           memoryUpdater
+	diagnostics      *diagnostics.Collector
 	permissionMode   permission.Mode
+	runOptions       RunOptions
 }
 
 func New(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
@@ -84,7 +89,8 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 			Writer:     permission.Writer{ProjectRoot: options.Executor.ProjectRoot},
 		}
 	}
-	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, permissionMode: permission.ModeDefault}
+	runOptions := runOptionsFromConfig(options.Agent)
+	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, permissionMode: permission.ModeDefault, runOptions: runOptions}
 }
 
 func (o *Orchestrator) SetPermissionMode(mode permission.Mode) {
@@ -92,6 +98,34 @@ func (o *Orchestrator) SetPermissionMode(mode permission.Mode) {
 		mode = permission.ModeDefault
 	}
 	o.permissionMode = mode
+}
+
+type PermissionStatus struct {
+	Mode         string
+	SessionRules int
+	LocalRules   int
+	ProjectRules int
+	UserRules    int
+	LoadErrors   int
+}
+
+func (o *Orchestrator) PermissionStatus() PermissionStatus {
+	mode := o.permissionMode
+	if mode == "" {
+		mode = permission.ModeDefault
+	}
+	status := PermissionStatus{Mode: string(mode)}
+	if o == nil || o.authorizer == nil {
+		return status
+	}
+	if o.authorizer.Session != nil {
+		status.SessionRules = len(o.authorizer.Session.Rules())
+	}
+	status.LocalRules = len(o.authorizer.Local.Rules)
+	status.ProjectRules = len(o.authorizer.Project.Rules)
+	status.UserRules = len(o.authorizer.User.Rules)
+	status.LoadErrors = len(o.authorizer.LoadErrors)
+	return status
 }
 
 func (o *Orchestrator) CompactContext(ctx context.Context, conv *conversation.Conversation) (contextmgr.Result, error) {
@@ -132,6 +166,9 @@ func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversati
 			return nil, err
 		}
 		optionalSections = append(optionalSections, prepared.StableSections...)
+		if o.diagnostics != nil {
+			o.diagnostics.Add(prepared.Diagnostics...)
+		}
 		if prepared.MessagesChanged {
 			if err := o.store.Save(ctx, conv); err != nil {
 				return nil, err
@@ -282,14 +319,7 @@ func (o *Orchestrator) handleToolCall(ctx context.Context, conv *conversation.Co
 		return o.finalReply(ctx, conv, out, start)
 	case permission.DecisionAsk:
 		decisionCh := make(chan events.ToolConfirmationDecision, 1)
-		confirmation := &events.ToolConfirmationRequest{
-			CallID:         call.ID,
-			Name:           call.Name,
-			Arguments:      redactedArguments(call),
-			Prompt:         formatPermissionPrompt(call, decision),
-			AllowPermanent: decision.Prompt != nil && decision.Prompt.AllowPermanent,
-			Decision:       decisionCh,
-		}
+		confirmation := confirmationRequest(call, decision, decisionCh)
 		out <- events.Event{Type: events.ToolWaitingConfirmation, Tool: newToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}
 		select {
 		case <-ctx.Done():
@@ -444,7 +474,60 @@ func resultDisplay(result tool.Result) *events.ToolDisplay {
 			status = events.ToolDisplayCancelled
 		}
 	}
-	return &events.ToolDisplay{CallID: result.CallID, Name: result.Name, Summary: result.Summary, Status: status}
+	return &events.ToolDisplay{
+		CallID:            result.CallID,
+		Name:              result.Name,
+		Summary:           result.Summary,
+		Status:            status,
+		ErrorCode:         resultErrorCode(result),
+		Stdout:            stringData(result.Data, "stdout"),
+		Stderr:            stringData(result.Data, "stderr"),
+		Truncated:         result.Truncated,
+		Recoverable:       resultRecoverable(result),
+		ArtifactID:        artifactID(result),
+		ArtifactBytes:     artifactBytes(result),
+		ArtifactAvailable: artifactAvailable(result),
+	}
+}
+
+func stringData(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	value, _ := data[key].(string)
+	return redactSensitive(value)
+}
+
+func resultRecoverable(result tool.Result) bool {
+	return result.Error != nil && result.Error.Recoverable
+}
+
+func artifactID(result tool.Result) string {
+	return stringData(result.Data, "artifact_id")
+}
+
+func artifactAvailable(result tool.Result) bool {
+	if result.Data == nil {
+		return false
+	}
+	value, _ := result.Data["artifact_available"].(bool)
+	return value
+}
+
+func artifactBytes(result tool.Result) int64 {
+	if result.Data == nil {
+		return 0
+	}
+	switch value := result.Data["artifact_bytes"].(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	default:
+		return 0
+	}
 }
 
 func formatToolConfirmation(call tool.Call) string {
@@ -466,12 +549,52 @@ func formatToolConfirmation(call tool.Call) string {
 	}
 }
 
+func confirmationRequest(call tool.Call, decision permission.Decision, decisionCh chan events.ToolConfirmationDecision) *events.ToolConfirmationRequest {
+	request := &events.ToolConfirmationRequest{
+		CallID:         call.ID,
+		Name:           call.Name,
+		Arguments:      redactedArguments(call),
+		Prompt:         formatPermissionPrompt(call, decision),
+		AllowPermanent: decision.Prompt != nil && decision.Prompt.AllowPermanent,
+		Decision:       decisionCh,
+	}
+	if decision.Prompt == nil {
+		return request
+	}
+	request.Risk = string(decision.Prompt.Risk)
+	request.PermissionMode = string(decision.Prompt.Mode)
+	if decision.Prompt.RulePreview != nil {
+		request.ScopePreview = decision.Prompt.RulePreview.Display()
+	}
+	request.Warning = permissionWarning(call, decision.Prompt)
+	request.RevokeHint = permissionRevokeHint(request.AllowPermanent)
+	return request
+}
+
+func permissionWarning(call tool.Call, prompt *permission.ConfirmationPrompt) string {
+	if call.Name == "Bash" {
+		return "Bash 不在沙箱中运行，请确认命令可信且作用范围符合预期。"
+	}
+	if prompt.Risk == permission.RiskHigh {
+		return "高风险工具调用，请确认目标和影响范围。"
+	}
+	return ""
+}
+
+func permissionRevokeHint(allowPermanent bool) string {
+	if allowPermanent {
+		return "永久授权会写入本地权限规则，可稍后从权限配置中撤销。"
+	}
+	return "本次工具调用不支持永久授权。"
+}
+
 func formatPermissionPrompt(call tool.Call, decision permission.Decision) string {
 	base := formatToolConfirmation(call)
 	if decision.Prompt == nil {
 		return base + " 需要权限确认，按 y 允许本次，按 s 本会话允许，按 p 永久允许，按 n 拒绝，Esc 取消。"
 	}
 	parts := []string{base, "需要权限确认"}
+	parts = append(parts, "风险: "+string(decision.Prompt.Risk))
 	if decision.Prompt.Reason != "" {
 		parts = append(parts, "原因: "+decision.Prompt.Reason)
 	}
@@ -479,8 +602,12 @@ func formatPermissionPrompt(call tool.Call, decision permission.Decision) string
 		parts = append(parts, "模式: "+string(decision.Prompt.Mode))
 	}
 	if decision.Prompt.RulePreview != nil {
-		parts = append(parts, "本次允许规则: "+decision.Prompt.RulePreview.Display())
+		parts = append(parts, "范围: "+decision.Prompt.RulePreview.Display())
 	}
+	if warning := permissionWarning(call, decision.Prompt); warning != "" {
+		parts = append(parts, "警告: "+warning)
+	}
+	parts = append(parts, permissionRevokeHint(decision.Prompt.AllowPermanent))
 	shortcut := "按 y 允许本次，按 s 本会话允许，按 n 拒绝，Esc 取消。"
 	if decision.Prompt.AllowPermanent {
 		shortcut = "按 y 允许本次，按 s 本会话允许，按 p 永久允许，按 n 拒绝，Esc 取消。"
@@ -511,17 +638,7 @@ func mcpToolParts(name string) (string, string) {
 }
 
 func redactSensitive(value string) string {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(api[_-]?key\s*=\s*)[^\s]+`),
-		regexp.MustCompile(`(?i)(token\s*=\s*)[^\s]+`),
-		regexp.MustCompile(`(?i)(secret\s*=\s*)[^\s]+`),
-		regexp.MustCompile(`(?i)(password\s*=\s*)[^\s]+`),
-	}
-	redacted := value
-	for _, pattern := range patterns {
-		redacted = pattern.ReplaceAllString(redacted, `${1}[REDACTED]`)
-	}
-	return redacted
+	return strings.ReplaceAll(redact.Text(value), "[redacted]", "[REDACTED]")
 }
 
 func stringArg(args map[string]any, key string) string {

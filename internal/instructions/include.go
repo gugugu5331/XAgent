@@ -21,13 +21,19 @@ type includeRequest struct {
 }
 
 func expandIncludes(ctx context.Context, req includeRequest) (string, []diagnostics.Diagnostic) {
+	expanded, items, _ := expandIncludesWithDeps(ctx, req)
+	return expanded, items
+}
+
+func expandIncludesWithDeps(ctx context.Context, req includeRequest) (string, []diagnostics.Diagnostic, []string) {
 	var items []diagnostics.Diagnostic
+	var deps []string
 	lines := strings.Split(req.content, "\n")
 	out := make([]string, 0, len(lines))
 	for _, line := range lines {
 		if err := ctx.Err(); err != nil {
 			items = append(items, newDiagnostic("instructions_context_cancelled", err.Error(), req.sourceName, req.baseDir))
-			return strings.Join(out, "\n"), items
+			return strings.Join(out, "\n"), items, deps
 		}
 		includePath, ok := parseIncludeLine(line)
 		if !ok {
@@ -49,13 +55,14 @@ func expandIncludes(ctx context.Context, req includeRequest) (string, []diagnost
 		if !ok {
 			continue
 		}
+		deps = append(deps, actualPath)
 		if req.visited[actualPath] {
 			items = append(items, newDiagnostic("instructions_include_cycle", "检测到 @include 循环引用，已跳过", req.sourceName, actualPath))
 			continue
 		}
 		nextVisited := copyVisited(req.visited)
 		nextVisited[actualPath] = true
-		expanded, nested := expandIncludes(ctx, includeRequest{
+		expanded, nested, nestedDeps := expandIncludesWithDeps(ctx, includeRequest{
 			content:     string(content),
 			baseDir:     filepath.Dir(actualPath),
 			allowedRoot: req.allowedRoot,
@@ -66,11 +73,12 @@ func expandIncludes(ctx context.Context, req includeRequest) (string, []diagnost
 			depth:       req.depth + 1,
 		})
 		items = append(items, nested...)
+		deps = append(deps, nestedDeps...)
 		if strings.TrimSpace(expanded) != "" {
 			out = append(out, expanded)
 		}
 	}
-	return strings.TrimSpace(strings.Join(out, "\n")), items
+	return strings.TrimSpace(strings.Join(out, "\n")), items, deps
 }
 
 func parseIncludeLine(line string) (string, bool) {

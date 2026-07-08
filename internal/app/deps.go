@@ -6,6 +6,8 @@ import (
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
+	"xagent/internal/diagnostics"
+	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
 	"xagent/internal/provider"
 	"xagent/internal/resources"
@@ -23,6 +25,11 @@ type Deps struct {
 	ContextManager *contextmgr.Manager
 	SessionContext *sessionctx.Manager
 	Memory         *memory.Manager
+	Diagnostics    *diagnostics.Collector
 	Closer         interface{ Close(context.Context) error }
-	MCPStatus      interface{ StatusLine() string }
+	MCPStatus      interface {
+		StatusLine() string
+		Summary() mcpclient.StatusSummary
+		Diagnostics() []mcpclient.Diagnostic
+	}
 }

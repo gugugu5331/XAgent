@@ -11,6 +11,34 @@ import (
 	"xagent/internal/provider"
 )
 
+func TestShouldUpdateMemoryFiltersOrdinaryChat(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{text: "用户请求:\n今天天气怎么样\n\n最终回复:\n我不知道实时天气", want: false},
+		{text: "用户请求:\n我叫罗新新\n\n最终回复:\n记住了", want: true},
+		{text: "用户请求:\n以后回答简洁一点\n\n最终回复:\n好的", want: true},
+		{text: "用户请求:\n这个项目的架构是 Go TUI\n\n最终回复:\n了解", want: true},
+	}
+	for _, tc := range cases {
+		if got := ShouldUpdateMemory(tc.text); got != tc.want {
+			t.Fatalf("ShouldUpdateMemory(%q) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+}
+
+func TestOrdinaryConversationSecretFlowPolicy(t *testing.T) {
+	ordinary := "用户请求:\n今天天气怎么样 token=ordinary-secret\n\n最终回复:\n无法查询实时天气"
+	if ShouldUpdateMemory(ordinary) {
+		t.Fatalf("ordinary conversation should not trigger memory update")
+	}
+	prompt := BuildUpdatePrompt(UpdateInput{Scope: ScopeProject, Candidate: "记住我的 token=memory-secret 偏好", Now: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)}, Index{Scope: ScopeProject})
+	if strings.Contains(prompt, "memory-secret") {
+		t.Fatalf("memory update prompt leaked candidate secret: %s", prompt)
+	}
+}
+
 func TestParseIndexKeepsEntrySummary(t *testing.T) {
 	index, err := ParseIndex(ScopeProject, []byte("# Memory Index\n\n- [用户姓名](name.md) — 用户的名字是罗新新。\n"))
 	if err != nil {
@@ -125,6 +153,9 @@ func TestMemoryWritesAreAtomicAndRecoverBadIndex(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, noteFileName(note.ID))); err != nil {
 		t.Fatalf("note file missing: %v", err)
 	}
+	if _, err := manager.LoadIndex(ScopeProject); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(root, IndexFileName), []byte("bad index"), 0o600); err != nil {
 		t.Fatalf("write bad index: %v", err)
 	}
@@ -137,6 +168,100 @@ func TestMemoryWritesAreAtomicAndRecoverBadIndex(t *testing.T) {
 	}
 	if len(manager.Diagnostics()) == 0 || manager.Diagnostics()[0].Code != "memory_bad_index_rebuilt" {
 		t.Fatalf("expected bad index diagnostic: %#v", manager.Diagnostics())
+	}
+}
+
+func TestMemoryIndexCacheReturnsCopies(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(ManagerOptions{ProjectDir: root, MaxIndexLines: 200, MaxIndexBytes: 25 * 1024})
+	note := NewNote(NoteProjectKnowledge, ScopeProject, "架构", "项目使用 Go", "test", time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC))
+	if err := manager.SaveNote(note); err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	first, err := manager.LoadIndex(ScopeProject)
+	if err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+	first.Entries[0].Title = "污染"
+	second, err := manager.LoadIndex(ScopeProject)
+	if err != nil {
+		t.Fatalf("load cached index: %v", err)
+	}
+	if second.Entries[0].Title != "架构" {
+		t.Fatalf("cache was mutated through returned index: %#v", second.Entries)
+	}
+}
+
+func TestMemoryIndexCacheRefreshesAfterDelete(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(ManagerOptions{ProjectDir: root, MaxIndexLines: 200, MaxIndexBytes: 25 * 1024})
+	note := NewNote(NoteProjectKnowledge, ScopeProject, "架构", "项目使用 Go", "test", time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC))
+	if err := manager.SaveNote(note); err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	if _, err := manager.LoadIndex(ScopeProject); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if err := manager.DeleteNote(ScopeProject, note.ID); err != nil {
+		t.Fatalf("delete note: %v", err)
+	}
+	index, err := manager.LoadIndex(ScopeProject)
+	if err != nil {
+		t.Fatalf("load index after delete: %v", err)
+	}
+	if len(index.Entries) != 0 {
+		t.Fatalf("index should be empty after delete: %#v", index.Entries)
+	}
+}
+
+func TestMemoryIndexCacheRebuildsWhenIndexFileDeleted(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(ManagerOptions{ProjectDir: root, MaxIndexLines: 200, MaxIndexBytes: 25 * 1024})
+	note := NewNote(NoteProjectKnowledge, ScopeProject, "架构", "项目使用 Go", "test", time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC))
+	if err := manager.SaveNote(note); err != nil {
+		t.Fatalf("save note: %v", err)
+	}
+	if _, err := manager.LoadIndex(ScopeProject); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if err := os.Remove(filepath.Join(root, IndexFileName)); err != nil {
+		t.Fatalf("remove index: %v", err)
+	}
+	index, err := manager.LoadIndex(ScopeProject)
+	if err != nil {
+		t.Fatalf("load index after remove: %v", err)
+	}
+	if len(index.Entries) != 1 || index.Entries[0].ID != note.ID {
+		t.Fatalf("rebuilt index mismatch: %#v", index.Entries)
+	}
+	if _, err := os.Stat(filepath.Join(root, IndexFileName)); err != nil {
+		t.Fatalf("index file should be recreated: %v", err)
+	}
+}
+
+func TestMemoryIndexRebuildBypassesCache(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(ManagerOptions{ProjectDir: root, MaxIndexLines: 200, MaxIndexBytes: 25 * 1024})
+	first := NewNote(NoteProjectKnowledge, ScopeProject, "first", "项目使用 Go", "test", time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC))
+	second := NewNote(NoteReference, ScopeProject, "second", "参考资料", "test", time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC))
+	if err := manager.SaveNote(first); err != nil {
+		t.Fatalf("save first note: %v", err)
+	}
+	if _, err := manager.LoadIndex(ScopeProject); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, noteFileName(second.ID)), []byte(MarshalNote(second)), 0o600); err != nil {
+		t.Fatalf("write second note: %v", err)
+	}
+	if _, err := manager.RebuildIndex(ScopeProject); err != nil {
+		t.Fatalf("rebuild index: %v", err)
+	}
+	index, err := manager.LoadIndex(ScopeProject)
+	if err != nil {
+		t.Fatalf("load rebuilt index: %v", err)
+	}
+	if len(index.Entries) != 2 {
+		t.Fatalf("expected rebuilt index to include external note: %#v", index.Entries)
 	}
 }
 

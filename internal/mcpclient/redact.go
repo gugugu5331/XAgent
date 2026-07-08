@@ -1,8 +1,9 @@
 package mcpclient
 
 import (
-	"regexp"
 	"strings"
+
+	"xagent/internal/redact"
 )
 
 func RedactArguments(arguments map[string]any) map[string]any {
@@ -41,18 +42,7 @@ func RedactAny(value any) any {
 }
 
 func RedactText(value string) string {
-	redacted := value
-	for _, pattern := range []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(api[_-]?key\s*[=:]\s*)[^\s,;]+`),
-		regexp.MustCompile(`(?i)(token\s*[=:]\s*)[^\s,;]+`),
-		regexp.MustCompile(`(?i)(secret\s*[=:]\s*)[^\s,;]+`),
-		regexp.MustCompile(`(?i)(password\s*[=:]\s*)[^\s,;]+`),
-		regexp.MustCompile(`(?i)(authorization\s*[=:]\s*)[^\s,;]+`),
-		regexp.MustCompile(`(?i)(credential\s*[=:]\s*)[^\s,;]+`),
-	} {
-		redacted = pattern.ReplaceAllString(redacted, `${1}[redacted]`)
-	}
-	return redacted
+	return redact.Text(value)
 }
 
 func IsSensitiveKey(key string) bool {

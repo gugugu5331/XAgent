@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -18,6 +19,70 @@ func (m *Model) sendConfirmation(action events.PermissionAction, allowed bool) {
 	m.confirmation.Confirmation.Decision <- events.ToolConfirmationDecision{CallID: m.confirmation.Confirmation.CallID, Allowed: allowed, Action: action}
 	m.confirmation = nil
 	m.status.WaitingConfirmation = false
+}
+
+func (m *Model) handlePermissionsStatusCommand(text string) bool {
+	if strings.TrimSpace(text) != "/permissions status" {
+		return false
+	}
+	status := m.orchestrator.PermissionStatus()
+	m.status.Notice = fmt.Sprintf("本地权限状态，不会发送给模型: mode=%s session=%d local=%d project=%d user=%d load_errors=%d", status.Mode, status.SessionRules, status.LocalRules, status.ProjectRules, status.UserRules, status.LoadErrors)
+	m.status.Error = nil
+	return true
+}
+
+func (m *Model) handleMCPStatusCommand(text string) bool {
+	if strings.TrimSpace(text) != "/mcp status" {
+		return false
+	}
+	if m.deps.MCPStatus == nil {
+		m.status.Notice = "本地 MCP 状态: 未配置 MCP"
+		m.status.Error = nil
+		return true
+	}
+	summary := m.deps.MCPStatus.Summary()
+	parts := []string{fmt.Sprintf("本地 MCP 状态，不会发送给模型: configured=%d ready=%d failed=%d disabled=%d closed=%d", summary.Configured, summary.Ready, summary.Failed, summary.Disabled, summary.Closed)}
+	for _, item := range summary.Diagnostics {
+		text := redact.Text(strings.TrimSpace(item.Message))
+		if item.Server != "" {
+			text = redact.Text(item.Server) + ": " + text
+		}
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	m.status.Notice = strings.Join(parts, "；")
+	m.status.Error = nil
+	return true
+}
+
+func (m *Model) handleDiagnosticsCommand(text string) bool {
+	if strings.TrimSpace(text) != "/diagnostics" {
+		return false
+	}
+	collector := m.diagnostics
+	if collector == nil {
+		collector = m.deps.Diagnostics
+	}
+	items := collector.List()
+	if len(items) == 0 {
+		m.status.Notice = "本地诊断: 暂无诊断，不会发送给模型"
+		m.status.Error = nil
+		return true
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		text := item.Safe(redact.Text).Text()
+		if item.Source != "" {
+			text += " source=" + redact.Text(item.Source)
+		}
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	m.status.Notice = "本地诊断，不会发送给模型: " + strings.Join(parts, "；")
+	m.status.Error = nil
+	return true
 }
 
 func (m *Model) handleMemoryCommand(text string) bool {
@@ -115,6 +180,20 @@ func (m *Model) setMemoryError(err error) {
 	m.status.Error = fmt.Errorf("%s", redact.Text(err.Error()))
 }
 
+func (m *Model) cancelRequest(notice string) {
+	if m.request != nil && m.request.Cancel != nil {
+		m.request.Cancel()
+	}
+	m.request = nil
+	m.streaming = false
+	m.status.Streaming = false
+	m.status.WaitingConfirmation = false
+	m.status.Notice = notice
+	m.status.Error = nil
+	m.input.SetEnabled(true)
+	m.confirmation = nil
+}
+
 func parseMemoryScope(value string) (memory.Scope, error) {
 	switch strings.TrimSpace(value) {
 	case string(memory.ScopeUser):
@@ -177,6 +256,10 @@ func enabledText(enabled bool) string {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.streaming && (msg.String() == "esc" || msg.String() == "ctrl+c") {
+			m.cancelRequest("请求已取消，可继续输入")
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.close()
@@ -253,6 +336,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Clear()
 				return m, nil
 			}
+			if m.handleMCPStatusCommand(text) {
+				m.input.Clear()
+				return m, nil
+			}
+			if m.handleDiagnosticsCommand(text) {
+				m.input.Clear()
+				return m, nil
+			}
+			if m.handlePermissionsStatusCommand(text) {
+				m.input.Clear()
+				return m, nil
+			}
 			if strings.HasPrefix(text, "/memory") && m.handleMemoryCommand(text) {
 				m.input.Clear()
 				return m, nil
@@ -260,11 +355,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.conversation == nil {
 				m.startNewConversation()
 			}
-			events, err := m.orchestrator.Send(context.Background(), m.conversation, text)
+			requestCtx, cancel := context.WithCancel(context.Background())
+			events, err := m.orchestrator.Send(requestCtx, m.conversation, text)
 			if err != nil {
+				cancel()
 				m.status.Error = err
 				return m, nil
 			}
+			m.request = &RequestSession{Cancel: cancel, StartedAt: time.Now(), Timeout: time.Duration(m.deps.Config.LLM.RequestTimeoutMS) * time.Millisecond}
 			m.input.Clear()
 			m.input.SetEnabled(false)
 			m.streaming = true
@@ -324,6 +422,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case EventDone:
 			m.messages.CommitAssistant()
+			m.request = nil
 			m.streaming = false
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false
@@ -333,6 +432,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case EventError:
 			m.messages.CommitAssistant()
+			m.request = nil
 			m.streaming = false
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false

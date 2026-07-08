@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"xagent/internal/config"
 	"xagent/internal/tool"
 )
 
@@ -37,6 +38,17 @@ const (
 
 func defaultRunOptions() RunOptions {
 	return RunOptions{MaxIterations: 10, MaxUnknownToolCalls: 2}
+}
+
+func runOptionsFromConfig(agent config.AgentConfig) RunOptions {
+	options := defaultRunOptions()
+	if agent.MaxIterations > 0 {
+		options.MaxIterations = agent.MaxIterations
+	}
+	if agent.MaxUnknownToolCalls > 0 {
+		options.MaxUnknownToolCalls = agent.MaxUnknownToolCalls
+	}
+	return options
 }
 
 func parseRunRequest(text string) (RunRequest, error) {

@@ -181,6 +181,9 @@ func canAllowPermanent(normalized NormalizedCall) bool {
 	if strings.HasPrefix(normalized.Call.Name, "mcp__") {
 		return false
 	}
+	if ruleContainsSecret(Rule{Tool: normalized.Call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow)}) {
+		return false
+	}
 	return !(normalized.Call.Name == "Bash" && normalized.ComplexShell)
 }
 
