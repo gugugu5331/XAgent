@@ -92,18 +92,8 @@ func main() {
 	executor := tool.NewExecutor(registry, projectRoot, time.Duration(cfg.Tool.TimeoutMS)*time.Millisecond, cfg.Tool.MaxOutputBytes)
 	contextManager := contextmgr.New(llm, cfg.Storage.DataDir, cfg.Context)
 	instructionLoader := &instructions.CachedLoader{Loader: instructions.Loader{ProjectRoot: projectRoot, Config: cfg.Instructions}}
-	memoryManager := memory.NewManager(memory.ManagerOptions{
-		UserDir:           resolveUserPath(cfg.Memory.UserDir),
-		ProjectDir:        resolveProjectPath(projectRoot, cfg.Memory.ProjectDir),
-		MaxIndexLines:     cfg.Memory.MaxIndexLines,
-		MaxIndexBytes:     cfg.Memory.MaxIndexBytes,
-		UpdateQueueSize:   cfg.Memory.UpdateQueueSize,
-		UpdateConcurrency: cfg.Memory.UpdateConcurrency,
-		UpdateTimeoutMS:   cfg.Memory.UpdateTimeoutMS,
-		MaxCandidateBytes: cfg.Memory.MaxCandidateBytes,
-		Provider:          llm,
-	})
-	sessionManager := &sessionctx.Manager{Instructions: instructionLoader, Memory: memoryManager, Context: contextManager}
+	memoryManager := newMemoryManager(projectRoot, cfg.Memory, llm)
+	sessionManager := newSessionManager(instructionLoader, memoryManager, contextManager)
 	model := app.New(app.Deps{
 		Config:              cfg,
 		Provider:            llm,
@@ -142,6 +132,31 @@ func newSkillManager(projectRoot string, userSkillsRoot string, registry *tool.R
 		Limits:          skill.DefaultLimits(),
 		Redact:          redactor,
 	})
+}
+
+func newMemoryManager(projectRoot string, memoryConfig config.MemoryConfig, updateProvider memory.UpdateProvider) *memory.Manager {
+	if !config.Enabled(memoryConfig.Enabled, true) {
+		return nil
+	}
+	return memory.NewManager(memory.ManagerOptions{
+		UserDir:           resolveUserPath(memoryConfig.UserDir),
+		ProjectDir:        resolveProjectPath(projectRoot, memoryConfig.ProjectDir),
+		MaxIndexLines:     memoryConfig.MaxIndexLines,
+		MaxIndexBytes:     memoryConfig.MaxIndexBytes,
+		UpdateQueueSize:   memoryConfig.UpdateQueueSize,
+		UpdateConcurrency: memoryConfig.UpdateConcurrency,
+		UpdateTimeoutMS:   memoryConfig.UpdateTimeoutMS,
+		MaxCandidateBytes: memoryConfig.MaxCandidateBytes,
+		Provider:          updateProvider,
+	})
+}
+
+func newSessionManager(instructionLoader sessionctx.InstructionLoader, memoryManager *memory.Manager, contextManager sessionctx.ContextPreparer) *sessionctx.Manager {
+	manager := &sessionctx.Manager{Instructions: instructionLoader, Context: contextManager}
+	if memoryManager != nil {
+		manager.Memory = memoryManager
+	}
+	return manager
 }
 
 func reservedCommandNames(definitions []command.Definition) []string {

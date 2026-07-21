@@ -7,10 +7,34 @@ import (
 	"strings"
 	"testing"
 
+	"xagent/internal/config"
 	"xagent/internal/redact"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
+
+func TestNewMemoryManagerHonorsEnabled(t *testing.T) {
+	disabled := false
+	disabledManager := newMemoryManager(t.TempDir(), config.MemoryConfig{Enabled: &disabled}, nil)
+	if disabledManager != nil {
+		t.Fatal("memory.enabled=false constructed a production memory manager")
+	}
+	if manager := newSessionManager(nil, disabledManager, nil); manager.Memory != nil {
+		t.Fatal("disabled memory became a non-nil typed interface in the session manager")
+	}
+
+	enabled := true
+	enabledManager := newMemoryManager(t.TempDir(), config.MemoryConfig{Enabled: &enabled}, nil)
+	if enabledManager == nil {
+		t.Fatal("memory.enabled=true did not construct a production memory manager")
+	}
+	if manager := newSessionManager(nil, enabledManager, nil); manager.Memory == nil {
+		t.Fatal("enabled memory was not attached to the session manager")
+	}
+	if manager := newMemoryManager(t.TempDir(), config.MemoryConfig{}, nil); manager == nil {
+		t.Fatal("unset memory.enabled must preserve the enabled-by-default behavior")
+	}
+}
 
 func TestStartupSkillAssemblyLoadsThreeTiers(t *testing.T) {
 	projectRoot := t.TempDir()
