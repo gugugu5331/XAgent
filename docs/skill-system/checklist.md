@@ -82,43 +82,43 @@
 
 ### E01：目录轻量注入与按需加载
 
-- [ ] 启动带捕获请求能力的本地测试 Provider，放置一个正文含唯一 canary 的项目 Skill；发送普通消息时首个请求只能看到名称和说明，Agent 调用 `load_skill` 后的下一请求才出现 canary SOP。（验证：保存两次 Provider 请求，逐项对比 system blocks 和 tools。）
+- [x] 启动带捕获请求能力的本地测试 Provider，放置一个正文含唯一 canary 的项目 Skill；发送普通消息时首个请求只能看到名称和说明，Agent 调用 `load_skill` 后的下一请求才出现 canary SOP。（实际：真实 TUI 产生恰好两次请求；请求 1 含名称与说明但不含 `E01_FULL_SOP_CANARY_7d519a`，请求 2 才含完整 SOP、替换后的 `from-agent` 参数，并把工具收窄为 `Read`、`load_skill`。）
 
 ### E02：`/review` 独立运行
 
-- [ ] 先完成一轮含工具调用的主对话，再执行 `/review 当前改动`；TUI 实时显示审查进度和正常权限确认，完成后重载会话只看到原始 `/review` 和最终审查摘要，看不到临时工具轨迹。（验证：观察 TUI，并检查会话 JSONL 中消息角色序列。）
+- [x] 先完成一轮含工具调用的主对话，再执行 `/review 当前改动`；TUI 实时显示审查进度和正常权限确认，完成后重载会话只看到原始 `/review` 和最终审查摘要，看不到临时工具轨迹。（实际：Bash 从“等待确认”经 `y` 到“执行中”和成功结果均实时可见；会话 JSONL 角色恰为 `user,tool_call,tool_result,assistant,user,assistant`，重载后有 `/review 当前改动` 与 `E02_REVIEW_FINAL`，无独立 Bash 轨迹。）
 
 ### E03：`/commit` 共享激活
 
-- [ ] 在有可提交改动的测试仓库执行 `/commit 示例提交`；首轮即出现 commit SOP，后续工具轮持续存在，工具只限 Read/Glob/Grep/Bash 加 `load_skill`，主历史保存原短命令。（验证：捕获 Provider 请求、观察权限确认并检查最终 git 提交和会话历史。）
+- [x] 在有可提交改动的测试仓库执行 `/commit 示例提交`；首轮即出现 commit SOP，后续工具轮持续存在，工具只限 Read/Glob/Grep/Bash 加 `load_skill`，主历史保存原短命令。（实际：四次请求均含 commit SOP，工具集始终恰为 `Bash,Glob,Grep,Read,load_skill`；三次 Bash 均经过权限确认，真实生成提交 `0c4f2c6 e2e skill commit`，会话首条保留原始 `/commit 示例提交`。）
 
 ### E04：`/test` 独立执行
 
-- [ ] 执行 `/test 运行相关测试`；临时上下文只携带最近一轮完整历史，实际运行测试并实时显示工具状态，完成后只回流最终结果摘要且不创建额外会话。（验证：观察 TUI、会话列表和 Store 文件数量。）
+- [x] 执行 `/test 运行相关测试`；临时上下文只携带最近一轮完整历史，实际运行测试并实时显示工具状态，完成后只回流最终结果摘要且不创建额外会话。（实际：独立请求只携带最近一个完整 user/assistant 轮次，确认后真实执行 `go test ./...` 并显示 `ok e04fixture`；唯一会话 JSONL 仅四条主历史消息、无 Bash 轨迹，Context Store 文件数为 0，重载仍只有一个会话。）
 
 ### E05：模型冲突与工具交集
 
-- [ ] 创建两个 shared 项目 Skill：先验证相同模型的工具白名单取交集，再把第二个改为不同模型并重新激活；第二次激活应失败且第一个 Skill 的 SOP、模型和工具集保持原样。（验证：查看错误提示并捕获失败前后的 Provider 请求。）
+- [x] 创建两个 shared 项目 Skill：先验证相同模型的工具白名单取交集，再把第二个改为不同模型并重新激活；第二次激活应失败且第一个 Skill 的 SOP、模型和工具集保持原样。（实际：第二个同模型 Skill 激活后工具交集为 `Read,load_skill`；改成冲突模型后激活显示 `active skills require different models` 且没有 Provider 请求，随后请求仍使用原模型、两份旧 SOP 与原工具交集。）
 
 ### E06：热更新与活动快照
 
-- [ ] 激活一个 shared Skill 后修改其说明、SOP 和 mode；下一次 Tab/Enter 看到新目录与命令元数据，但当前活动请求仍使用旧 SOP；重新调用后才使用新 SOP。（验证：依次记录 help/补全和 Provider system block。）
+- [x] 激活一个 shared Skill 后修改其说明、SOP 和 mode；下一次 Tab/Enter 看到新目录与命令元数据，但当前活动请求仍使用旧 SOP；重新调用后才使用新 SOP。（实际：热更新后 `/help` 立即显示新说明与 `[Skill/isolated]`；普通请求的目录已更新但活动区仍只有旧 SOP，重新执行 `/hot ARG_NEW` 后独立请求只含新 SOP。）
 
 ### E07：`/clear` 与会话生命周期
 
-- [ ] 激活多个 shared Skill 后执行 `/clear`；消息显示清空、历史消息数量不变，下一请求恢复默认模型和基础工具。随后新建、切换会话和重启，均没有活动 Skill。（验证：执行 `/status`、捕获下一请求并检查原会话 JSONL。）
+- [x] 激活多个 shared Skill 后执行 `/clear`；消息显示清空、历史消息数量不变，下一请求恢复默认模型和基础工具。随后新建、切换会话和重启，均没有活动 Skill。（实际：清除前后 `/session` 消息数均为 4，显示与 Skills 状态清空；下一请求恢复默认模型和全部基础工具。新会话、重启及从启动历史列表装载已有会话后均无活动 Skill。）
 
 ### E08：无效白名单启动失败
 
-- [ ] 在项目 Skill 中声明不存在的工具后启动应用；程序应在 TUI 接受输入前退出并给出脱敏错误。修正为已注册工具后重新启动应成功。（验证：记录两个进程退出码、stderr 和 TUI 是否出现。）
+- [x] 在项目 Skill 中声明不存在的工具后启动应用；程序应在 TUI 接受输入前退出并给出脱敏错误。修正为已注册工具后重新启动应成功。（实际：未知工具使用 API-key canary 时进程在 alternate-screen 前以 1 退出，stderr 只显示 `unknown tool "[redacted]"`；改为 `Read` 后真实 TUI 出现并以 0 退出。）
 
 ### E09：保留命令冲突
 
-- [ ] 新建名为 `clear` 或基础命令别名的项目 Skill；`/help` 和 Tab 不出现该 Skill 命令，诊断说明冲突，但 Agent 通过 `load_skill` 仍能加载它。（验证：观察 help、补全、诊断和捕获的 Agent 工具调用。）
+- [x] 新建名为 `clear` 或基础命令别名的项目 Skill；`/help` 和 Tab 不出现该 Skill 命令，诊断说明冲突，但 Agent 通过 `load_skill` 仍能加载它。（实际：诊断为 `skill_command_reserved`，`/help` 仅有基础 `/clear`，`/cl<Tab>` 只补成 `/clear`；普通请求中 Agent 成功调用 `load_skill(clear)`，下一请求含保留 Skill 的 SOP 与参数并把工具收窄为 `Read,load_skill`。）
 
 ### E10：资源根与路径越界
 
-- [ ] 创建目录型 Skill，放置一个包内参考文件和一个指向包外的 symlink；允许的 Read 可读参考文件，symlink 读取和对包外路径的 Write/Edit 均被拒绝。（验证：观察工具结果及权限/错误信息，确认包外文件未改变。）
+- [x] 创建目录型 Skill，放置一个包内参考文件和一个指向包外的 symlink；允许的 Read 可读参考文件，symlink 读取和对包外路径的 Write/Edit 均被拒绝。（实际：包内 Read 成功；symlink Read、包外 Write、包外 Edit 均返回 `permission_denied`。外部原文件前后 SHA-256 同为 `7dc3b41e...60a8`，目标新文件不存在。）
 
 ## 验收记录（2026-07-22）
 
@@ -132,7 +132,8 @@
 - 一次并行高负载全量测试中，MCP stdio 注册烟测在 2.7 秒期限内超时；随后独立重复运行 `go test ./internal/mcpclient -run TestMCPStdioToolRegistersAndExecutesThroughToolExecutor -count=10` 全部通过，顺序全量测试也通过，未复现功能故障。
 - 构建真实 `xagent` 二进制并进入 TUI 执行 `/help`，确认 `/commit [Skill/shared]`、`/review [Skill/isolated]`、`/test [Skill/isolated]` 已动态注册，正常退出且退出码为 0。
 - 使用 `rg` 审计新增导出 API，已移除仅供测试使用的 `Parse`、`CatalogPrompt`、`ActivePrompt` 包装函数；测试改走实际生产入口。
-- E01–E10 是需要人工操作和外部观察的完整 TUI 场景，本次未勾选；因此 AC27 仍待人工验收，不能视为已经完整通过。
+- E01–E10 已在隔离临时项目中使用真实 `xagent` 二进制、PTY、本地 OpenAI-compatible Provider 和捕获的请求 JSONL 全部执行通过；所有 XAgent 进程正常场景均以 0 退出。请求、会话和配置等证据位于 `/private/tmp/xagent-e2e-e01e04.oLg8Bk`、`/private/tmp/xagent-e05e07-refresh-clear-v1`、`/private/tmp/xagent-e08e10.h3oUa0`，关键 PTY 观察已逐项摘录在上方。
+- E04 首轮还暴露了 `memory.enabled: false` 未接入生产 wiring 的独立问题；修复后以含“记住”标记的真实 TUI 请求复验，主请求完成后等待 5 秒仍只有一次 Provider 请求，且未再触发 panic 或记忆抽取。复验证据位于 `/private/tmp/xagent-memory-disabled.xN4xIf`。
 
 ## 验收标准覆盖
 
@@ -166,4 +167,4 @@
 | AC26 | C50、C51、C52、C53、C54、C55 |
 | AC27 | E01–E10 |
 
-全部 AC1–AC27 均映射到至少一个可运行或可观察条目；自动化覆盖已完成，AC27 所映射的 E01–E10 仍待人工执行。
+全部 AC1–AC27 均已由至少一个可运行或可观察条目验证；自动化条目 C01–C55 与真实 TUI 条目 E01–E10 均已完成。
