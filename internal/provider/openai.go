@@ -34,7 +34,7 @@ func (p *OpenAIProvider) Name() string {
 func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
 	out := make(chan StreamEvent)
 	body, err := json.Marshal(openAIRequest{
-		Model:         p.cfg.Model,
+		Model:         requestModel(req.Model, p.cfg.Model),
 		Stream:        true,
 		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
 		Messages:      toOpenAIMessages(req),
@@ -73,23 +73,27 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 		for event := range ReadSSE(resp.Body) {
 			if event.Data == "[DONE]" {
 				if len(calls) > 0 {
-					out <- newToolCallsEvent(openAIToolCalls(calls))
+					emitStreamEvent(ctx, out, newToolCallsEvent(openAIToolCalls(calls)))
 					return
 				}
-				out <- StreamEvent{Type: StreamEventDone}
+				emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventDone})
 				return
 			}
 			var chunk openAIChunk
 			if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
-				out <- StreamEvent{Type: StreamEventError, Err: fmt.Errorf("解析 OpenAI 流式响应失败: %w", err)}
+				emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventError, Err: fmt.Errorf("解析 OpenAI 流式响应失败: %w", err)})
 				return
 			}
 			if chunk.Usage != nil {
-				out <- StreamEvent{Type: StreamEventUsage, Usage: &Usage{InputTokens: int64(chunk.Usage.PromptTokens), OutputTokens: int64(chunk.Usage.CompletionTokens)}}
+				if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventUsage, Usage: &Usage{InputTokens: int64(chunk.Usage.PromptTokens), OutputTokens: int64(chunk.Usage.CompletionTokens)}}) {
+					return
+				}
 			}
 			for _, choice := range chunk.Choices {
 				if choice.Delta.Content != "" {
-					out <- StreamEvent{Type: StreamEventTextDelta, Delta: choice.Delta.Content}
+					if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventTextDelta, Delta: choice.Delta.Content}) {
+						return
+					}
 				}
 				for _, delta := range choice.Delta.ToolCalls {
 					state := calls[delta.Index]
@@ -108,7 +112,7 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 					}
 				}
 				if choice.FinishReason != "" && choice.FinishReason != "tool_calls" {
-					out <- StreamEvent{Type: StreamEventDone}
+					emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventDone})
 					return
 				}
 			}

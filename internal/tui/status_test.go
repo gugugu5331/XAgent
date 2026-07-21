@@ -32,6 +32,30 @@ func TestStatusModeKeepsUsageMCPAndError(t *testing.T) {
 	}
 }
 
+func TestStatusSkillAndRequestModel(t *testing.T) {
+	running := Status{
+		Mode: "default", Provider: "fake", Model: "default-model",
+		ActiveSkills: "commit, test", RequestModel: "skill-model", Streaming: true,
+	}.View()
+	for _, want := range []string{"Model: default-model", "Skills: commit, test", "Request model: skill-model"} {
+		if !strings.Contains(running, want) {
+			t.Fatalf("running status missing %q: %q", want, running)
+		}
+	}
+
+	completed := Status{Mode: "default", Provider: "fake", Model: "default-model", ActiveSkills: "commit, test"}.View()
+	if strings.Contains(completed, "Request model:") || !strings.Contains(completed, "Model: default-model") {
+		t.Fatalf("completed status did not restore default model: %q", completed)
+	}
+}
+
+func TestStatusDefaultOutputUnchangedWithoutSkills(t *testing.T) {
+	output := Status{Mode: "default", Provider: "fake", Model: "model"}.View()
+	if output != "[DEFAULT] | Provider: fake | Model: model" {
+		t.Fatalf("default status changed: %q", output)
+	}
+}
+
 type errStatusTest struct{}
 
 func (errStatusTest) Error() string { return "boom" }

@@ -27,6 +27,26 @@ func TestRegistryNormalizesSortsAndCopiesDefinitions(t *testing.T) {
 	}
 }
 
+func TestRegistryDefinitionsCopiesAllDefinitions(t *testing.T) {
+	registry := MustNew(
+		Definition{Name: "visible", Aliases: []string{"v"}, Type: TypeLocal, Handler: noopHandler},
+		Definition{Name: "hidden", Aliases: []string{"x"}, Type: TypeLocal, Hidden: true, Handler: noopHandler},
+	)
+	definitions := registry.Definitions()
+	if len(definitions) != 2 || definitions[0].Name != "hidden" || !definitions[0].Hidden {
+		t.Fatalf("Definitions omitted hidden command: %#v", definitions)
+	}
+	definitions[0].Aliases[0] = "mutated"
+	definitions[1].Name = "changed"
+	again := registry.Definitions()
+	if again[0].Aliases[0] != "x" || again[1].Name != "visible" {
+		t.Fatalf("Definitions exposed mutable registry state: %#v", again)
+	}
+	if definitions := (*Registry)(nil).Definitions(); definitions != nil {
+		t.Fatalf("nil Registry returned definitions: %#v", definitions)
+	}
+}
+
 func TestRegistryRejectsConflicts(t *testing.T) {
 	tests := []struct {
 		name        string

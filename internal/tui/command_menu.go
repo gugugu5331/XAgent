@@ -10,6 +10,7 @@ type CommandMenuItem struct {
 	Name        string
 	Description string
 	ArgHint     string
+	Badge       string
 }
 
 type CommandMenu struct {
@@ -58,6 +59,9 @@ func (m CommandMenu) View() string {
 			prefix = "› "
 		}
 		line := prefix + "/" + item.Name
+		if strings.TrimSpace(item.Badge) != "" {
+			line += " [" + strings.TrimSpace(item.Badge) + "]"
+		}
 		if strings.TrimSpace(item.ArgHint) != "" {
 			line += " " + item.ArgHint
 		}

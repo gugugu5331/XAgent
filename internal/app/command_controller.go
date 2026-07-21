@@ -40,9 +40,23 @@ func (c *commandController) SendUserMessage(text string) {
 	c.cmd = c.model.submitUserMessage(text)
 }
 
+func (c *commandController) ExecuteSkill(name string, args string, raw string) error {
+	cmd, err := c.model.executeSkill(name, args, raw)
+	if err != nil {
+		return err
+	}
+	c.cmd = cmd
+	return nil
+}
+
 func (c *commandController) ClearMessages() {
 	c.model.messages.Clear()
 	c.model.messagesCleared = true
+	if c.model.skillActivity != nil {
+		c.model.skillActivity.Clear()
+	}
+	c.model.status.ActiveSkills = ""
+	c.model.status.RequestModel = ""
 }
 
 func (c *commandController) SwitchMode(mode command.Mode) {

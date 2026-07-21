@@ -4,6 +4,6 @@ config.yaml
 !.xagent/permissions.yaml
 .xagent/permissions.local.yaml
 .xagent/tmp-*
-xagent
+/xagent
 .claude/settings.local.json
 .DS_Store

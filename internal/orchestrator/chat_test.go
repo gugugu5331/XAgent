@@ -18,8 +18,10 @@ import (
 	"xagent/internal/permission"
 	"xagent/internal/prompt"
 	"xagent/internal/provider"
+	"xagent/internal/redact"
 	"xagent/internal/resources"
 	"xagent/internal/sessionctx"
+	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
 
@@ -393,6 +395,171 @@ func TestCollectProviderStreamForwardsAndCollects(t *testing.T) {
 	}
 	if !text || !thinking || !usage {
 		t.Fatalf("missing forwarded events text=%v thinking=%v usage=%v", text, thinking, usage)
+	}
+}
+
+func TestCollectProviderStreamRedactsLongSensitiveFieldsWithoutLeakingSuffixes(t *testing.T) {
+	jwt := strings.Repeat("jwt-segment-", 20)
+	apiKey := strings.Repeat("api-secret-", 20)
+	stream := make(chan provider.StreamEvent, 3)
+	stream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: "before Authorization: Bearer " + jwt + "\napi_key = " + apiKey + " after"}
+	stream <- provider.StreamEvent{Type: provider.StreamEventDone}
+	close(stream)
+	out := make(chan events.Event, 8)
+
+	collector, reason, err := collectProviderStreamWithRedactor(context.Background(), stream, out, redact.Text, 64)
+	if err != nil || reason != StopReasonCompleted {
+		t.Fatalf("collect failed: reason=%s err=%v", reason, err)
+	}
+	close(out)
+	var visible strings.Builder
+	for event := range out {
+		visible.WriteString(event.Text)
+	}
+	visible.WriteString(collector.AssistantText.String())
+	for _, suffix := range []string{jwt[len(jwt)-80:], apiKey[len(apiKey)-80:]} {
+		if strings.Contains(visible.String(), suffix) {
+			t.Fatalf("long sensitive field leaked suffix %q: %q", suffix, visible.String())
+		}
+	}
+}
+
+func TestCollectProviderStreamKeepsRedactionStateAcrossUsage(t *testing.T) {
+	secret := strings.Repeat("opaque-runtime-", 10)
+	redactor := func(value string) string { return strings.ReplaceAll(value, secret, "[redacted]") }
+	stream := make(chan provider.StreamEvent, 4)
+	stream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: "prefix " + secret[:70]}
+	stream <- provider.StreamEvent{Type: provider.StreamEventUsage, Usage: &provider.Usage{OutputTokens: 1}}
+	stream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: secret[70:]}
+	stream <- provider.StreamEvent{Type: provider.StreamEventDone}
+	close(stream)
+	out := make(chan events.Event, 8)
+
+	collector, reason, err := collectProviderStreamWithRedactor(context.Background(), stream, out, redactor, len(secret))
+	if err != nil || reason != StopReasonCompleted {
+		t.Fatalf("collect failed: reason=%s err=%v", reason, err)
+	}
+	close(out)
+	var visible strings.Builder
+	for event := range out {
+		visible.WriteString(event.Text)
+	}
+	visible.WriteString(collector.AssistantText.String())
+	if strings.Contains(visible.String(), secret) || !strings.Contains(visible.String(), "[redacted]") {
+		t.Fatalf("usage event broke streaming redaction state: %q", visible.String())
+	}
+}
+
+func TestCollectProviderStreamKeepsRedactionStateAcrossEventTypes(t *testing.T) {
+	secret := strings.Repeat("cross-type-secret-", 8)
+	redactor := func(value string) string { return strings.ReplaceAll(value, secret, "[redacted]") }
+	stream := make(chan provider.StreamEvent, 3)
+	stream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: secret[:60]}
+	stream <- provider.StreamEvent{Type: provider.StreamEventThinkingDelta, Delta: secret[60:]}
+	stream <- provider.StreamEvent{Type: provider.StreamEventDone}
+	close(stream)
+	out := make(chan events.Event, 4)
+
+	collector, reason, err := collectProviderStreamWithRedactor(context.Background(), stream, out, redactor, len(secret))
+	if err != nil || reason != StopReasonCompleted {
+		t.Fatalf("collect failed: reason=%s err=%v", reason, err)
+	}
+	close(out)
+	var visible strings.Builder
+	for event := range out {
+		visible.WriteString(event.Text)
+	}
+	visible.WriteString(collector.AssistantText.String())
+	visible.WriteString(collector.ThinkingText.String())
+	if strings.Contains(visible.String(), secret) || !strings.Contains(visible.String(), "[redacted]") {
+		t.Fatalf("event type switch broke streaming redaction state: %q", visible.String())
+	}
+}
+
+func TestCollectProviderStreamRedactsErrorsAndIncompletePrivateKeys(t *testing.T) {
+	secret := strings.Repeat("provider-secret-", 8)
+	redactor := func(value string) string { return strings.ReplaceAll(value, secret, "[redacted]") }
+	errorStream := make(chan provider.StreamEvent, 1)
+	errorStream <- provider.StreamEvent{Type: provider.StreamEventError, Err: fmt.Errorf("provider failed: %s", secret)}
+	close(errorStream)
+	if _, reason, err := collectProviderStreamWithRedactor(context.Background(), errorStream, make(chan events.Event, 1), redactor, len(secret)); err == nil || reason != StopReasonProviderError || strings.Contains(err.Error(), secret) {
+		t.Fatalf("provider error was not safely redacted: reason=%s err=%v", reason, err)
+	}
+
+	nilErrorStream := make(chan provider.StreamEvent, 1)
+	nilErrorStream <- provider.StreamEvent{Type: provider.StreamEventError}
+	close(nilErrorStream)
+	if _, reason, err := collectProviderStreamWithRedactor(context.Background(), nilErrorStream, make(chan events.Event, 1), redactor, len(secret)); err == nil || reason != StopReasonProviderError {
+		t.Fatalf("nil provider error was not synthesized: reason=%s err=%v", reason, err)
+	}
+
+	keyStream := make(chan provider.StreamEvent, 2)
+	keyStream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: "before\n-----BEGIN PRIVATE KEY-----\nTRUNCATED-KEY-MATERIAL"}
+	keyStream <- provider.StreamEvent{Type: provider.StreamEventDone}
+	close(keyStream)
+	out := make(chan events.Event, 4)
+	collector, reason, err := collectProviderStreamWithRedactor(context.Background(), keyStream, out, redact.Text, 64)
+	if err != nil || reason != StopReasonCompleted {
+		t.Fatalf("private-key collect failed: reason=%s err=%v", reason, err)
+	}
+	close(out)
+	var visible strings.Builder
+	for event := range out {
+		visible.WriteString(event.Text)
+	}
+	visible.WriteString(collector.AssistantText.String())
+	if strings.Contains(visible.String(), "TRUNCATED-KEY-MATERIAL") || !strings.Contains(visible.String(), "[redacted]") {
+		t.Fatalf("incomplete private key leaked: %q", visible.String())
+	}
+}
+
+func TestCollectProviderStreamFailsClosedOnUnboundedToken(t *testing.T) {
+	stream := make(chan provider.StreamEvent, 1)
+	stream <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: "Authorization: Bearer " + strings.Repeat("x", maxPendingStreamBytes+1)}
+	close(stream)
+	out := make(chan events.Event, 1)
+
+	collector, reason, err := collectProviderStreamWithRedactor(context.Background(), stream, out, redact.Text, 64)
+	if err == nil || reason != StopReasonProviderError || collector.AssistantText.Len() != 0 || len(out) != 0 {
+		t.Fatalf("unbounded token did not fail closed: collector=%#v reason=%s err=%v events=%d", collector, reason, err, len(out))
+	}
+}
+
+func TestStopRunWithErrorRedactsRuntimeSecrets(t *testing.T) {
+	secret := strings.Repeat("runtime-provider-secret-", 5)
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret(secret)
+	orch := NewWithOptions(OrchestratorOptions{Redact: runtimeRedactor.Text, RedactionLookbehind: runtimeRedactor.MaxSecretBytes()})
+	out := make(chan events.Event, 2)
+	orch.stopRunWithError(
+		context.Background(),
+		conversation.NewConversation("redacted-error", time.Now()),
+		&executionState{profile: skill.ExecutionProfile{}},
+		out,
+		1,
+		1,
+		StopReasonProviderError,
+		"provider failed: "+secret,
+		fmt.Errorf("provider failed: %s", secret),
+	)
+	close(out)
+	var sawProgress, sawError bool
+	for event := range out {
+		if event.Progress != nil {
+			sawProgress = true
+			if strings.Contains(event.Progress.Message, secret) {
+				t.Fatalf("progress leaked runtime secret: %#v", event.Progress)
+			}
+		}
+		if event.Err != nil {
+			sawError = true
+			if strings.Contains(event.Err.Error(), secret) {
+				t.Fatalf("error event leaked runtime secret: %v", event.Err)
+			}
+		}
+	}
+	if !sawProgress || !sawError {
+		t.Fatalf("missing stop events: progress=%v error=%v", sawProgress, sawError)
 	}
 }
 

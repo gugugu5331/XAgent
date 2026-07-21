@@ -89,9 +89,18 @@ func TestMapRedactsSensitiveKeysAndNestedStrings(t *testing.T) {
 func TestRuntimeRedactorRegistersSecretsPerInstance(t *testing.T) {
 	first := NewRuntimeRedactor()
 	second := NewRuntimeRedactor()
+	if got := first.MaxSecretBytes(); got != 0 {
+		t.Fatalf("empty runtime redactor MaxSecretBytes() = %d, want 0", got)
+	}
 	first.RegisterSecret("short")
 	first.RegisterSecret("runtime-secret")
 	first.RegisterSecret("runtime-secret")
+	if got, want := first.MaxSecretBytes(), len("runtime-secret"); got != want {
+		t.Fatalf("MaxSecretBytes() = %d, want %d", got, want)
+	}
+	if got := second.MaxSecretBytes(); got != 0 {
+		t.Fatalf("second runtime redactor unexpectedly inherited max secret size: %d", got)
+	}
 
 	firstText := first.Text("value short runtime-secret")
 	assertNoLeak(t, firstText, []string{"short", "runtime-secret"})
@@ -110,6 +119,18 @@ func TestRuntimeRedactorRegistersSecretsPerInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoLeak(t, string(data), []string{"runtime-secret", "short"})
+}
+
+func TestRuntimeRedactorReplacesOverlappingSecretsLongestFirst(t *testing.T) {
+	redactor := NewRuntimeRedactor()
+	redactor.RegisterSecret("abc")
+	redactor.RegisterSecret("abcdef")
+
+	got := redactor.Text("value=abcdef")
+	assertNoLeak(t, got, []string{"abc", "def", "abcdef"})
+	if !strings.Contains(got, "[redacted]") {
+		t.Fatalf("overlapping secret was not replaced: %q", got)
+	}
 }
 
 func assertNoLeak(t *testing.T, value string, secrets []string) {

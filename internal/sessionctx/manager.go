@@ -46,9 +46,31 @@ type PreparedContext struct {
 }
 
 func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, mode PrepareMode) (PreparedContext, error) {
-	prepared := PreparedContext{}
+	prepared := m.PrepareStable(ctx)
 	if m == nil {
 		return prepared, nil
+	}
+	if m.Context != nil && conv != nil {
+		result, err := m.Context.Prepare(ctx, conv, contextMode(mode))
+		prepared.ContextResult = result
+		if result.Changed {
+			prepared.MessagesChanged = true
+		}
+		if err != nil {
+			prepared.Diagnostics = append(prepared.Diagnostics, diagnostics.New("sessionctx_context_prepare_failed", diagnostics.SeverityWarning, err.Error()))
+			return prepared, err
+		}
+	}
+	return prepared, nil
+}
+
+// PrepareStable loads system instructions and memory without compacting,
+// externalizing, or otherwise mutating a Conversation. Independent Skill
+// executions use this path so their temporary conversations remain in-memory.
+func (m *Manager) PrepareStable(ctx context.Context) PreparedContext {
+	prepared := PreparedContext{}
+	if m == nil {
+		return prepared
 	}
 	if m.Instructions != nil {
 		sections, items := m.Instructions.Load(ctx)
@@ -62,18 +84,7 @@ func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, 
 		prepared.Diagnostics = append(prepared.Diagnostics, m.Memory.Diagnostics()...)
 	}
 	prepared.StableSections = append(prepared.StableSections, restoreBoundarySection())
-	if m.Context != nil && conv != nil {
-		result, err := m.Context.Prepare(ctx, conv, contextMode(mode))
-		prepared.ContextResult = result
-		if result.Changed {
-			prepared.MessagesChanged = true
-		}
-		if err != nil {
-			prepared.Diagnostics = append(prepared.Diagnostics, diagnostics.New("sessionctx_context_prepare_failed", diagnostics.SeverityWarning, err.Error()))
-			return prepared, err
-		}
-	}
-	return prepared, nil
+	return prepared
 }
 
 func (m *Manager) memorySections() ([]prompt.Section, []diagnostics.Diagnostic) {

@@ -15,8 +15,9 @@ const (
 	ToolError               Type = "tool_error"
 	ToolDenied              Type = "tool_denied"
 	AgentProgressed         Type = "agent_progress"
-	DiagnosticEmitted      Type = "diagnostic_emitted"
+	DiagnosticEmitted       Type = "diagnostic_emitted"
 	UsageUpdated            Type = "usage_updated"
+	MainTraceReset          Type = "main_trace_reset"
 	Done                    Type = "done"
 	Error                   Type = "error"
 )
@@ -103,13 +104,15 @@ type UsageDisplay struct {
 }
 
 type Event struct {
-	Type         Type
-	Text         string
-	Duration     time.Duration
-	Err          error
-	Tool         *ToolDisplay
-	Confirmation *ToolConfirmationRequest
-	Diagnostic   *DiagnosticDisplay
-	Progress     *AgentProgress
-	Usage        *UsageDisplay
+	Type          Type
+	Text          string
+	Duration      time.Duration
+	Err           error
+	Transient     bool
+	IndependentID string
+	Tool          *ToolDisplay
+	Confirmation  *ToolConfirmationRequest
+	Diagnostic    *DiagnosticDisplay
+	Progress      *AgentProgress
+	Usage         *UsageDisplay
 }

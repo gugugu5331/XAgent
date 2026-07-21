@@ -57,6 +57,21 @@ func TestSessionContextMergesDiagnostics(t *testing.T) {
 	}
 }
 
+func TestPrepareStableDoesNotMutateConversationContext(t *testing.T) {
+	contextPreparer := &fakeContextPreparer{changed: true}
+	manager := &Manager{
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Content: "stable project rules", Stable: true}}},
+		Context:      contextPreparer,
+	}
+	prepared := manager.PrepareStable(context.Background())
+	if contextPreparer.calls != 0 || prepared.MessagesChanged || prepared.ContextResult.Changed {
+		t.Fatalf("stable preparation invoked mutating context path: calls=%d prepared=%#v", contextPreparer.calls, prepared)
+	}
+	if !strings.Contains(joinSections(prepared.StableSections), "stable project rules") {
+		t.Fatalf("stable preparation omitted instructions: %#v", prepared.StableSections)
+	}
+}
+
 func TestSessionContextPriority(t *testing.T) {
 	manager := &Manager{
 		Instructions: fakeInstructionLoader{sections: []prompt.Section{
@@ -113,9 +128,13 @@ func (p fakeMemoryProvider) LoadIndex(scope memory.Scope) (memory.Index, error) 
 
 func (p fakeMemoryProvider) Diagnostics() []diagnostics.Diagnostic { return p.diagnostics }
 
-type fakeContextPreparer struct{ changed bool }
+type fakeContextPreparer struct {
+	changed bool
+	calls   int
+}
 
 func (p *fakeContextPreparer) Prepare(ctx context.Context, conv *conversation.Conversation, mode contextmgr.Mode) (contextmgr.Result, error) {
+	p.calls++
 	return contextmgr.Result{Changed: p.changed}, nil
 }
 

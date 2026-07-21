@@ -10,6 +10,7 @@ import (
 )
 
 type ChatRequest struct {
+	Model         string
 	StableSystem  []SystemBlock
 	DynamicSystem []SystemBlock
 	SystemPrompt  string
@@ -126,4 +127,23 @@ func nonEmptyToolDefinitions(definitions []ToolDefinition) []ToolDefinition {
 		result = append(result, definition)
 	}
 	return result
+}
+
+func requestModel(override string, fallback string) string {
+	if model := strings.TrimSpace(override); model != "" {
+		return model
+	}
+	return fallback
+}
+
+func emitStreamEvent(ctx context.Context, out chan<- StreamEvent, event StreamEvent) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case out <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }

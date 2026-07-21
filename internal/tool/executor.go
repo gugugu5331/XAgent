@@ -35,7 +35,13 @@ func (e *Executor) NeedsConfirmation(call Call) bool {
 
 func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, grant permission.Grant) Result {
 	permissionCall := permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
-	normalized, err := permission.NormalizeCall(permissionCall, e.ProjectRoot)
+	var readRoots []string
+	if scope, scopeErr := effectiveReadScope(ctx, e.ProjectRoot); scopeErr == nil {
+		readRoots = scope.ExtraRoots
+	} else {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool read scope is invalid for permission checking.", Recoverable: true})
+	}
+	normalized, err := permission.NormalizeCallWithReadRoots(permissionCall, e.ProjectRoot, readRoots)
 	if err != nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
 	}

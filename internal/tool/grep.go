@@ -21,7 +21,7 @@ func NewGrepTool(projectRoot string) Tool {
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {
-	return "Search text content in project files by plain text or regular expression. Use this dedicated tool to inspect project content before editing; searched paths must stay within the project."
+	return "Search text in the project or an active Skill's read-only package root by plain text or regular expression. Use this dedicated tool to inspect content before editing; searched paths must stay within an allowed root."
 }
 
 func (t *GrepTool) Risk() Risk { return RiskSafe }
@@ -29,7 +29,7 @@ func (t *GrepTool) Risk() Risk { return RiskSafe }
 func (t *GrepTool) Schema() Schema {
 	return ObjectSchema([]string{"pattern"}, map[string]SchemaProperty{
 		"pattern": StringProperty("Text or regex pattern to search for."),
-		"path":    StringProperty("Optional file or directory path relative to project root."),
+		"path":    StringProperty("Optional project-relative path or absolute path inside an active Skill's allowed package root."),
 		"regex":   BoolProperty("Whether pattern is a regular expression."),
 	})
 }
@@ -43,7 +43,11 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 	if searchPath == "" {
 		searchPath = "."
 	}
-	root, err := ResolveProjectPath(t.projectRoot, searchPath)
+	scope, err := effectiveReadScope(ctx, t.projectRoot)
+	if err != nil {
+		return Failure(input, errorCode(err), fmt.Sprintf("读取范围无效: %v", err), true)
+	}
+	root, err := resolveReadPath(scope, searchPath)
 	if err != nil {
 		return Failure(input, errorCode(err), err.Error(), true)
 	}
@@ -57,16 +61,13 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 	}
 
 	matches := []string{}
-	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
+	walkErr := walkGrepFiles(ctx, root.root, root.absolute, func(path string) error {
 		if len(matches) >= 200 {
-			return filepath.SkipAll
+			return errGrepLimit
 		}
-		return grepFile(path, t.projectRoot, pattern, re, useRegex, &matches)
+		return grepFile(path, scope, pattern, re, useRegex, &matches)
 	})
-	if walkErr != nil {
+	if walkErr != nil && walkErr != errGrepLimit {
 		return Failure(input, ErrNotFound, fmt.Sprintf("搜索失败: %v", walkErr), true)
 	}
 	status := StatusSuccess
@@ -80,8 +81,53 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 	return result
 }
 
-func grepFile(path string, projectRoot string, pattern string, re *regexp.Regexp, useRegex bool, matches *[]string) error {
-	resolved, fileContent, err := ReadProjectFile(projectRoot, path)
+var errGrepLimit = fmt.Errorf("grep result limit reached")
+
+func walkGrepFiles(ctx context.Context, root string, path string, visit func(string) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return visit(path)
+	}
+	entries, err := readDirNoFollow(root, path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		child := filepath.Join(path, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			if err := visit(child); err != nil {
+				return err
+			}
+			continue
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if entryInfo.IsDir() {
+			if err := walkGrepFiles(ctx, root, child, visit); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := visit(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func grepFile(path string, scope ReadScope, pattern string, re *regexp.Regexp, useRegex bool, matches *[]string) error {
+	target, fileContent, err := readFileInScope(scope, path)
 	if err != nil {
 		return nil
 	}
@@ -95,8 +141,7 @@ func grepFile(path string, projectRoot string, pattern string, re *regexp.Regexp
 			matched = re.MatchString(line)
 		}
 		if matched {
-			rel := RelativeToRoot(projectRoot, resolved)
-			*matches = append(*matches, fmt.Sprintf("%s:%d:%s", rel, lineNumber, strings.TrimSpace(line)))
+			*matches = append(*matches, fmt.Sprintf("%s:%d:%s", target.display, lineNumber, strings.TrimSpace(line)))
 			if len(*matches) >= 200 {
 				return nil
 			}

@@ -53,5 +53,6 @@ func suggestionFrom(definition Definition) Suggestion {
 		Aliases:     append([]string(nil), definition.Aliases...),
 		Description: definition.Description,
 		ArgHint:     definition.ArgHint,
+		Badge:       definition.Badge,
 	}
 }

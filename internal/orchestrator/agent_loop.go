@@ -8,23 +8,30 @@ import (
 	"xagent/internal/conversation"
 	"xagent/internal/events"
 	"xagent/internal/memory"
+	"xagent/internal/provider"
 	"xagent/internal/tool"
 )
 
-func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conversation, req RunRequest, out chan<- events.Event, start time.Time) bool {
+func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conversation, req RunRequest, state *executionState, out chan<- events.Event, start time.Time) RunResult {
+	result := RunResult{}
 	options := o.runOptions
 	if options.MaxIterations <= 0 || options.MaxUnknownToolCalls <= 0 {
 		options = defaultRunOptions()
 	}
 	unknownToolCalls := 0
 	for iteration := 1; iteration <= options.MaxIterations; iteration++ {
-		out <- progressEvent(iteration, options.MaxIterations, "", "")
-		stream, err := o.stream(ctx, conv, req.Mode, true, iteration)
-		if err != nil {
-			o.stopWithError(ctx, conv, out, iteration, options.MaxIterations, StopReasonProviderError, err.Error(), err)
-			return true
+		if !emitEvent(ctx, out, progressEvent(iteration, options.MaxIterations, "", "")) {
+			return finishRunResult(result, start, StopReasonCancelled)
 		}
-		collector, reason, err := collectProviderStream(ctx, stream, out)
+		stream, err := o.streamWithProfile(ctx, conv, req.Mode, state.profile, true, iteration)
+		if err != nil {
+			o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, err.Error(), err)
+			return finishRunResult(result, start, StopReasonProviderError)
+		}
+		parentCheckpoint := checkpointConversation(conv)
+		iterationProfile := state.profile.Clone()
+		collector, reason, err := collectProviderStreamWithRedactor(ctx, stream, out, o.redactText, o.redactionLookbehind)
+		addUsage(&result.Usage, collector.Usage)
 		if o.contextManager != nil {
 			o.contextManager.UpdateUsage(conv, collector.Usage)
 		}
@@ -35,57 +42,131 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 			conversation.AppendAssistantMessage(conv, collector.AssistantText.String())
 		}
 		if err != nil {
-			o.stopWithError(ctx, conv, out, iteration, options.MaxIterations, reason, err.Error(), err)
-			return true
+			o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, reason, err.Error(), err)
+			return finishRunResult(result, start, reason)
 		}
 		if len(collector.ToolCalls) == 0 {
-			if err := o.store.Save(ctx, conv); err != nil {
-				out <- events.Event{Type: events.Error, Err: err}
-				return true
+			result.FinalText = collector.AssistantText.String()
+			if err := o.saveConversationIfNeeded(ctx, conv, state); err != nil {
+				emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.redactError(err)})
+				return finishRunResult(result, start, StopReasonProviderError)
 			}
-			o.updateMemoryAfterCompleted(req, collector.AssistantText.String())
-			out <- progressEvent(iteration, options.MaxIterations, string(StopReasonCompleted), "已完成")
-			out <- events.Event{Type: events.Done, Duration: time.Since(start)}
-			return true
+			if state.profile.UpdateMemory {
+				o.updateMemoryAfterCompleted(req, collector.AssistantText.String())
+			}
+			if !emitEvent(ctx, out, progressEvent(iteration, options.MaxIterations, string(StopReasonCompleted), "已完成")) {
+				return finishRunResult(result, start, StopReasonCancelled)
+			}
+			emitEvent(ctx, out, events.Event{Type: events.Done, Duration: time.Since(start)})
+			return finishRunResult(result, start, StopReasonCompleted)
 		}
-		batches := makeToolBatches(collector.ToolCalls, o.registry)
-		executions, stopReason, err := o.executeToolBatches(ctx, req.Mode, batches, out)
+		if containsLoadSkillCall(collector.ToolCalls) {
+			terminal, stopReason, unknownCount, err := o.handleSkillToolCalls(ctx, conv, req, state, parentCheckpoint, iterationProfile, collector.ToolCalls, out)
+			unknownToolCalls += unknownCount
+			if err != nil {
+				if stopReason == "" || stopReason == StopReasonCompleted {
+					stopReason = StopReasonProviderError
+				}
+				o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, stopReason, err.Error(), err)
+				if terminal != nil {
+					addUsage(&terminal.Usage, &result.Usage)
+					return finishRunResult(*terminal, start, stopReason)
+				}
+				return finishRunResult(result, start, stopReason)
+			}
+			if terminal != nil {
+				addUsage(&terminal.Usage, &result.Usage)
+				return finishRunResult(*terminal, start, terminal.Reason)
+			}
+			if unknownToolCalls >= options.MaxUnknownToolCalls {
+				if o.saveRunAfterStop(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonUnknownTool, "未知工具过多") != nil {
+					return finishRunResult(result, start, StopReasonProviderError)
+				}
+				emitEvent(ctx, out, events.Event{Type: events.Done, Duration: time.Since(start)})
+				return finishRunResult(result, start, StopReasonUnknownTool)
+			}
+			continue
+		}
+		registry, err := o.registryForProfile(req.Mode, iterationProfile)
+		if err != nil {
+			o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, err.Error(), err)
+			return finishRunResult(result, start, StopReasonProviderError)
+		}
+		batches := makeToolBatches(collector.ToolCalls, registry)
+		execCtx, scopeErr := o.contextWithReadScope(ctx, iterationProfile)
+		if scopeErr != nil {
+			o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, scopeErr.Error(), scopeErr)
+			return finishRunResult(result, start, StopReasonProviderError)
+		}
+		executions, stopReason, err := o.executeToolBatchesWithRegistry(execCtx, req.Mode, registry, batches, out)
 		for _, execution := range executions {
 			o.appendToolMessages(conv, execution.Call, execution.Result)
 		}
 		if err != nil {
-			o.stopWithError(ctx, conv, out, iteration, options.MaxIterations, stopReason, err.Error(), err)
-			return true
+			o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, stopReason, err.Error(), err)
+			return finishRunResult(result, start, stopReason)
 		}
 		unknownToolCalls += countUnknownToolResults(executions)
 		if unknownToolCalls >= options.MaxUnknownToolCalls {
-			if o.saveAfterStop(ctx, conv, out, iteration, options.MaxIterations, StopReasonUnknownTool, "未知工具过多") != nil {
-				return true
+			if o.saveRunAfterStop(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonUnknownTool, "未知工具过多") != nil {
+				return finishRunResult(result, start, StopReasonProviderError)
 			}
-			out <- events.Event{Type: events.Done, Duration: time.Since(start)}
-			return true
+			emitEvent(ctx, out, events.Event{Type: events.Done, Duration: time.Since(start)})
+			return finishRunResult(result, start, StopReasonUnknownTool)
 		}
 	}
-	if o.saveAfterStop(ctx, conv, out, options.MaxIterations, options.MaxIterations, StopReasonMaxIterations, "达到迭代上限") != nil {
-		return true
+	if o.saveRunAfterStop(ctx, conv, state, out, options.MaxIterations, options.MaxIterations, StopReasonMaxIterations, "达到迭代上限") != nil {
+		return finishRunResult(result, start, StopReasonProviderError)
 	}
-	out <- events.Event{Type: events.Done, Duration: time.Since(start)}
-	return true
+	emitEvent(ctx, out, events.Event{Type: events.Done, Duration: time.Since(start)})
+	return finishRunResult(result, start, StopReasonMaxIterations)
 }
 
-func (o *Orchestrator) stopWithError(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, iteration int, max int, reason StopReason, message string, err error) {
-	if saveErr := o.saveAfterStop(ctx, conv, out, iteration, max, reason, message); saveErr != nil {
+func finishRunResult(result RunResult, start time.Time, reason StopReason) RunResult {
+	result.Duration = time.Since(start)
+	result.Reason = reason
+	return result
+}
+
+func addUsage(total *provider.Usage, usage *provider.Usage) {
+	if total == nil || usage == nil {
 		return
 	}
-	out <- events.Event{Type: events.Error, Err: err}
+	total.InputTokens += usage.InputTokens
+	total.OutputTokens += usage.OutputTokens
+	total.CacheCreationInputTokens += usage.CacheCreationInputTokens
+	total.CacheReadInputTokens += usage.CacheReadInputTokens
 }
 
-func (o *Orchestrator) saveAfterStop(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, iteration int, max int, reason StopReason, message string) error {
-	if err := o.store.Save(ctx, conv); err != nil {
-		out <- events.Event{Type: events.Error, Err: err}
+func (o *Orchestrator) saveConversationIfNeeded(ctx context.Context, conv *conversation.Conversation, state *executionState) error {
+	if state == nil || !state.profile.Persist || o.store == nil {
+		return nil
+	}
+	saveCtx := ctx
+	if saveCtx == nil {
+		saveCtx = context.Background()
+	}
+	if saveCtx.Err() != nil {
+		var cancel context.CancelFunc
+		saveCtx, cancel = context.WithTimeout(context.WithoutCancel(saveCtx), 2*time.Second)
+		defer cancel()
+	}
+	return o.store.Save(saveCtx, conv)
+}
+
+func (o *Orchestrator) stopRunWithError(ctx context.Context, conv *conversation.Conversation, state *executionState, out chan<- events.Event, iteration int, max int, reason StopReason, message string, err error) {
+	if saveErr := o.saveRunAfterStop(ctx, conv, state, out, iteration, max, reason, o.redactText(message)); saveErr != nil {
+		return
+	}
+	emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.redactError(err)})
+}
+
+func (o *Orchestrator) saveRunAfterStop(ctx context.Context, conv *conversation.Conversation, state *executionState, out chan<- events.Event, iteration int, max int, reason StopReason, message string) error {
+	if err := o.saveConversationIfNeeded(ctx, conv, state); err != nil {
+		emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.redactError(err)})
 		return err
 	}
-	out <- progressEvent(iteration, max, string(reason), message)
+	emitEvent(ctx, out, progressEvent(iteration, max, string(reason), o.redactText(message)))
 	return nil
 }
 

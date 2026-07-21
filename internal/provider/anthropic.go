@@ -21,8 +21,11 @@ type AnthropicProvider struct {
 	client anthropic.Client
 }
 
-func NewAnthropic(cfg config.LLMConfig, _ *http.Client) *AnthropicProvider {
+func NewAnthropic(cfg config.LLMConfig, client *http.Client) *AnthropicProvider {
 	options := []option.RequestOption{option.WithAPIKey(cfg.APIKey)}
+	if client != nil {
+		options = append(options, option.WithHTTPClient(client))
+	}
 	if strings.TrimRight(cfg.BaseURL, "/") != "https://api.anthropic.com" {
 		options = append(options, option.WithBaseURL(strings.TrimRight(cfg.BaseURL, "/")))
 	}
@@ -35,20 +38,7 @@ func (p *AnthropicProvider) Name() string {
 
 func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
 	out := make(chan StreamEvent)
-	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(reqModel(p.cfg.Model)),
-		MaxTokens: 64000,
-		Messages:  toAnthropicMessages(req.Messages),
-		Tools:     toAnthropicTools(req),
-		System:    toAnthropicSystemBlocks(req),
-	}
-	if req.Thinking.Enabled {
-		adaptive := anthropic.ThinkingConfigAdaptiveParam{}
-		if req.Thinking.Show {
-			adaptive.Display = anthropic.ThinkingConfigAdaptiveDisplaySummarized
-		}
-		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
-	}
+	params := anthropicMessageParams(p.cfg.Model, req)
 
 	go func() {
 		defer close(out)
@@ -64,35 +54,60 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 			case anthropic.ContentBlockDeltaEvent:
 				switch delta := value.Delta.AsAny().(type) {
 				case anthropic.TextDelta:
-					out <- StreamEvent{Type: StreamEventTextDelta, Delta: delta.Text}
+					if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventTextDelta, Delta: delta.Text}) {
+						return
+					}
 				case anthropic.ThinkingDelta:
-					out <- StreamEvent{Type: StreamEventThinkingDelta, Delta: delta.Thinking}
+					if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventThinkingDelta, Delta: delta.Thinking}) {
+						return
+					}
 				case anthropic.InputJSONDelta:
 					if state := toolCalls[value.Index]; state != nil {
 						state.Arguments.WriteString(delta.PartialJSON)
 					}
 				}
 			case anthropic.MessageDeltaEvent:
-				out <- StreamEvent{Type: StreamEventUsage, Usage: &Usage{
+				if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventUsage, Usage: &Usage{
 					InputTokens:              value.Usage.InputTokens,
 					OutputTokens:             value.Usage.OutputTokens,
 					CacheCreationInputTokens: value.Usage.CacheCreationInputTokens,
 					CacheReadInputTokens:     value.Usage.CacheReadInputTokens,
-				}}
-			case anthropic.MessageStopEvent:
-				if len(toolCalls) > 0 {
-					out <- newToolCallsEvent(anthropicToolCalls(toolCalls))
+				}}) {
 					return
 				}
-				out <- StreamEvent{Type: StreamEventDone}
+			case anthropic.MessageStopEvent:
+				if len(toolCalls) > 0 {
+					emitStreamEvent(ctx, out, newToolCallsEvent(anthropicToolCalls(toolCalls)))
+					return
+				}
+				emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventDone})
 				return
 			}
 		}
 		if err := stream.Err(); err != nil {
-			out <- StreamEvent{Type: StreamEventError, Err: err}
+			emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventError, Err: err})
 		}
 	}()
 	return out, nil
+}
+
+func anthropicMessageParams(defaultModel string, req ChatRequest) anthropic.MessageNewParams {
+	params := anthropic.MessageNewParams{
+		Model:     anthropic.Model(reqModel(requestModel(req.Model, defaultModel))),
+		MaxTokens: 64000,
+		Messages:  toAnthropicMessages(req.Messages),
+		Tools:     toAnthropicTools(req),
+		System:    toAnthropicSystemBlocks(req),
+	}
+	if req.Thinking.Enabled {
+		adaptive := anthropic.ThinkingConfigAdaptiveParam{}
+		if req.Thinking.Show {
+			adaptive.Display = anthropic.ThinkingConfigAdaptiveDisplaySummarized
+		}
+		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
+	}
+
+	return params
 }
 
 type anthropicToolCallState struct {

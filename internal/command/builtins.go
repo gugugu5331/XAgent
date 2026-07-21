@@ -5,16 +5,6 @@ import (
 	"strings"
 )
 
-const ReviewPrompt = `请审查当前工作区的所有未提交改动。只做审查，不要修改文件，也不要创建提交。
-
-优先查找并报告：
-1. 正确性缺陷和边界条件错误；
-2. 安全风险或敏感信息泄露；
-3. 可能导致既有行为回退的改动；
-4. 缺失、薄弱或无法证明行为的测试。
-
-按严重程度从高到低列出发现。每项给出文件与尽可能精确的位置、触发条件、实际影响和修复方向。若没有发现问题，明确说明，并指出仍存在的验证盲区。`
-
 func Builtins() []Definition {
 	return []Definition{
 		{Name: "help", Aliases: []string{"h", "?"}, Description: "显示可用命令", Usage: "/help", Type: TypeLocal, Handler: helpHandler},
@@ -26,7 +16,7 @@ func Builtins() []Definition {
 		{Name: "memory", Aliases: []string{"mem"}, Description: "显示记忆状态与条目数量", Usage: "/memory", Type: TypeLocal, Handler: memoryHandler},
 		{Name: "permission", Aliases: []string{"perm"}, Description: "显示当前权限状态", Usage: "/permission", Type: TypeLocal, Handler: permissionHandler},
 		{Name: "status", Aliases: []string{"st"}, Description: "显示统一运行状态", Usage: "/status", Type: TypeLocal, Handler: statusHandler},
-		{Name: "review", Aliases: []string{"rv"}, Description: "让 AI 审查当前未提交改动", Usage: "/review", Type: TypePrompt, Handler: reviewHandler},
+		{Name: "rv", Description: "兼容旧审查命令", Usage: "/rv [args]", Type: TypePrompt, ArgHint: "[args]", Hidden: true, Handler: reviewShimHandler},
 		{Name: "permissions", Description: "兼容旧权限状态命令", Usage: "/permissions status", Type: TypeLocal, Hidden: true, Handler: legacyPermissionsHandler},
 		{Name: "mcp", Description: "兼容旧 MCP 状态命令", Usage: "/mcp status", Type: TypeLocal, Hidden: true, Handler: legacyMCPHandler},
 		{Name: "diagnostics", Description: "兼容旧诊断命令", Usage: "/diagnostics", Type: TypeLocal, Hidden: true, Handler: legacyDiagnosticsHandler},
@@ -46,6 +36,9 @@ func helpHandler(context ExecutionContext, invocation Invocation) error {
 		line := fmt.Sprintf("/%s", definition.Name)
 		if len(aliases) > 0 {
 			line += " (" + strings.Join(aliases, ", ") + ")"
+		}
+		if definition.Badge != "" {
+			line += " [" + definition.Badge + "]"
 		}
 		line += " — " + definition.Description + "；用法: " + definition.Usage
 		if definition.ArgHint != "" {
@@ -156,12 +149,8 @@ func statusHandler(context ExecutionContext, invocation Invocation) error {
 	return nil
 }
 
-func reviewHandler(context ExecutionContext, invocation Invocation) error {
-	if err := rejectArgs(invocation, "/review"); err != nil {
-		return err
-	}
-	context.Controller.SendUserMessage(ReviewPrompt)
-	return nil
+func reviewShimHandler(context ExecutionContext, invocation Invocation) error {
+	return context.Controller.ExecuteSkill("review", invocation.Args, invocation.Raw)
 }
 
 func legacyPermissionsHandler(context ExecutionContext, invocation Invocation) error {

@@ -25,7 +25,7 @@ type Authorizer struct {
 }
 
 func (a *Authorizer) Decide(call Call, context Context) Decision {
-	normalized, err := NormalizeCall(call, context.ProjectRoot)
+	normalized, err := NormalizeCallWithReadRoots(call, context.ProjectRoot, context.ReadRoots)
 	if err != nil {
 		return deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "invalid tool arguments"}, "工具参数无法用于权限判断", "Tool arguments are invalid for permission checking.")
 	}
@@ -65,7 +65,7 @@ func (a *Authorizer) Decide(call Call, context Context) Decision {
 }
 
 func (a *Authorizer) ResolveUserDecision(call Call, context Context, action UserAction) Decision {
-	normalized, err := NormalizeCall(call, context.ProjectRoot)
+	normalized, err := NormalizeCallWithReadRoots(call, context.ProjectRoot, context.ReadRoots)
 	if err != nil {
 		return deny(call, ReasonConfigError, Source{Kind: SourceUserDecision, Description: "invalid tool arguments"}, "工具参数无法用于权限判断", "Tool arguments are invalid for permission checking.")
 	}

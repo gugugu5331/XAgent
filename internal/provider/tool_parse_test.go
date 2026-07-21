@@ -8,10 +8,29 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"xagent/internal/config"
 	"xagent/internal/tool"
 )
+
+func TestEmitStreamEventStopsWhenConsumerDisappears(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	out := make(chan StreamEvent)
+	go func() {
+		done <- emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventTextDelta, Delta: "blocked"})
+	}()
+	cancel()
+	select {
+	case sent := <-done:
+		if sent {
+			t.Fatal("event unexpectedly sent without a consumer")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider event sender did not stop after cancellation")
+	}
+}
 
 func TestOpenAIProviderParsesToolCallDeltas(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +136,63 @@ func TestOpenAIProviderEmitsUsage(t *testing.T) {
 		t.Fatalf("expected include_usage stream option, got %#v", requestBody)
 	}
 }
+
+func TestRequestModelOverrideOpenAI(t *testing.T) {
+	requestBodies := make([]map[string]any, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Error(err)
+			return
+		}
+		requestBodies = append(requestBodies, body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	provider := NewOpenAI(config.LLMConfig{Model: "configured-model", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	requests := []ChatRequest{
+		{
+			Model: "  skill-model  ",
+			Tools: []ToolDefinition{{Name: "Read", Description: "read", Schema: tool.Schema{Type: "object"}}},
+		},
+		{},
+	}
+	for _, request := range requests {
+		stream, err := provider.StreamChat(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for event := range stream {
+			if event.Type == StreamEventError {
+				t.Fatal(event.Err)
+			}
+		}
+	}
+	if len(requestBodies) != 2 {
+		t.Fatalf("captured %d requests, want 2", len(requestBodies))
+	}
+	if requestBodies[0]["model"] != "skill-model" {
+		t.Fatalf("override request used wrong model: %#v", requestBodies[0])
+	}
+	tools, ok := requestBodies[0]["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("override request dropped tools: %#v", requestBodies[0])
+	}
+	if requestBodies[1]["model"] != "configured-model" {
+		t.Fatalf("default request was polluted by prior override: %#v", requestBodies[1])
+	}
+	if provider.cfg.Model != "configured-model" {
+		t.Fatalf("provider config was mutated: %#v", provider.cfg)
+	}
+}
+
 func TestAnthropicToolCallsAreSorted(t *testing.T) {
 	calls := anthropicToolCalls(map[int64]*anthropicToolCallState{
 		2: {ID: "b", Name: "Glob"},

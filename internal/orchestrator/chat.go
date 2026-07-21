@@ -20,25 +20,34 @@ import (
 	"xagent/internal/redact"
 	"xagent/internal/resources"
 	"xagent/internal/sessionctx"
+	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
 
 type OrchestratorOptions struct {
-	Provider       provider.Provider
-	Store          conversation.ConversationStore
-	Resources      resources.PromptProvider
-	Thinking       config.ThinkingConfig
-	Registry       *tool.Registry
-	Executor       *tool.Executor
-	ContextManager *contextmgr.Manager
-	SessionContext sessionPreparer
-	Memory         memoryUpdater
-	Diagnostics    *diagnostics.Collector
-	Agent          config.AgentConfig
+	Provider            provider.Provider
+	Store               conversation.ConversationStore
+	Resources           resources.PromptProvider
+	Thinking            config.ThinkingConfig
+	Registry            *tool.Registry
+	Executor            *tool.Executor
+	ContextManager      *contextmgr.Manager
+	SessionContext      sessionPreparer
+	Memory              memoryUpdater
+	Diagnostics         *diagnostics.Collector
+	Agent               config.AgentConfig
+	SkillManager        *skill.Manager
+	DefaultModel        string
+	Redact              func(string) string
+	RedactionLookbehind int
 }
 
 type sessionPreparer interface {
 	Prepare(ctx context.Context, conv *conversation.Conversation, mode sessionctx.PrepareMode) (sessionctx.PreparedContext, error)
+}
+
+type stableSessionPreparer interface {
+	PrepareStable(ctx context.Context) sessionctx.PreparedContext
 }
 
 type memoryUpdater interface {
@@ -46,20 +55,24 @@ type memoryUpdater interface {
 }
 
 type Orchestrator struct {
-	provider         provider.Provider
-	store            conversation.ConversationStore
-	resources        resources.PromptProvider
-	thinking         config.ThinkingConfig
-	registry         *tool.Registry
-	readOnlyRegistry *tool.Registry
-	executor         *tool.Executor
-	authorizer       *permission.Authorizer
-	contextManager   *contextmgr.Manager
-	sessionContext   sessionPreparer
-	memory           memoryUpdater
-	diagnostics      *diagnostics.Collector
-	permissionMode   permission.Mode
-	runOptions       RunOptions
+	provider            provider.Provider
+	store               conversation.ConversationStore
+	resources           resources.PromptProvider
+	thinking            config.ThinkingConfig
+	registry            *tool.Registry
+	readOnlyRegistry    *tool.Registry
+	executor            *tool.Executor
+	authorizer          *permission.Authorizer
+	contextManager      *contextmgr.Manager
+	sessionContext      sessionPreparer
+	memory              memoryUpdater
+	diagnostics         *diagnostics.Collector
+	skillManager        *skill.Manager
+	defaultModel        string
+	redact              func(string) string
+	redactionLookbehind int
+	permissionMode      permission.Mode
+	runOptions          RunOptions
 }
 
 func New(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
@@ -90,7 +103,33 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 		}
 	}
 	runOptions := runOptionsFromConfig(options.Agent)
-	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, permissionMode: permission.ModeDefault, runOptions: runOptions}
+	redactor := options.Redact
+	if redactor == nil {
+		redactor = redact.Text
+	}
+	lookbehind := options.RedactionLookbehind
+	if lookbehind < 64 {
+		lookbehind = 64
+	}
+	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, skillManager: options.SkillManager, defaultModel: strings.TrimSpace(options.DefaultModel), redact: redactor, redactionLookbehind: lookbehind, permissionMode: permission.ModeDefault, runOptions: runOptions}
+}
+
+func (o *Orchestrator) redactText(value string) string {
+	if o == nil || o.redact == nil {
+		return redact.Text(value)
+	}
+	return o.redact(value)
+}
+
+func (o *Orchestrator) redactError(err error) error {
+	if err == nil {
+		return nil
+	}
+	safe := o.redactText(err.Error())
+	if safe == err.Error() {
+		return err
+	}
+	return fmt.Errorf("%s", safe)
 }
 
 func (o *Orchestrator) SetPermissionMode(mode permission.Mode) {
@@ -150,30 +189,58 @@ func (o *Orchestrator) Send(ctx context.Context, conv *conversation.Conversation
 }
 
 func (o *Orchestrator) SendWithMode(ctx context.Context, conv *conversation.Conversation, userText string, mode RunMode) (<-chan events.Event, error) {
-	userText = strings.TrimSpace(userText)
-	if userText == "" {
+	return o.SendRequest(ctx, conv, RunRequest{UserText: userText, Mode: mode})
+}
+
+func (o *Orchestrator) SendRequest(ctx context.Context, conv *conversation.Conversation, req RunRequest) (<-chan events.Event, error) {
+	req.UserText = strings.TrimSpace(req.UserText)
+	if req.UserText == "" {
 		return nil, fmt.Errorf("请输入非空内容")
 	}
-	if mode != RunModeDefault && mode != RunModePlan && mode != RunModeDo {
-		return nil, fmt.Errorf("运行模式无效: %s", mode)
+	if req.Mode != RunModeDefault && req.Mode != RunModePlan && req.Mode != RunModeDo {
+		return nil, fmt.Errorf("运行模式无效: %s", req.Mode)
 	}
-	req := RunRequest{UserText: userText, Mode: mode}
+	if conv == nil {
+		return nil, fmt.Errorf("会话不能为空")
+	}
+	state, err := o.newExecutionState(req)
+	if err != nil {
+		return nil, err
+	}
 	out := make(chan events.Event)
 	conversation.AppendUserMessage(conv, req.UserText)
 
 	go func() {
 		defer close(out)
 		start := time.Now()
-		out <- events.Event{Type: events.UserSubmitted, Text: req.UserText}
-		o.runAgentLoop(ctx, conv, req, out, start)
+		if !emitEvent(ctx, out, events.Event{Type: events.UserSubmitted, Text: req.UserText}) {
+			return
+		}
+		o.runAgentLoop(ctx, conv, req, state, out, start)
 	}()
 	return out, nil
 }
 
 func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, mode RunMode, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
+	profile, err := o.buildExecutionProfile(mode, skill.NewActivity(), 0)
+	if err != nil {
+		return nil, err
+	}
+	return o.streamWithProfile(ctx, conv, mode, profile, includeTools, iteration)
+}
+
+func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
 	optionalSections := []prompt.Section{}
 	if o.sessionContext != nil {
-		prepared, err := o.sessionContext.Prepare(ctx, conv, sessionctx.PrepareAuto)
+		var prepared sessionctx.PreparedContext
+		var err error
+		if !profile.Persist {
+			if stable, ok := o.sessionContext.(stableSessionPreparer); ok {
+				prepared = stable.PrepareStable(ctx)
+			}
+		} else {
+			prepared, err = o.sessionContext.Prepare(ctx, conv, sessionctx.PrepareAuto)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -181,24 +248,32 @@ func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversati
 		if o.diagnostics != nil {
 			o.diagnostics.Add(prepared.Diagnostics...)
 		}
-		if prepared.MessagesChanged {
+		if prepared.MessagesChanged && profile.Persist && o.store != nil {
 			if err := o.store.Save(ctx, conv); err != nil {
 				return nil, err
 			}
 		}
-	} else if o.contextManager != nil {
+	} else if o.contextManager != nil && profile.Persist {
 		result, err := o.contextManager.Prepare(ctx, conv, contextmgr.ModeAuto)
 		if err != nil {
 			return nil, err
 		}
-		if result.Changed {
+		if result.Changed && profile.Persist && o.store != nil {
 			if err := o.store.Save(ctx, conv); err != nil {
 				return nil, err
 			}
 		}
 	}
-	bundle := prompt.Build(prompt.BuildRequest{Mode: promptRunMode(mode), Iteration: iteration, ProjectRoot: o.projectRoot(), OptionalStableSections: optionalSections})
+	bundle := prompt.Build(prompt.BuildRequest{
+		Mode:                   promptRunMode(mode),
+		Iteration:              iteration,
+		ProjectRoot:            o.projectRoot(),
+		SkillCatalog:           skill.CatalogPromptWithRedactor(profile.Catalog, o.redactText),
+		ActiveSkills:           skill.ActivePromptWithRedactor(profile.Activity, o.redactText),
+		OptionalStableSections: optionalSections,
+	})
 	request := provider.ChatRequest{
+		Model:         profile.Model,
 		StableSystem:  providerStableBlocks(bundle.StableBlocks),
 		DynamicSystem: providerDynamicBlocks(bundle.DynamicBlocks),
 		Messages:      conversation.ContextMessages(conv),
@@ -206,7 +281,7 @@ func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversati
 		Cache:         provider.CachePolicy{EnablePromptCache: true},
 	}
 	if includeTools {
-		registry, err := o.registryForMode(mode)
+		registry, err := o.registryForProfile(mode, profile)
 		if err != nil {
 			return nil, err
 		}
@@ -249,135 +324,17 @@ func providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	return result
 }
 
-func (o *Orchestrator) consumeStream(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, stream <-chan provider.StreamEvent, start time.Time, mode RunMode, allowTool bool) bool {
-	var assistantText strings.Builder
-	var thinkingText strings.Builder
-	for event := range stream {
-		switch event.Type {
-		case provider.StreamEventTextDelta:
-			assistantText.WriteString(event.Delta)
-			out <- events.Event{Type: events.TextDelta, Text: event.Delta}
-		case provider.StreamEventThinkingDelta:
-			thinkingText.WriteString(event.Delta)
-			out <- events.Event{Type: events.ThinkingDelta, Text: event.Delta}
-		case provider.StreamEventToolCall:
-			if o.thinking.Show {
-				conversation.AppendThinkingMessage(conv, thinkingText.String())
-			}
-			if assistantText.Len() > 0 {
-				conversation.AppendAssistantMessage(conv, assistantText.String())
-			}
-			toolCalls := streamToolCalls(event)
-			if len(toolCalls) == 0 {
-				out <- events.Event{Type: events.Error, Err: fmt.Errorf("工具调用为空")}
-				return true
-			}
-			if len(toolCalls) > 1 {
-				result := multipleToolCallsResult(toolCalls)
-				o.appendUnsupportedToolMessages(conv, toolCalls, result)
-				out <- toolResultEvent(result)
-				return o.finalReply(ctx, conv, out, start)
-			}
-			if !allowTool || o.executor == nil {
-				result := unsupportedToolLoopResult(toolCalls[0])
-				o.appendToolMessages(conv, toolCalls[0], result)
-				out <- toolResultEvent(result)
-				return o.finishWithoutMoreTools(ctx, conv, out, start, result.Content)
-			}
-			return o.handleToolCall(ctx, conv, out, mode, toolCalls[0], start)
-		case provider.StreamEventUsage:
-			if o.contextManager != nil {
-				o.contextManager.UpdateUsage(conv, event.Usage)
-			}
-			if event.Usage != nil {
-				out <- events.Event{Type: events.UsageUpdated, Usage: usageDisplay(event.Usage)}
-			}
-		case provider.StreamEventDone:
-			if o.thinking.Show {
-				conversation.AppendThinkingMessage(conv, thinkingText.String())
-			}
-			conversation.AppendAssistantMessage(conv, assistantText.String())
-			if err := o.store.Save(ctx, conv); err != nil {
-				out <- events.Event{Type: events.Error, Err: err}
-				return true
-			}
-			out <- events.Event{Type: events.Done, Duration: time.Since(start)}
-			return true
-		case provider.StreamEventError:
-			out <- events.Event{Type: events.Error, Err: event.Err}
-			return true
-		}
-	}
-	return false
-}
-
-func (o *Orchestrator) handleToolCall(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, mode RunMode, call tool.Call, start time.Time) bool {
-	display := newToolDisplay(call, events.ToolDisplayPending, "")
-	out <- events.Event{Type: events.ToolPending, Tool: display}
-
-	var result tool.Result
-	if o.authorizer == nil {
-		result = tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "权限系统不可用", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true}}
-		out <- toolResultEvent(result)
-		o.appendToolMessages(conv, call, result)
-		return o.finalReply(ctx, conv, out, start)
-	}
-	decision := o.authorizer.Decide(permissionCall(call), o.permissionContext(mode))
-	switch decision.Kind {
-	case permission.DecisionDeny:
-		result = permissionDeniedResult(call, decision)
-		out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
-		o.appendToolMessages(conv, call, result)
-		return o.finalReply(ctx, conv, out, start)
-	case permission.DecisionAsk:
-		decisionCh := make(chan events.ToolConfirmationDecision, 1)
-		confirmation := confirmationRequest(call, decision, decisionCh)
-		out <- events.Event{Type: events.ToolWaitingConfirmation, Tool: newToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}
-		select {
-		case <-ctx.Done():
-			out <- events.Event{Type: events.Error, Err: ctx.Err()}
-			return true
-		case userDecision := <-decisionCh:
-			decision = o.authorizer.ResolveUserDecision(permissionCall(call), o.permissionContext(mode), permissionAction(userDecision))
-			if decision.Kind == permission.DecisionDeny {
-				result = permissionDeniedResult(call, decision)
-				out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
-				o.appendToolMessages(conv, call, result)
-				return o.finalReply(ctx, conv, out, start)
-			}
-		}
-	}
-
-	out <- events.Event{Type: events.ToolRunning, Tool: newToolDisplay(call, events.ToolDisplayRunning, "执行中")}
-	result = o.executor.ExecuteAuthorized(ctx, call, *decision.Grant)
-	out <- toolResultEvent(result)
-	o.appendToolMessages(conv, call, result)
-	return o.finalReply(ctx, conv, out, start)
-}
-
-func (o *Orchestrator) finalReply(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, start time.Time) bool {
-	stream, err := o.stream(ctx, conv, RunModeDefault, false, 1)
-	if err != nil {
-		out <- events.Event{Type: events.Error, Err: err}
-		return true
-	}
-	return o.consumeStream(ctx, conv, out, stream, start, RunModeDefault, false)
-}
-
-func (o *Orchestrator) finishWithoutMoreTools(ctx context.Context, conv *conversation.Conversation, out chan<- events.Event, start time.Time, text string) bool {
-	conversation.AppendAssistantMessage(conv, text)
-	out <- events.Event{Type: events.TextDelta, Text: text}
-	if err := o.store.Save(ctx, conv); err != nil {
-		out <- events.Event{Type: events.Error, Err: err}
-		return true
-	}
-	out <- events.Event{Type: events.Done, Duration: time.Since(start)}
-	return true
-}
-
 func (o *Orchestrator) appendToolMessages(conv *conversation.Conversation, call tool.Call, result tool.Result) {
-	conversation.AppendToolCallMessage(conv, call.ID, call.Name, redactedArguments(call))
-	conversation.AppendToolResultMessage(conv, call.ID, call.Name, resultHistoryStatus(result), result.Summary, resultContent(result), resultErrorCode(result), result.Truncated, resultData(result), resultErrorData(result))
+	data := resultData(result)
+	errorData := resultErrorData(result)
+	if len(data) > 0 {
+		data = json.RawMessage(o.redactText(string(data)))
+	}
+	if len(errorData) > 0 {
+		errorData = json.RawMessage(o.redactText(string(errorData)))
+	}
+	conversation.AppendToolCallMessage(conv, call.ID, call.Name, o.redactText(redactedArguments(call)))
+	conversation.AppendToolResultMessage(conv, call.ID, call.Name, resultHistoryStatus(result), o.redactText(redactSensitive(result.Summary)), o.redactText(resultContent(result)), resultErrorCode(result), result.Truncated, data, errorData)
 }
 
 func (o *Orchestrator) appendUnsupportedToolMessages(conv *conversation.Conversation, calls []tool.Call, result tool.Result) {
@@ -440,6 +397,50 @@ func toolResultEvent(result tool.Result) events.Event {
 	return events.Event{Type: eventType, Tool: resultDisplay(result)}
 }
 
+func (o *Orchestrator) safeToolResultEvent(result tool.Result) events.Event {
+	event := toolResultEvent(result)
+	if event.Tool != nil {
+		o.redactToolDisplay(event.Tool)
+	}
+	return event
+}
+
+func (o *Orchestrator) safeToolDisplay(call tool.Call, status events.ToolDisplayStatus, summary string) *events.ToolDisplay {
+	display := newToolDisplay(call, status, summary)
+	o.redactToolDisplay(display)
+	return display
+}
+
+func (o *Orchestrator) safeResultDisplay(result tool.Result) *events.ToolDisplay {
+	display := resultDisplay(result)
+	o.redactToolDisplay(display)
+	return display
+}
+
+func (o *Orchestrator) redactToolDisplay(display *events.ToolDisplay) {
+	if display == nil {
+		return
+	}
+	display.Arguments = o.redactText(display.Arguments)
+	display.Summary = o.redactText(display.Summary)
+	display.Stdout = o.redactText(display.Stdout)
+	display.Stderr = o.redactText(display.Stderr)
+	display.ArtifactID = o.redactText(display.ArtifactID)
+}
+
+func (o *Orchestrator) safeConfirmationRequest(call tool.Call, decision permission.Decision, decisionCh chan events.ToolConfirmationDecision) *events.ToolConfirmationRequest {
+	request := confirmationRequest(call, decision, decisionCh)
+	if request == nil {
+		return nil
+	}
+	request.Arguments = o.redactText(request.Arguments)
+	request.Prompt = o.redactText(request.Prompt)
+	request.ScopePreview = o.redactText(request.ScopePreview)
+	request.Warning = o.redactText(request.Warning)
+	request.RevokeHint = o.redactText(request.RevokeHint)
+	return request
+}
+
 func newToolDisplay(call tool.Call, status events.ToolDisplayStatus, summary string) *events.ToolDisplay {
 	return &events.ToolDisplay{CallID: call.ID, Name: call.Name, Arguments: redactedArguments(call), Summary: summary, Status: status}
 }
@@ -456,7 +457,7 @@ func redactedArguments(call tool.Call) string {
 		}
 		return string(data)
 	}
-	for _, key := range []string{"command", "content", "old_text", "new_text"} {
+	for _, key := range []string{"command", "content", "old_text", "new_text", "path", "pattern", "name", "args"} {
 		if value, ok := args[key].(string); ok {
 			args[key] = redactSensitive(value)
 		}
@@ -489,7 +490,7 @@ func resultDisplay(result tool.Result) *events.ToolDisplay {
 	return &events.ToolDisplay{
 		CallID:            result.CallID,
 		Name:              result.Name,
-		Summary:           result.Summary,
+		Summary:           redactSensitive(result.Summary),
 		Status:            status,
 		ErrorCode:         resultErrorCode(result),
 		Stdout:            stringData(result.Data, "stdout"),
@@ -679,12 +680,12 @@ func resultContent(result tool.Result) string {
 		Error:     result.Error,
 		Truncated: result.Truncated,
 	}
-	data, err := json.Marshal(payload)
+	data, err := marshalRedactedJSON(payload)
 	if err != nil {
 		if strings.TrimSpace(result.Content) != "" {
-			return result.Content
+			return redactSensitive(result.Content)
 		}
-		return result.Summary
+		return redactSensitive(result.Summary)
 	}
 	return string(data)
 }
@@ -693,7 +694,7 @@ func resultData(result tool.Result) json.RawMessage {
 	if result.Data == nil {
 		return nil
 	}
-	data, err := json.Marshal(result.Data)
+	data, err := marshalRedactedJSON(result.Data)
 	if err != nil {
 		return nil
 	}
@@ -704,11 +705,28 @@ func resultErrorData(result tool.Result) json.RawMessage {
 	if result.Error == nil {
 		return nil
 	}
-	data, err := json.Marshal(result.Error)
+	data, err := marshalRedactedJSON(result.Error)
 	if err != nil {
 		return nil
 	}
 	return data
+}
+
+func marshalRedactedJSON(value any) (json.RawMessage, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, err
+	}
+	redacted := redact.Any(decoded)
+	data, err = json.Marshal(redacted)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(data), nil
 }
 
 func resultErrorCode(result tool.Result) string {

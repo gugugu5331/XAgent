@@ -4,6 +4,7 @@ type Controller interface {
 	DisplayNotice(text string)
 	DisplayError(err error)
 	SendUserMessage(text string)
+	ExecuteSkill(name string, args string, raw string) error
 
 	ClearMessages()
 	SwitchMode(mode Mode)

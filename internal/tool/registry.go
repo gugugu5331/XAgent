@@ -20,8 +20,9 @@ type OpenAIFunction struct {
 }
 
 type Registry struct {
-	tools map[string]Tool
-	order []string
+	tools     map[string]Tool
+	order     []string
+	immutable bool
 }
 
 func NewRegistry(projectRoot string) (*Registry, error) {
@@ -58,6 +59,12 @@ func NewReadOnlyRegistry(projectRoot string) (*Registry, error) {
 }
 
 func (r *Registry) Register(tool Tool) error {
+	if r == nil {
+		return fmt.Errorf("工具注册中心不能为空")
+	}
+	if r.immutable {
+		return fmt.Errorf("工具过滤视图不可修改")
+	}
 	if tool == nil {
 		return fmt.Errorf("工具不能为空")
 	}
@@ -78,7 +85,18 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return tool, ok
 }
 
+// Names returns registered tool names in stable registration order.
+func (r *Registry) Names() []string {
+	if r == nil {
+		return nil
+	}
+	return append([]string(nil), r.order...)
+}
+
 func (r *Registry) List() []Tool {
+	if r == nil {
+		return nil
+	}
 	tools := make([]Tool, 0, len(r.order))
 	for _, name := range r.order {
 		tools = append(tools, r.tools[name])

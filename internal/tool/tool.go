@@ -91,6 +91,7 @@ const (
 	ErrCommandFailed                = "command_failed"
 	ErrPermissionDenied             = "permission_denied"
 	ErrNoResults                    = "no_results"
+	ErrInternalRoutingRequired      = "internal_routing_required"
 )
 
 func Success(call Input, summary string, content string, data map[string]any) Result {

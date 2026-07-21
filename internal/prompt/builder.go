@@ -7,6 +7,9 @@ import (
 
 func Build(req BuildRequest) Bundle {
 	stable := stableBlocks(req.OptionalStableSections)
+	if catalog := strings.TrimSpace(req.SkillCatalog); catalog != "" {
+		stable = append(stable, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true})
+	}
 	return Bundle{StableBlocks: stable, DynamicBlocks: DynamicBlocks(req)}
 }
 

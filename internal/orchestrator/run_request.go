@@ -3,8 +3,11 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"xagent/internal/config"
+	"xagent/internal/provider"
+	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
 
@@ -19,6 +22,15 @@ const (
 type RunRequest struct {
 	UserText string
 	Mode     RunMode
+	Profile  skill.ExecutionProfile
+	Activity *skill.Activity
+}
+
+type RunResult struct {
+	FinalText string
+	Usage     provider.Usage
+	Duration  time.Duration
+	Reason    StopReason
 }
 
 type RunOptions struct {

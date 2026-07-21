@@ -6,6 +6,10 @@ import (
 )
 
 func DynamicBlocks(req BuildRequest) []Block {
+	blocks := make([]Block, 0, 2)
+	if active := strings.TrimSpace(req.ActiveSkills); active != "" {
+		blocks = append(blocks, Block{Name: ActiveSkillsBlockName, Content: active, Stable: false})
+	}
 	iteration := req.Iteration
 	if iteration <= 0 {
 		iteration = 1
@@ -19,7 +23,7 @@ func DynamicBlocks(req BuildRequest) []Block {
 	}
 	parts = append(parts, modeInstruction(req.Mode, iteration))
 	parts = append(parts, "</system-reminder>")
-	return []Block{{Name: "runtime-system-reminder", Content: strings.Join(parts, "\n"), Stable: false}}
+	return append(blocks, Block{Name: "runtime-system-reminder", Content: strings.Join(parts, "\n"), Stable: false})
 }
 
 func modeInstruction(mode RunMode, iteration int) string {

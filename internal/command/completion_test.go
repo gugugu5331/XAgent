@@ -5,7 +5,7 @@ import "testing"
 func completionRegistry(t *testing.T) *Registry {
 	t.Helper()
 	registry, err := New(
-		Definition{Name: "plan", Aliases: []string{"p"}, Type: TypeUI, Handler: noopHandler},
+		Definition{Name: "plan", Aliases: []string{"p"}, Type: TypeUI, Badge: "Skill/shared", Handler: noopHandler},
 		Definition{Name: "permission", Aliases: []string{"perm"}, Type: TypeLocal, Handler: noopHandler},
 		Definition{Name: "compact", Aliases: []string{"ctx"}, Type: TypeLocal, Handler: noopHandler},
 		Definition{Name: "clear", Aliases: []string{"cls"}, Type: TypeUI, Handler: noopHandler},
@@ -15,6 +15,14 @@ func completionRegistry(t *testing.T) *Registry {
 		t.Fatal(err)
 	}
 	return registry
+}
+
+func TestCompleteCopiesBadge(t *testing.T) {
+	registry := completionRegistry(t)
+	got := registry.Complete("/plan")
+	if len(got) != 1 || got[0].Badge != "Skill/shared" {
+		t.Fatalf("completion omitted badge: %#v", got)
+	}
 }
 
 func TestCompleteUniquePrefixAndExactAlias(t *testing.T) {

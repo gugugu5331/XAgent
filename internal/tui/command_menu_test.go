@@ -45,3 +45,17 @@ func TestCommandMenuEmptyDoesNotOpen(t *testing.T) {
 		t.Fatalf("empty menu is visible: %#v", menu)
 	}
 }
+
+func TestCommandMenuBadge(t *testing.T) {
+	var menu CommandMenu
+	menu.Open([]CommandMenuItem{
+		{Name: "commit", Description: "提交改动", Badge: "Skill/shared"},
+		{Name: "review", Description: "审查改动", Badge: "Skill/isolated"},
+	})
+	output := menu.View()
+	for _, want := range []string{"/commit [Skill/shared]", "/review [Skill/isolated]"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("menu output missing %q: %q", want, output)
+		}
+	}
+}

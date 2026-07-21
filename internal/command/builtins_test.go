@@ -28,15 +28,27 @@ type testController struct {
 	legacyMCPErr      error
 	legacyDiagnostics string
 	legacyDiagErr     error
+	skillCalls        []skillCall
+	skillErr          error
+}
+
+type skillCall struct {
+	name string
+	args string
+	raw  string
 }
 
 func (c *testController) DisplayNotice(text string)   { c.notices = append(c.notices, text) }
 func (c *testController) DisplayError(err error)      { c.errors = append(c.errors, err) }
 func (c *testController) SendUserMessage(text string) { c.sent = append(c.sent, text) }
-func (c *testController) ClearMessages()              { c.cleared++ }
-func (c *testController) SwitchMode(mode Mode)        { c.mode = mode }
-func (c *testController) CurrentMode() Mode           { return c.mode }
-func (c *testController) RefreshStatus()              { c.refreshed++ }
+func (c *testController) ExecuteSkill(name string, args string, raw string) error {
+	c.skillCalls = append(c.skillCalls, skillCall{name: name, args: args, raw: raw})
+	return c.skillErr
+}
+func (c *testController) ClearMessages()       { c.cleared++ }
+func (c *testController) SwitchMode(mode Mode) { c.mode = mode }
+func (c *testController) CurrentMode() Mode    { return c.mode }
+func (c *testController) RefreshStatus()       { c.refreshed++ }
 func (c *testController) CompactContext() (string, error) {
 	return c.compactMessage, c.compactErr
 }
@@ -68,11 +80,11 @@ func (c *testController) lastError() string {
 	return c.errors[len(c.errors)-1].Error()
 }
 
-func TestBuiltinsRegisterTenVisibleCommands(t *testing.T) {
+func TestBuiltinsRegisterNineVisibleCommands(t *testing.T) {
 	registry := MustNew(Builtins()...)
 	visible := registry.Visible()
-	if len(visible) != 10 {
-		t.Fatalf("expected 10 visible commands, got %d: %#v", len(visible), visible)
+	if len(visible) != 9 {
+		t.Fatalf("expected 9 visible commands, got %d: %#v", len(visible), visible)
 	}
 	expected := map[string]struct {
 		aliases []string
@@ -82,11 +94,11 @@ func TestBuiltinsRegisterTenVisibleCommands(t *testing.T) {
 		"clear": {aliases: []string{"cls"}, typeOf: TypeUI}, "plan": {aliases: []string{"p"}, typeOf: TypeUI},
 		"do": {aliases: []string{"d"}, typeOf: TypeUI}, "session": {aliases: []string{"sess"}, typeOf: TypeLocal},
 		"memory": {aliases: []string{"mem"}, typeOf: TypeLocal}, "permission": {aliases: []string{"perm"}, typeOf: TypeLocal},
-		"status": {aliases: []string{"st"}, typeOf: TypeLocal}, "review": {aliases: []string{"rv"}, typeOf: TypePrompt},
+		"status": {aliases: []string{"st"}, typeOf: TypeLocal},
 	}
 	seenTypes := map[Type]bool{}
 	for _, definition := range visible {
-		if definition.Name == "permissions" || definition.Name == "mcp" || definition.Name == "diagnostics" {
+		if definition.Name == "permissions" || definition.Name == "mcp" || definition.Name == "diagnostics" || definition.Name == "rv" {
 			t.Fatalf("hidden command is visible: %#v", definition)
 		}
 		if definition.Description == "" || definition.Usage == "" || definition.Handler == nil {
@@ -98,10 +110,18 @@ func TestBuiltinsRegisterTenVisibleCommands(t *testing.T) {
 		}
 		seenTypes[definition.Type] = true
 	}
-	for _, typeOf := range []Type{TypeLocal, TypeUI, TypePrompt} {
+	for _, typeOf := range []Type{TypeLocal, TypeUI} {
 		if !seenTypes[typeOf] {
 			t.Fatalf("builtin types do not include %q", typeOf)
 		}
+	}
+	definitions := registry.Definitions()
+	foundPromptShim := false
+	for _, definition := range definitions {
+		foundPromptShim = foundPromptShim || definition.Name == "rv" && definition.Type == TypePrompt && definition.Hidden
+	}
+	if !foundPromptShim {
+		t.Fatalf("hidden /rv prompt shim missing: %#v", definitions)
 	}
 }
 
@@ -123,7 +143,7 @@ func TestBuiltinHelpShowsVisibleMetadataOnly(t *testing.T) {
 				t.Fatalf("help missing argument hint for /%s: %q", definition.Name, text)
 			}
 		}
-		for _, hidden := range []string{"/permissions", "/mcp", "/diagnostics"} {
+		for _, hidden := range []string{"/permissions", "/mcp", "/diagnostics", "/rv"} {
 			if strings.Contains(text, hidden+" ") {
 				t.Fatalf("help leaked %s: %q", hidden, text)
 			}
@@ -139,7 +159,7 @@ func slashAliases(aliases []string) []string {
 	return result
 }
 
-func TestBuiltinUIAndReviewCommands(t *testing.T) {
+func TestBuiltinUICommands(t *testing.T) {
 	registry := MustNew(Builtins()...)
 	controller := &testController{}
 	registry.Dispatch("/clear", controller)
@@ -154,9 +174,53 @@ func TestBuiltinUIAndReviewCommands(t *testing.T) {
 	if controller.mode != ModeDefault || controller.refreshed != 2 {
 		t.Fatalf("do did not restore mode: %#v", controller)
 	}
-	registry.Dispatch("/rv", controller)
-	if len(controller.sent) != 1 || controller.sent[0] != ReviewPrompt || !strings.Contains(controller.sent[0], "不要修改文件") {
-		t.Fatalf("review prompt mismatch: %#v", controller.sent)
+}
+
+func TestReviewMigration(t *testing.T) {
+	registry := MustNew(Builtins()...)
+	controller := &testController{}
+
+	if result := registry.Dispatch("/review target", controller); result.Kind != DispatchUnknown {
+		t.Fatalf("hard-coded /review should be unregistered: %#v", result)
+	}
+	controller.errors = nil
+	result := registry.Dispatch("/RV Target  One", controller)
+	if result.Kind != DispatchExecuted || result.Err != nil {
+		t.Fatalf("/rv shim failed: %#v", result)
+	}
+	want := skillCall{name: "review", args: "Target  One", raw: "/RV Target  One"}
+	if !reflect.DeepEqual(controller.skillCalls, []skillCall{want}) {
+		t.Fatalf("unexpected Skill calls: %#v", controller.skillCalls)
+	}
+	if got := registry.Complete("/rv"); len(got) != 0 {
+		t.Fatalf("hidden /rv leaked into completion: %#v", got)
+	}
+	if strings.Contains(controller.lastNotice(), "/rv") {
+		t.Fatalf("hidden /rv leaked into help: %q", controller.lastNotice())
+	}
+}
+
+func TestReviewShimPropagatesSkillError(t *testing.T) {
+	want := errors.New("review unavailable")
+	controller := &testController{skillErr: want}
+	result := MustNew(Builtins()...).Dispatch("/rv", controller)
+	if !errors.Is(result.Err, want) || controller.lastError() != want.Error() {
+		t.Fatalf("review Skill error was not propagated: result=%#v controller=%#v", result, controller)
+	}
+}
+
+func TestBuiltinHelpShowsSkillBadge(t *testing.T) {
+	definitions := append(Builtins(), Definition{
+		Name: "test", Description: "运行测试", Usage: "/test [scope]", Type: TypePrompt,
+		ArgHint: "[scope]", Badge: "Skill/isolated", Handler: noopHandler,
+	})
+	registry := MustNew(definitions...)
+	controller := &testController{}
+	if result := registry.Dispatch("/help", controller); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if !strings.Contains(controller.lastNotice(), "/test [Skill/isolated]") {
+		t.Fatalf("help omitted Skill badge: %q", controller.lastNotice())
 	}
 }
 
@@ -221,7 +285,7 @@ func TestBuiltinLegacyCommandsDelegate(t *testing.T) {
 
 func TestBuiltinUsageErrorsNeverSendUserMessage(t *testing.T) {
 	registry := MustNew(Builtins()...)
-	for _, input := range []string{"/help extra", "/compact extra", "/clear extra", "/plan extra", "/do extra", "/session extra", "/permission extra", "/status extra", "/review extra", "/mcp nope", "/permissions nope", "/diagnostics extra"} {
+	for _, input := range []string{"/help extra", "/compact extra", "/clear extra", "/plan extra", "/do extra", "/session extra", "/permission extra", "/status extra", "/mcp nope", "/permissions nope", "/diagnostics extra"} {
 		controller := &testController{}
 		result := registry.Dispatch(input, controller)
 		if result.Err == nil || !strings.Contains(result.Err.Error(), "用法:") || len(controller.sent) != 0 {

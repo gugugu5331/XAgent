@@ -99,3 +99,103 @@ func TestDynamicBlocksDoNotIncludeUserInjection(t *testing.T) {
 		t.Fatalf("unexpected user-like injection in dynamic blocks: %s", dynamic)
 	}
 }
+
+func TestBuildWithoutSkills(t *testing.T) {
+	baseline := Build(BuildRequest{Mode: RunModeDefault, Iteration: 2, ProjectRoot: "/repo"})
+	withEmptyFields := Build(BuildRequest{
+		Mode:         RunModeDefault,
+		Iteration:    2,
+		ProjectRoot:  "/repo",
+		SkillCatalog: "  ",
+		ActiveSkills: "\n",
+	})
+	if !reflect.DeepEqual(baseline, withEmptyFields) {
+		t.Fatalf("empty Skill fields changed prompt:\nbaseline=%#v\nactual=%#v", baseline, withEmptyFields)
+	}
+	for _, block := range append(append([]Block{}, baseline.StableBlocks...), baseline.DynamicBlocks...) {
+		if block.Name == SkillCatalogBlockName || block.Name == ActiveSkillsBlockName {
+			t.Fatalf("empty Skill field created block: %#v", block)
+		}
+	}
+}
+
+func TestSkillBlockOrdering(t *testing.T) {
+	catalog := "- commit: Create a focused commit.\n- review: Review the current change."
+	active := "<active-skills>\ncommit SOP CANARY\n</active-skills>"
+	var firstActive string
+	for iteration := 1; iteration <= 3; iteration++ {
+		bundle := Build(BuildRequest{
+			Mode:         RunModeDo,
+			Iteration:    iteration,
+			ProjectRoot:  "/repo",
+			SkillCatalog: catalog,
+			ActiveSkills: active,
+			OptionalStableSections: []Section{{
+				Name: "project-instructions", Priority: 100, Content: "project rules", Stable: true,
+			}},
+		})
+		catalogBlock, catalogIndex := findBlock(bundle.StableBlocks, SkillCatalogBlockName)
+		if catalogIndex < 0 || !catalogBlock.Stable || catalogBlock.Content != catalog {
+			t.Fatalf("iteration %d has invalid catalog block: %#v", iteration, catalogBlock)
+		}
+		if catalogIndex != len(bundle.StableBlocks)-1 {
+			t.Fatalf("catalog must follow fixed and optional stable blocks: names=%#v", blockNames(bundle.StableBlocks))
+		}
+		if strings.Contains(catalogBlock.Content, "SOP CANARY") {
+			t.Fatalf("catalog leaked active SOP: %q", catalogBlock.Content)
+		}
+		activeBlock, activeIndex := findBlock(bundle.DynamicBlocks, ActiveSkillsBlockName)
+		reminderBlock, reminderIndex := findBlock(bundle.DynamicBlocks, "runtime-system-reminder")
+		if activeIndex != 0 || reminderIndex != 1 || activeBlock.Stable || reminderBlock.Stable {
+			t.Fatalf("iteration %d dynamic order mismatch: %#v", iteration, bundle.DynamicBlocks)
+		}
+		if firstActive == "" {
+			firstActive = activeBlock.Content
+		} else if activeBlock.Content != firstActive {
+			t.Fatalf("active SOP drifted at iteration %d: %q != %q", iteration, activeBlock.Content, firstActive)
+		}
+		combinedNames := append(blockNames(bundle.StableBlocks), blockNames(bundle.DynamicBlocks)...)
+		securityIndex := indexOf(combinedNames, "系统约束")
+		activeCombinedIndex := indexOf(combinedNames, ActiveSkillsBlockName)
+		reminderCombinedIndex := indexOf(combinedNames, "runtime-system-reminder")
+		if securityIndex < 0 || !(securityIndex < activeCombinedIndex && activeCombinedIndex < reminderCombinedIndex) {
+			t.Fatalf("security/active/runtime order mismatch: %#v", combinedNames)
+		}
+	}
+}
+
+func TestSkillCatalogWithoutActivationDoesNotCreateActiveBlock(t *testing.T) {
+	bundle := Build(BuildRequest{SkillCatalog: "- review: Review changes."})
+	if _, index := findBlock(bundle.StableBlocks, SkillCatalogBlockName); index < 0 {
+		t.Fatalf("missing catalog block: %#v", bundle.StableBlocks)
+	}
+	if _, index := findBlock(bundle.DynamicBlocks, ActiveSkillsBlockName); index >= 0 {
+		t.Fatalf("catalog-only build created active block: %#v", bundle.DynamicBlocks)
+	}
+}
+
+func findBlock(blocks []Block, name string) (Block, int) {
+	for index, block := range blocks {
+		if block.Name == name {
+			return block, index
+		}
+	}
+	return Block{}, -1
+}
+
+func blockNames(blocks []Block) []string {
+	names := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		names = append(names, block.Name)
+	}
+	return names
+}
+
+func indexOf(values []string, want string) int {
+	for index, value := range values {
+		if value == want {
+			return index
+		}
+	}
+	return -1
+}

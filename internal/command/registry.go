@@ -63,6 +63,19 @@ func (r *Registry) Visible() []Definition {
 	return visible
 }
 
+// Definitions returns an immutable snapshot of all registered command
+// definitions, including hidden compatibility commands.
+func (r *Registry) Definitions() []Definition {
+	if r == nil {
+		return nil
+	}
+	definitions := make([]Definition, len(r.definitions))
+	for index, definition := range r.definitions {
+		definitions[index] = cloneDefinition(definition)
+	}
+	return definitions
+}
+
 func normalizeDefinition(definition Definition) (Definition, error) {
 	definition.Name = normalizeName(definition.Name)
 	if definition.Name == "" {
@@ -97,6 +110,7 @@ func normalizeDefinition(definition Definition) (Definition, error) {
 	definition.Description = strings.TrimSpace(definition.Description)
 	definition.Usage = strings.TrimSpace(definition.Usage)
 	definition.ArgHint = strings.TrimSpace(definition.ArgHint)
+	definition.Badge = strings.TrimSpace(definition.Badge)
 	return definition, nil
 }
 

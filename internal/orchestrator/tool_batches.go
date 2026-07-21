@@ -30,7 +30,11 @@ type indexedToolCall struct {
 }
 
 func (o *Orchestrator) filterToolCall(mode RunMode, call tool.Call) (tool.Result, bool) {
-	if o.registry == nil {
+	return o.filterToolCallWithRegistry(mode, o.registry, call)
+}
+
+func (o *Orchestrator) filterToolCallWithRegistry(mode RunMode, registry *tool.Registry, call tool.Call) (tool.Result, bool) {
+	if registry == nil {
 		return tool.Result{
 			CallID:  call.ID,
 			Name:    call.Name,
@@ -39,8 +43,16 @@ func (o *Orchestrator) filterToolCall(mode RunMode, call tool.Call) (tool.Result
 			Error:   &tool.Error{Code: tool.ErrToolNotFound, Message: "工具注册中心不可用", Recoverable: true},
 		}, true
 	}
-	registeredTool, ok := o.registry.Get(call.Name)
+	registeredTool, ok := registry.Get(call.Name)
 	if !ok {
+		// Preserve the established Plan Mode denial path: tools hidden from the
+		// provider by the read-only view are still rejected by Authorizer with a
+		// permission-denied result if a provider fabricates the call.
+		if mode == RunModePlan && o.registry != nil {
+			if _, exists := o.registry.Get(call.Name); exists && !isReadOnlyTool(call.Name) {
+				return tool.Result{}, false
+			}
+		}
 		return tool.Result{
 			CallID:  call.ID,
 			Name:    call.Name,
@@ -83,6 +95,10 @@ func makeToolBatches(calls []tool.Call, registry *tool.Registry) []ToolBatch {
 }
 
 func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, batches []ToolBatch, out chan<- events.Event) ([]ToolExecution, StopReason, error) {
+	return o.executeToolBatchesWithRegistry(ctx, mode, o.registry, batches, out)
+}
+
+func (o *Orchestrator) executeToolBatchesWithRegistry(ctx context.Context, mode RunMode, registry *tool.Registry, batches []ToolBatch, out chan<- events.Event) ([]ToolExecution, StopReason, error) {
 	executions := make([]ToolExecution, 0)
 	for _, batch := range batches {
 		select {
@@ -92,7 +108,7 @@ func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, bat
 		}
 		prepared := make([]ToolExecution, 0, len(batch.Calls))
 		for _, indexed := range batch.Calls {
-			execution := o.prepareToolExecution(ctx, mode, indexed, out)
+			execution := o.prepareToolExecutionWithRegistry(ctx, mode, registry, indexed, out)
 			prepared = append(prepared, execution)
 			if execution.Err != nil {
 				executions = append(executions, prepared...)
@@ -116,10 +132,18 @@ func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, bat
 }
 
 func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
+	return o.prepareToolExecutionWithRegistry(ctx, mode, o.registry, indexed, out)
+}
+
+func (o *Orchestrator) prepareToolExecutionWithRegistry(ctx context.Context, mode RunMode, registry *tool.Registry, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
 	call := indexed.Call
-	out <- events.Event{Type: events.ToolPending, Tool: newToolDisplay(call, events.ToolDisplayPending, "")}
-	if result, blocked := o.filterToolCall(mode, call); blocked {
-		out <- toolResultEvent(result)
+	if !emitEvent(ctx, out, events.Event{Type: events.ToolPending, Tool: o.safeToolDisplay(call, events.ToolDisplayPending, "")}) {
+		return ToolExecution{Call: call, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+	}
+	if result, blocked := o.filterToolCallWithRegistry(mode, registry, call); blocked {
+		if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
+			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+		}
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	}
 	if o.executor == nil {
@@ -130,7 +154,9 @@ func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, i
 			Summary: "工具执行器不可用",
 			Error:   &tool.Error{Code: tool.ErrToolNotFound, Message: "工具执行器不可用", Recoverable: true},
 		}
-		out <- toolResultEvent(result)
+		if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
+			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+		}
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	}
 	if o.authorizer == nil {
@@ -141,29 +167,38 @@ func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, i
 			Summary: "权限系统不可用",
 			Error:   &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true},
 		}
-		out <- toolResultEvent(result)
+		if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
+			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+		}
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	}
-	decision := o.authorizer.Decide(permissionCall(call), o.permissionContext(mode))
+	permissionContext := o.permissionContextWithReadScope(ctx, mode)
+	decision := o.authorizer.Decide(permissionCall(call), permissionContext)
 	switch decision.Kind {
 	case permission.DecisionDeny:
 		result := permissionDeniedResult(call, decision)
-		out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
+		if !emitEvent(ctx, out, events.Event{Type: events.ToolDenied, Tool: o.safeResultDisplay(result)}) {
+			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+		}
 		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 	case permission.DecisionAsk:
 		decisionCh := make(chan events.ToolConfirmationDecision, 1)
-		confirmation := confirmationRequest(call, decision, decisionCh)
-		out <- events.Event{Type: events.ToolWaitingConfirmation, Tool: newToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}
+		confirmation := o.safeConfirmationRequest(call, decision, decisionCh)
+		if !emitEvent(ctx, out, events.Event{Type: events.ToolWaitingConfirmation, Tool: o.safeToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}) {
+			return ToolExecution{Call: call, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+		}
 		select {
 		case <-ctx.Done():
 			result := tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具执行已取消", Error: &tool.Error{Code: tool.ErrTimeout, Message: ctx.Err().Error(), Recoverable: true}}
-			out <- toolResultEvent(result)
+			emitEvent(ctx, out, o.safeToolResultEvent(result))
 			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
 		case userDecision := <-decisionCh:
-			decision = o.authorizer.ResolveUserDecision(permissionCall(call), o.permissionContext(mode), permissionAction(userDecision))
+			decision = o.authorizer.ResolveUserDecision(permissionCall(call), permissionContext, permissionAction(userDecision))
 			if decision.Kind == permission.DecisionDeny {
 				result := permissionDeniedResult(call, decision)
-				out <- events.Event{Type: events.ToolDenied, Tool: resultDisplay(result)}
+				if !emitEvent(ctx, out, events.Event{Type: events.ToolDenied, Tool: o.safeResultDisplay(result)}) {
+					return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+				}
 				return ToolExecution{Call: call, Result: result, Index: indexed.Index}
 			}
 		}
@@ -173,9 +208,18 @@ func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, i
 
 func (o *Orchestrator) executePreparedTool(ctx context.Context, execution ToolExecution, out chan<- events.Event) ToolExecution {
 	call := execution.Call
-	out <- events.Event{Type: events.ToolRunning, Tool: newToolDisplay(call, events.ToolDisplayRunning, "执行中")}
+	if !emitEvent(ctx, out, events.Event{Type: events.ToolRunning, Tool: o.safeToolDisplay(call, events.ToolDisplayRunning, "执行中")}) {
+		execution.StopReason = StopReasonCancelled
+		execution.Err = ctx.Err()
+		return execution
+	}
 	result := o.executor.ExecuteAuthorized(ctx, call, *execution.Grant)
-	out <- toolResultEvent(result)
+	if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
+		execution.Result = result
+		execution.StopReason = StopReasonCancelled
+		execution.Err = ctx.Err()
+		return execution
+	}
 	execution.Result = result
 	return execution
 }
@@ -205,6 +249,14 @@ func (o *Orchestrator) permissionContext(mode RunMode) permission.Context {
 		permissionMode = permission.ModeDefault
 	}
 	return permission.Context{ProjectRoot: o.projectRoot(), Mode: permissionMode, PlanMode: mode == RunModePlan}
+}
+
+func (o *Orchestrator) permissionContextWithReadScope(ctx context.Context, mode RunMode) permission.Context {
+	result := o.permissionContext(mode)
+	if scope, ok := tool.ReadScopeFromContext(ctx); ok {
+		result.ReadRoots = append([]string(nil), scope.ExtraRoots...)
+	}
+	return result
 }
 
 func permissionCall(call tool.Call) permission.Call {

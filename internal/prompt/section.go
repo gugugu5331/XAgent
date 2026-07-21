@@ -10,6 +10,11 @@ type Section struct {
 type RunMode string
 
 const (
+	SkillCatalogBlockName = "skill-catalog"
+	ActiveSkillsBlockName = "active-skills"
+)
+
+const (
 	RunModeDefault RunMode = "default"
 	RunModePlan    RunMode = "plan"
 	RunModeDo      RunMode = "do"
@@ -19,6 +24,8 @@ type BuildRequest struct {
 	Mode                   RunMode
 	Iteration              int
 	ProjectRoot            string
+	SkillCatalog           string
+	ActiveSkills           string
 	OptionalStableSections []Section
 }
 

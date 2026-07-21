@@ -3,6 +3,7 @@ package redact
 import (
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -90,6 +91,24 @@ func (r *RuntimeRedactor) RegisterSecret(value string) {
 		}
 	}
 	r.secrets = append(r.secrets, value)
+	sort.SliceStable(r.secrets, func(i, j int) bool {
+		return len(r.secrets[i]) > len(r.secrets[j])
+	})
+}
+
+func (r *RuntimeRedactor) MaxSecretBytes() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	maximum := 0
+	for _, secret := range r.secrets {
+		if len(secret) > maximum {
+			maximum = len(secret)
+		}
+	}
+	return maximum
 }
 
 func (r *RuntimeRedactor) Text(value string) string {

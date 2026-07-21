@@ -17,6 +17,7 @@ import (
 	"xagent/internal/orchestrator"
 	"xagent/internal/permission"
 	"xagent/internal/redact"
+	"xagent/internal/skill"
 	"xagent/internal/tui"
 )
 
@@ -28,9 +29,11 @@ const (
 )
 
 type RequestSession struct {
-	Cancel    context.CancelFunc
-	StartedAt time.Time
-	Timeout   time.Duration
+	Cancel       context.CancelFunc
+	StartedAt    time.Time
+	Timeout      time.Duration
+	Independent  bool
+	TransientIDs []string
 }
 
 type Model struct {
@@ -47,7 +50,11 @@ type Model struct {
 	streaming       bool
 	confirmation    *Event
 	commandRegistry *command.Registry
+	baseCommands    []command.Definition
 	commandMenu     tui.CommandMenu
+	skillActivity   *skill.Activity
+	skillGeneration uint64
+	skillNotice     string
 	mode            orchestrator.RunMode
 	lastError       error
 	messagesCleared bool
@@ -63,15 +70,19 @@ func New(deps Deps) Model {
 	}
 	conversations, _ := deps.Store.List(ctx)
 	orchOptions := orchestrator.OrchestratorOptions{
-		Provider:       deps.Provider,
-		Store:          deps.Store,
-		Resources:      deps.Resources,
-		Thinking:       deps.Config.LLM.Thinking,
-		Registry:       deps.Registry,
-		Executor:       deps.Executor,
-		ContextManager: deps.ContextManager,
-		Diagnostics:    deps.Diagnostics,
-		Agent:          deps.Config.Agent,
+		Provider:            deps.Provider,
+		Store:               deps.Store,
+		Resources:           deps.Resources,
+		Thinking:            deps.Config.LLM.Thinking,
+		Registry:            deps.Registry,
+		Executor:            deps.Executor,
+		ContextManager:      deps.ContextManager,
+		Diagnostics:         deps.Diagnostics,
+		Agent:               deps.Config.Agent,
+		SkillManager:        deps.SkillManager,
+		DefaultModel:        deps.Config.LLM.Model,
+		Redact:              deps.Redact,
+		RedactionLookbehind: deps.RedactionLookbehind,
 	}
 	if deps.SessionContext != nil {
 		orchOptions.SessionContext = deps.SessionContext
@@ -92,6 +103,8 @@ func New(deps Deps) Model {
 		messages:        tui.NewMessagesView(deps.Config.LLM.Thinking.Show),
 		diagnostics:     deps.Diagnostics,
 		commandRegistry: deps.CommandRegistry,
+		baseCommands:    deps.CommandRegistry.Definitions(),
+		skillActivity:   skill.NewActivity(),
 		mode:            orchestrator.RunModeDefault,
 		status: tui.Status{
 			Mode:     string(orchestrator.RunModeDefault),
@@ -99,6 +112,7 @@ func New(deps Deps) Model {
 			Model:    deps.Config.LLM.Model,
 		},
 	}
+	model.installInitialSkillCommands()
 	model.refreshMCPStatus()
 	model.syncMCPDiagnostics()
 	if deps.Config.UI.StartMode == config.StartModeNew {
@@ -152,8 +166,14 @@ func (m *Model) loadConversation(id string) {
 }
 
 func (m *Model) resetCommandState() {
+	if m.skillActivity != nil {
+		m.skillActivity.Clear()
+	}
 	m.mode = orchestrator.RunModeDefault
 	m.status.Mode = string(orchestrator.RunModeDefault)
+	m.skillActivity = skill.NewActivity()
+	m.status.ActiveSkills = ""
+	m.status.RequestModel = ""
 	m.commandMenu.Close()
 	m.messagesCleared = false
 }
@@ -192,15 +212,22 @@ func recoveryNotice(report conversation.RecoveryReport) string {
 }
 
 func (m *Model) close() {
+	var closeErrors []string
 	if m.conversation != nil {
 		_ = m.deps.Store.Save(context.Background(), m.conversation)
+	}
+	if m.skillActivity != nil {
+		m.skillActivity.Clear()
 	}
 	if m.deps.Closer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := m.deps.Closer.Close(ctx); err != nil {
-			m.status.Error = fmt.Errorf("MCP close: %w", err)
+			closeErrors = append(closeErrors, "MCP close: "+redact.Text(err.Error()))
 		}
+	}
+	if len(closeErrors) > 0 {
+		m.status.Error = fmt.Errorf("%s", strings.Join(closeErrors, "; "))
 	}
 	m.refreshMCPStatus()
 }

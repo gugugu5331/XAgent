@@ -14,6 +14,7 @@ XAgent 是一个使用 Go 构建的终端 AI 编程助手。它在交互式 TUI 
 - 上下文管理：自动外置大型工具结果，并支持手动压缩长会话。
 - 会话恢复：使用 JSONL 持久化会话，可跳过损坏记录并恢复未正常结束的会话。
 - 指令与记忆：加载项目级/用户级指令，维护可检索的长期记忆。
+- 可复用 Skill：按需加载 Markdown SOP，支持共享会话、独立执行、工具白名单和动态斜杠命令。
 - 安全诊断：对 API Key、Token 等敏感内容进行运行时脱敏。
 
 ## 环境要求
@@ -110,7 +111,7 @@ go run ./cmd/xagent
 | `p` | 永久允许（仅在该操作支持时可用） |
 | `n` / `Esc` | 拒绝或取消工具操作 |
 
-斜杠命令会由本地注册中心直接分发。除 `/review` 外，它们不会作为用户消息发送给模型；命令名和别名不区分大小写。输入命令前缀后可按 `Tab` 补全，单个匹配直接写回，多个匹配显示选择菜单。
+斜杠命令会由本地注册中心直接分发。基础设施命令在本地执行；Skill 命令会保留原始输入并启动对应 AI 工作流。命令名和别名不区分大小写。输入命令前缀后可按 `Tab` 补全，单个匹配直接写回，多个匹配显示选择菜单。
 
 | 命令 | 别名 | 类型 | 作用 |
 | --- | --- | --- | --- |
@@ -123,11 +124,75 @@ go run ./cmd/xagent
 | `/memory` | `/mem` | 本地 | 显示用户级和项目级记忆状态及条目数 |
 | `/permission` | `/perm` | 本地 | 显示权限模式和各层规则数量 |
 | `/status` | `/st` | 本地 | 显示 Provider、模型、模式、Token、Cache、MCP 和最近错误 |
-| `/review` | `/rv` | 提示词 | 展开固定审查提示并交给 AI 审查未提交改动 |
+| `/commit` | — | Skill/shared | 在当前会话激活提交工作流 |
+| `/review` | `/rv`（隐藏兼容入口） | Skill/isolated | 在独立上下文审查当前改动并回流摘要 |
+| `/test` | — | Skill/isolated | 在独立上下文运行相关测试并回流摘要 |
 
 状态栏中的 `[DEFAULT]` 和 `[PLAN]` 表示当前会话模式。`/plan` 会让后续普通请求持续使用只读计划模式，直到执行 `/do`；新建、切换或重新打开会话时恢复 `[DEFAULT]`。模式本身不写入会话存储。
 
 为保持兼容，`/permissions status`、`/mcp status`、`/diagnostics` 以及 `/memory status|index|off|delete|rebuild` 仍可使用，但不出现在帮助和补全中。
+
+## Skill
+
+Skill 把可复用的 AI 操作保存为 Markdown SOP。XAgent 启动时只把有效 Skill 的名称和一句说明告诉模型；用户调用短命令或 Agent 调用系统级 `load_skill` 后，完整 SOP 才进入当前请求的系统上下文。
+
+Skill 按以下优先级发现，同名时高层有效定义覆盖低层定义：
+
+1. 项目级：`.xagent/skills/`
+2. 用户级：`~/.config/xagent/skills/`
+3. 程序内置：`commit`、`review`、`test`
+
+既可以用单个 Markdown 文件，也可以使用带辅助资源的目录：
+
+```text
+.xagent/skills/
+├── explain.md
+└── release/
+    ├── SKILL.md
+    ├── template.md
+    ├── examples/
+    └── scripts/
+```
+
+单文件和目录入口都使用 YAML frontmatter：
+
+```markdown
+---
+name: release
+description: 检查并准备一次发布
+allowed_tools:
+  - Read
+  - Glob
+  - Grep
+  - Bash
+mode: isolated
+history: 1
+model: optional-model-name
+---
+
+检查版本、变更和测试状态。用户补充要求：{{args}}
+```
+
+字段语义：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | 是 | 唯一规范名称，也是斜杠命令名；支持小写字母、数字、`_`、`-` |
+| `description` | 是 | 启动阶段提供给 Agent 的一句说明 |
+| `allowed_tools` | 否 | 模型可见和可调用工具的白名单；省略或空列表表示不额外限制 |
+| `mode` | 是 | `shared` 保持在当前会话，`isolated` 使用临时上下文运行 |
+| `history` | 独立模式可选 | 独立执行携带最近多少个完整用户轮次，默认 0 |
+| `model` | 否 | 仅覆盖当前 Skill 请求的模型，不改变全局 Provider 配置 |
+
+正文只支持 `{{args}}` 占位符，以调用时的完整参数做一次字面替换；不支持条件、循环、命名参数或可执行模板。
+
+shared Skill 会立即执行并保持活动，后续每轮都携带其 SOP。多个活动 Skill 的非空工具白名单取交集，非空模型必须一致。isolated Skill 只激活目标 Skill，按 `history` 复制完整历史轮次，复用正常权限确认和实时工具进度；完成后主历史只保存原始命令和最终回复，不保存临时工具轨迹，也不会额外调用一次模型做摘要。
+
+目录型 Skill 只自动加载 `SKILL.md`。允许的 `Read`、`Glob`、`Grep` 可以按需访问包内辅助资源，但这个额外根始终只读，不会扩大 `Write`、`Edit`、`Bash` 或权限系统的边界。系统级 `load_skill` 始终可见，但只能激活已发现的有效 Skill。
+
+新增、修改或删除 Skill 后，下一次输入、Tab 补全或 Agent 请求前会原子刷新目录和动态命令。已活动 Skill 继续使用激活时的快照，重新调用后才采用新版本。`/clear` 保留会话历史，但会清除全部活动 Skill；新建、切换会话和重启也从无活动 Skill 开始。
+
+首版不提供 Skill 市场、远程安装、版本/依赖管理、自定义权限规则、底层工具注册、命令别名、逐个卸载或后台文件监听。
 
 ## 权限模式
 
@@ -187,11 +252,13 @@ mcp:
 | 路径 | 内容 |
 | --- | --- |
 | `config.yaml` | 项目配置，已被 Git 忽略 |
+| `.xagent/skills/` | 项目级 Skill 文件和能力包 |
 | `.xagent/conversations/` | 上下文管理产生的外置工具结果 |
 | `.mewcode/sessions/` | 可恢复的 JSONL 会话数据 |
 | `.mewcode/memory/` | 项目级长期记忆与索引 |
 | `MEWCODE.md` | 默认项目指令文件 |
 | `~/.config/xagent/config.yaml` | 用户级配置 |
+| `~/.config/xagent/skills/` | 用户级 Skill 文件和能力包 |
 
 不要把真实 API Key、Token 或本地权限文件提交到版本库。推荐始终使用环境变量引用敏感配置。
 
@@ -209,6 +276,7 @@ internal/conversation/  会话持久化与恢复
 internal/contextmgr/    上下文压缩和大型结果外置
 internal/instructions/  项目/用户指令加载
 internal/memory/        长期记忆管理
+internal/skill/         Skill 发现、快照、活动状态与执行配置
 internal/tui/           终端界面组件
 docs/                   功能规格、计划与验收记录
 ```

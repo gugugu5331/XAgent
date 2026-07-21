@@ -11,7 +11,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"xagent/internal/command"
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
@@ -329,28 +328,15 @@ func TestCommandModePlanPersistsUntilDoAndResetsForConversation(t *testing.T) {
 	}
 }
 
-func TestReviewCommandExpandsPromptAndUsesAgentLifecycle(t *testing.T) {
+func TestReviewCommandIsNoLongerHardCoded(t *testing.T) {
 	provider := &recordingCommandProvider{}
 	model := newCommandTestModel(t, provider)
-	model = runCommandInput(t, model, "/plan")
 	model = runCommandInput(t, model, "/review")
-	requests := provider.Requests()
-	if len(requests) != 1 {
-		t.Fatalf("review made %d requests", len(requests))
+	if model.status.Error == nil || !strings.Contains(model.status.Error.Error(), "/help") {
+		t.Fatalf("missing review Skill did not behave as an unknown command: %v", model.status.Error)
 	}
-	if len(model.conversation.Messages) == 0 || model.conversation.Messages[0].Content != command.ReviewPrompt {
-		t.Fatalf("review prompt was not persisted: %#v", model.conversation.Messages)
-	}
-	for _, want := range []string{"未提交改动", "严重程度", "不要修改文件"} {
-		if !strings.Contains(command.ReviewPrompt, want) {
-			t.Fatalf("review prompt missing requirement %q", want)
-		}
-	}
-	if strings.Contains(model.messages.View(), "/review") || !strings.Contains(model.messages.View(), "未提交改动") {
-		t.Fatalf("review UI did not show expanded prompt: %q", model.messages.View())
-	}
-	if !requestContainsDynamic(requests[0], "当前请求处于 Plan Mode") {
-		t.Fatal("review did not use the current plan mode")
+	if len(provider.Requests()) != 0 {
+		t.Fatal("hard-coded review still reached the provider")
 	}
 }
 

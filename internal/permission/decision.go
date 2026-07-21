@@ -93,6 +93,7 @@ const (
 
 type Context struct {
 	ProjectRoot    string
+	ReadRoots      []string
 	Mode           Mode
 	PlanMode       bool
 	ConversationID string

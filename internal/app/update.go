@@ -23,12 +23,15 @@ func (m *Model) cancelRequest(notice string) {
 	if m.request != nil && m.request.Cancel != nil {
 		m.request.Cancel()
 	}
+	m.clearRequestTransient()
 	m.request = nil
 	m.streaming = false
 	m.status.Streaming = false
 	m.status.WaitingConfirmation = false
 	m.status.Notice = notice
 	m.status.Error = nil
+	m.status.RequestModel = ""
+	m.syncSkillStatus()
 	m.input.SetEnabled(true)
 	m.confirmation = nil
 }
@@ -184,20 +187,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if eventMsg, ok := msg.(eventMsg); ok {
+		if eventMsg.event.Transient {
+			m.trackTransientID(eventMsg.event.IndependentID)
+		}
 		switch eventMsg.event.Type {
 		case EventUserSubmitted:
-			m.messages.AppendUser(eventMsg.event.Text)
+			if !eventMsg.event.Transient {
+				m.messages.AppendUser(eventMsg.event.Text)
+			}
 		case EventTextDelta:
-			m.messages.AppendAssistantDelta(eventMsg.event.Text)
+			if eventMsg.event.Transient {
+				m.messages.AppendTransientAssistantDelta(eventMsg.event.IndependentID, eventMsg.event.Text)
+			} else {
+				if m.request != nil && m.request.Independent {
+					m.clearRequestTransient()
+				}
+				m.messages.AppendAssistantDelta(eventMsg.event.Text)
+			}
 		case EventThinkingDelta:
-			m.messages.AppendThinkingDelta(eventMsg.event.Text)
+			if eventMsg.event.Transient {
+				m.messages.AppendTransientThinkingDelta(eventMsg.event.IndependentID, eventMsg.event.Text)
+			} else {
+				m.messages.AppendThinkingDelta(eventMsg.event.Text)
+			}
 		case EventToolPending, EventToolRunning, EventToolSuccess, EventToolError, EventToolDenied:
 			if eventMsg.event.Tool != nil {
-				m.messages.UpsertTool(*eventMsg.event.Tool)
+				if eventMsg.event.Transient {
+					m.messages.UpsertTransientTool(eventMsg.event.IndependentID, *eventMsg.event.Tool)
+				} else {
+					m.messages.UpsertTool(*eventMsg.event.Tool)
+				}
 			}
 		case EventToolWaitingConfirmation:
 			if eventMsg.event.Tool != nil {
-				m.messages.UpsertTool(*eventMsg.event.Tool)
+				if eventMsg.event.Transient {
+					m.messages.UpsertTransientTool(eventMsg.event.IndependentID, *eventMsg.event.Tool)
+				} else {
+					m.messages.UpsertTool(*eventMsg.event.Tool)
+				}
 			}
 			m.confirmation = &eventMsg.event
 			m.status.WaitingConfirmation = true
@@ -215,22 +242,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.CacheCreationInputTokens += eventMsg.event.Usage.CacheCreationInputTokens
 				m.status.CacheReadInputTokens += eventMsg.event.Usage.CacheReadInputTokens
 			}
+		case EventMainTraceReset:
+			if m.conversation != nil {
+				m.messages.SetMessages(m.conversation.Messages)
+			}
 		case EventDone:
+			m.clearRequestTransient()
 			m.messages.CommitAssistant()
 			m.request = nil
 			m.streaming = false
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false
+			m.status.RequestModel = ""
+			m.syncSkillStatus()
 			m.status.Duration = formatDuration(eventMsg.event.Duration)
 			m.input.SetEnabled(true)
 			m.confirmation = nil
 			return m, nil
 		case EventError:
+			m.clearRequestTransient()
 			m.messages.CommitAssistant()
 			m.request = nil
 			m.streaming = false
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false
+			m.status.RequestModel = ""
+			m.syncSkillStatus()
 			m.status.Error = eventMsg.event.Err
 			m.lastError = eventMsg.event.Err
 			m.input.SetEnabled(true)
@@ -247,6 +284,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input.Text, cmd = m.input.Text.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) trackTransientID(independentID string) {
+	if m.request == nil {
+		return
+	}
+	for _, existing := range m.request.TransientIDs {
+		if existing == independentID {
+			return
+		}
+	}
+	request := *m.request
+	request.TransientIDs = append(append([]string(nil), m.request.TransientIDs...), independentID)
+	m.request = &request
+}
+
+func (m *Model) clearRequestTransient() {
+	if m.request == nil {
+		return
+	}
+	for _, independentID := range m.request.TransientIDs {
+		m.messages.ClearTransient(independentID)
+	}
+	if len(m.request.TransientIDs) > 0 {
+		request := *m.request
+		request.TransientIDs = nil
+		m.request = &request
+	}
 }
 
 func compactNotice(changed bool, externalized int, summarized bool) string {

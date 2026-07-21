@@ -22,6 +22,7 @@ type Definition struct {
 	Usage       string
 	Type        Type
 	ArgHint     string
+	Badge       string
 	Hidden      bool
 	Handler     Handler
 }
@@ -61,6 +62,7 @@ type Suggestion struct {
 	Aliases     []string
 	Description string
 	ArgHint     string
+	Badge       string
 }
 
 type SessionStatus struct {

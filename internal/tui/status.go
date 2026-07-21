@@ -12,6 +12,8 @@ type Status struct {
 	Mode                     string
 	Provider                 string
 	Model                    string
+	ActiveSkills             string
+	RequestModel             string
 	Streaming                bool
 	WaitingConfirmation      bool
 	AgentIteration           int
@@ -30,6 +32,12 @@ type Status struct {
 
 func (s Status) View() string {
 	parts := []string{modeLabel(s.Mode), fmt.Sprintf("Provider: %s", s.Provider), fmt.Sprintf("Model: %s", s.Model)}
+	if strings.TrimSpace(s.ActiveSkills) != "" {
+		parts = append(parts, "Skills: "+strings.TrimSpace(s.ActiveSkills))
+	}
+	if strings.TrimSpace(s.RequestModel) != "" {
+		parts = append(parts, "Request model: "+strings.TrimSpace(s.RequestModel))
+	}
 	if s.WaitingConfirmation {
 		parts = append(parts, "等待工具确认")
 	} else if s.Streaming {

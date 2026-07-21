@@ -18,6 +18,7 @@ const (
 	EventToolDenied              = events.ToolDenied
 	EventAgentProgress           = events.AgentProgressed
 	EventUsageUpdated            = events.UsageUpdated
+	EventMainTraceReset          = events.MainTraceReset
 	EventDone                    = events.Done
 	EventError                   = events.Error
 )

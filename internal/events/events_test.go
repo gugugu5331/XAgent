@@ -16,4 +16,19 @@ func TestEventPayloadsAreZeroValueCompatible(t *testing.T) {
 	if event.Type != DiagnosticEmitted || event.Diagnostic.Code != "mcp_missing_env" {
 		t.Fatalf("unexpected diagnostic event: %#v", event)
 	}
+	if event.Transient || event.IndependentID != "" {
+		t.Fatalf("legacy event unexpectedly marked independent: %#v", event)
+	}
+}
+
+func TestEventMarksIndependentTransientFlow(t *testing.T) {
+	event := Event{Type: TextDelta, Text: "working", Transient: true, IndependentID: "run-1"}
+	if !event.Transient || event.IndependentID != "run-1" {
+		t.Fatalf("independent marker was not retained: %#v", event)
+	}
+
+	final := Event{Type: TextDelta, Text: "summary", IndependentID: "run-1"}
+	if final.Transient {
+		t.Fatalf("final summary must remain persistent: %#v", final)
+	}
 }

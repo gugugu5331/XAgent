@@ -52,6 +52,84 @@ func ReadProjectFile(projectRoot string, requestedPath string) (string, []byte, 
 	return resolved, data, nil
 }
 
+type resolvedReadPath struct {
+	absolute string
+	root     string
+	display  string
+	project  bool
+}
+
+func resolveReadPath(scope ReadScope, requestedPath string) (resolvedReadPath, error) {
+	if strings.TrimSpace(requestedPath) == "" {
+		return resolvedReadPath{}, fmt.Errorf("%s: 路径不能为空", ErrNotFound)
+	}
+	var normalized ReadScope
+	var err error
+	if scope.pinned {
+		normalized, err = NewPinnedReadScope(scope.ProjectRoot, scope.ExtraRoots)
+	} else {
+		normalized, err = NewReadScope(scope.ProjectRoot, scope.ExtraRoots)
+	}
+	if err != nil {
+		return resolvedReadPath{}, err
+	}
+	scope = normalized
+	if filepath.IsAbs(requestedPath) {
+		resolved, err := resolveWithExistingAncestor(requestedPath)
+		if err != nil {
+			return resolvedReadPath{}, fmt.Errorf("解析路径失败: %w", err)
+		}
+		root, project, ok := readRootForPath(scope, resolved)
+		if !ok {
+			return resolvedReadPath{}, fmt.Errorf("%s: 路径 %q 位于允许的只读根外", ErrPathOutsideProject, requestedPath)
+		}
+		return resolvedReadTarget(scope, root, resolved, project), nil
+	}
+
+	roots := readRoots(scope)
+	var missing resolvedReadPath
+	for index, root := range roots {
+		candidate := filepath.Join(root.path, requestedPath)
+		resolved, err := resolveWithExistingAncestor(candidate)
+		if err != nil {
+			return resolvedReadPath{}, fmt.Errorf("解析路径失败: %w", err)
+		}
+		if !isPathInsideRoot(root.path, resolved) {
+			return resolvedReadPath{}, fmt.Errorf("%s: 路径 %q 位于允许的只读根外", ErrPathOutsideProject, requestedPath)
+		}
+		target := resolvedReadTarget(scope, root.path, resolved, root.project)
+		if index == 0 {
+			missing = target
+		}
+		if _, err := os.Lstat(resolved); err == nil {
+			return target, nil
+		} else if !os.IsNotExist(err) {
+			return resolvedReadPath{}, err
+		}
+	}
+	return missing, nil
+}
+
+func readFileInScope(scope ReadScope, requestedPath string) (resolvedReadPath, []byte, error) {
+	target, err := resolveReadPath(scope, requestedPath)
+	if err != nil {
+		return resolvedReadPath{}, nil, err
+	}
+	file, err := openFileNoFollow(target.root, target.absolute, unix.O_RDONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return resolvedReadPath{}, nil, fmt.Errorf("%s: 打开文件失败: %w", ErrNotFound, err)
+		}
+		return resolvedReadPath{}, nil, fmt.Errorf("%s: 打开文件失败: %w", ErrPathOutsideProject, err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return resolvedReadPath{}, nil, err
+	}
+	return target, data, nil
+}
+
 func WriteProjectFile(projectRoot string, requestedPath string, data []byte) (string, error) {
 	resolved, err := ResolveProjectPath(projectRoot, requestedPath)
 	if err != nil {
@@ -80,6 +158,10 @@ func openProjectFileNoFollow(projectRoot string, absolutePath string, flags int,
 	if err != nil {
 		return nil, err
 	}
+	return openFileNoFollow(root, absolutePath, flags, perm)
+}
+
+func openFileNoFollow(root string, absolutePath string, flags int, perm uint32) (*os.File, error) {
 	resolved, err := resolveWithExistingAncestor(absolutePath)
 	if err != nil {
 		return nil, err
@@ -95,7 +177,7 @@ func openProjectFileNoFollow(projectRoot string, absolutePath string, flags int,
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("empty relative path")
 	}
-	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +201,71 @@ func openProjectFileNoFollow(projectRoot string, absolutePath string, flags int,
 	}
 	unix.Close(currentFD)
 	return nil, fmt.Errorf("invalid path")
+}
+
+type readRoot struct {
+	path    string
+	project bool
+}
+
+func readRoots(scope ReadScope) []readRoot {
+	roots := make([]readRoot, 0, len(scope.ExtraRoots)+1)
+	roots = append(roots, readRoot{path: scope.ProjectRoot, project: true})
+	for _, root := range scope.ExtraRoots {
+		roots = append(roots, readRoot{path: root})
+	}
+	return roots
+}
+
+func readRootForPath(scope ReadScope, absolutePath string) (string, bool, bool) {
+	if isPathInsideRoot(scope.ProjectRoot, absolutePath) {
+		return scope.ProjectRoot, true, true
+	}
+	for _, root := range scope.ExtraRoots {
+		if isPathInsideRoot(root, absolutePath) {
+			return root, false, true
+		}
+	}
+	return "", false, false
+}
+
+func resolvedReadTarget(scope ReadScope, root string, absolutePath string, project bool) resolvedReadPath {
+	return resolvedReadPath{
+		absolute: absolutePath,
+		root:     root,
+		display:  displayReadPath(scope, root, absolutePath, project),
+		project:  project,
+	}
+}
+
+func displayReadPath(scope ReadScope, root string, absolutePath string, project bool) string {
+	rel, err := filepath.Rel(root, absolutePath)
+	if err != nil {
+		return absolutePath
+	}
+	rel = filepath.ToSlash(rel)
+	if project {
+		return rel
+	}
+	base := filepath.Base(root)
+	duplicateIndex := 0
+	duplicateCount := 0
+	for index, extra := range scope.ExtraRoots {
+		if filepath.Base(extra) == base {
+			duplicateCount++
+			if extra == root {
+				duplicateIndex = index + 1
+			}
+		}
+	}
+	label := "skill:" + base
+	if duplicateCount > 1 {
+		label = fmt.Sprintf("%s#%d", label, duplicateIndex)
+	}
+	if rel == "." {
+		return label
+	}
+	return label + "/" + rel
 }
 
 func makeProjectDirsNoFollow(projectRoot string, absoluteDir string) error {

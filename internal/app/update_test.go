@@ -144,6 +144,99 @@ func TestModelTracksRequestSessionLifecycle(t *testing.T) {
 	}
 }
 
+func TestTransientEventLifecycle(t *testing.T) {
+	model := Model{
+		screen: screenChat, streaming: true, input: tui.NewInput(""), messages: tui.NewMessagesView(true),
+		request: &RequestSession{Cancel: func() {}, Independent: true},
+		status:  tui.Status{Streaming: true, RequestModel: "review-model", ActiveSkills: "review"},
+	}
+	model.messages.AppendUser("/review")
+	eventsToApply := []events.Event{
+		{Type: events.ThinkingDelta, Text: "temporary thinking", Transient: true, IndependentID: "run-1"},
+		{Type: events.TextDelta, Text: "temporary text", Transient: true, IndependentID: "run-1"},
+		{Type: events.ToolRunning, Transient: true, IndependentID: "run-1", Tool: &events.ToolDisplay{
+			CallID: "call-1", Name: "Read", Arguments: `{"path":"main.go"}`, Status: events.ToolDisplayRunning,
+		}},
+	}
+	for _, event := range eventsToApply {
+		updated, _ := model.Update(eventMsg{event: event, events: closedEvents()})
+		model = updated.(Model)
+	}
+	for _, want := range []string{"temporary thinking", "temporary text", "● Read(main.go)"} {
+		if !strings.Contains(model.messages.View(), want) {
+			t.Fatalf("live transient view missing %q: %q", want, model.messages.View())
+		}
+	}
+
+	updated, _ := model.Update(eventMsg{event: events.Event{Type: events.TextDelta, Text: "final summary"}, events: closedEvents()})
+	model = updated.(Model)
+	if strings.Contains(model.messages.View(), "temporary") || strings.Contains(model.messages.View(), "● Read") || !strings.Contains(model.messages.View(), "final summary") {
+		t.Fatalf("final summary did not replace transient trace: %q", model.messages.View())
+	}
+	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	model = updated.(Model)
+	if model.request != nil || model.streaming || model.status.RequestModel != "" || model.status.ActiveSkills != "" {
+		t.Fatalf("done did not restore request status: %#v", model)
+	}
+	if strings.Count(model.messages.View(), "final summary") != 1 {
+		t.Fatalf("final summary was not committed exactly once: %q", model.messages.View())
+	}
+}
+
+func TestTransientFailureAndCancelCleanup(t *testing.T) {
+	newModel := func(cancel context.CancelFunc) Model {
+		model := Model{
+			screen: screenChat, streaming: true, input: tui.NewInput(""), messages: tui.NewMessagesView(false),
+			request: &RequestSession{Cancel: cancel, Independent: true},
+			status:  tui.Status{Streaming: true, RequestModel: "review-model"},
+		}
+		model.messages.AppendUser("/review")
+		return model
+	}
+
+	model := newModel(func() {})
+	updated, _ := model.Update(eventMsg{event: events.Event{Type: events.TextDelta, Text: "temporary", Transient: true, IndependentID: "run-1"}, events: closedEvents()})
+	model = updated.(Model)
+	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Error, Err: errors.New("failed")}, events: closedEvents()})
+	model = updated.(Model)
+	if strings.Contains(model.messages.View(), "temporary") || model.request != nil || model.status.RequestModel != "" || model.status.Error == nil {
+		t.Fatalf("failure retained transient state: messages=%q model=%#v", model.messages.View(), model)
+	}
+
+	cancelled := false
+	model = newModel(func() { cancelled = true })
+	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.TextDelta, Text: "cancel me", Transient: true, IndependentID: "run-2"}, events: closedEvents()})
+	model = updated.(Model)
+	updated, _ = model.Update(keyMsg("esc"))
+	model = updated.(Model)
+	if !cancelled || strings.Contains(model.messages.View(), "cancel me") || model.request != nil || model.status.RequestModel != "" {
+		t.Fatalf("cancel retained transient state: cancelled=%t messages=%q model=%#v", cancelled, model.messages.View(), model)
+	}
+}
+
+func TestMainTraceResetDropsParentIterationBuffers(t *testing.T) {
+	conv := &conversation.Conversation{Messages: []conversation.Message{{Role: conversation.RoleUser, Content: "review this"}}}
+	model := Model{
+		screen: screenChat, streaming: true, input: tui.NewInput(""), messages: tui.NewMessagesView(true),
+		conversation: conv, request: &RequestSession{Cancel: func() {}}, status: tui.Status{Streaming: true},
+	}
+	for _, event := range []events.Event{
+		{Type: events.ThinkingDelta, Text: "parent thinking"},
+		{Type: events.TextDelta, Text: "parent preamble"},
+		{Type: events.MainTraceReset},
+		{Type: events.TextDelta, Text: "isolated summary"},
+	} {
+		updated, _ := model.Update(eventMsg{event: event, events: closedEvents()})
+		model = updated.(Model)
+	}
+	updated, _ := model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	model = updated.(Model)
+	output := model.messages.View()
+	if strings.Contains(output, "parent preamble") || strings.Contains(output, "parent thinking") || strings.Count(output, "isolated summary") != 1 {
+		t.Fatalf("main trace reset did not replace parent iteration: %q", output)
+	}
+}
+
 func TestStreamingKeysCancelBeforeQuit(t *testing.T) {
 	cancelled := false
 	closer := &fakeCloser{}

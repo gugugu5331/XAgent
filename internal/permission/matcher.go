@@ -20,6 +20,7 @@ type NormalizedCall struct {
 	Call             Call
 	Arguments        map[string]any
 	ProjectRoot      string
+	ReadRoots        []string
 	RawCommand       string
 	Command          string
 	ComplexShell     bool
@@ -30,13 +31,17 @@ type NormalizedCall struct {
 }
 
 func NormalizeCall(call Call, projectRoot string) (NormalizedCall, error) {
+	return NormalizeCallWithReadRoots(call, projectRoot, nil)
+}
+
+func NormalizeCallWithReadRoots(call Call, projectRoot string, readRoots []string) (NormalizedCall, error) {
 	arguments := map[string]any{}
 	if strings.TrimSpace(call.ArgumentsJSON) != "" {
 		if err := json.Unmarshal([]byte(call.ArgumentsJSON), &arguments); err != nil {
 			return NormalizedCall{}, err
 		}
 	}
-	normalized := NormalizedCall{Call: call, Arguments: arguments, ProjectRoot: projectRoot}
+	normalized := NormalizedCall{Call: call, Arguments: arguments, ProjectRoot: projectRoot, ReadRoots: append([]string(nil), readRoots...)}
 	switch call.Name {
 	case "Bash":
 		command, _ := arguments["command"].(string)
@@ -45,7 +50,16 @@ func NormalizeCall(call Call, projectRoot string) (NormalizedCall, error) {
 		normalized.ComplexShell = IsComplexShell(normalized.RawCommand)
 		normalized.RuleValue = normalized.Command
 		normalized.FingerprintValue = normalized.Command
-	case "Read", "Write", "Edit", "Glob", "Grep":
+	case "Read", "Glob", "Grep":
+		pathValue, original, err := normalizeReadPathArgument(call.Name, arguments, projectRoot, readRoots)
+		if err != nil {
+			return NormalizedCall{}, err
+		}
+		normalized.Path = pathValue
+		normalized.OriginalPath = original
+		normalized.RuleValue = pathValue
+		normalized.FingerprintValue = pathValue
+	case "Write", "Edit":
 		pathValue, original, err := normalizePathArgument(call.Name, arguments, projectRoot)
 		if err != nil {
 			return NormalizedCall{}, err
@@ -105,17 +119,23 @@ func MatchRule(rule Rule, normalized NormalizedCall) (bool, error) {
 
 func ruleValue(rule Rule, normalized NormalizedCall) (string, error) {
 	if rule.PathParam != "" && rule.Tool != "Bash" {
-		return normalizePathForParam(rule.Tool, normalized.Arguments, normalized.ProjectRoot, rule.PathParam)
+		return normalizePathForParam(rule.Tool, normalized.Arguments, normalized.ProjectRoot, normalized.ReadRoots, rule.PathParam)
 	}
 	return normalized.RuleValue, nil
 }
 
-func normalizePathForParam(toolName string, arguments map[string]any, projectRoot string, pathParam string) (string, error) {
+func normalizePathForParam(toolName string, arguments map[string]any, projectRoot string, readRoots []string, pathParam string) (string, error) {
 	value := "."
 	if raw, ok := arguments[pathParam].(string); ok && strings.TrimSpace(raw) != "" {
 		value = raw
 	}
-	resolved, err := ResolveProjectPath(projectRoot, value)
+	var resolved PathResolution
+	var err error
+	if toolName == "Read" || toolName == "Glob" || toolName == "Grep" {
+		resolved, err = ResolveReadPath(projectRoot, readRoots, value)
+	} else {
+		resolved, err = ResolveProjectPath(projectRoot, value)
+	}
 	if err != nil {
 		return "", err
 	}

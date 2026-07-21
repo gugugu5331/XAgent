@@ -184,3 +184,75 @@ func TestMessagesViewClearDoesNotModifySourceAndCanAppend(t *testing.T) {
 		t.Fatalf("unexpected output after append: %q", output)
 	}
 }
+
+func TestTransientMessagesRenderAndClearWithoutPersistence(t *testing.T) {
+	view := NewMessagesView(true)
+	view.SetMessages([]conversation.Message{{Role: conversation.RoleUser, Content: "/review current"}})
+	view.AppendTransientThinkingDelta("run-1", "checking")
+	view.AppendTransientAssistantDelta("run-1", "I will inspect.")
+	view.UpsertTransientTool("run-1", events.ToolDisplay{
+		CallID: "call-1", Name: "Read", Arguments: `{"path":"main.go"}`, Status: events.ToolDisplayRunning,
+	})
+
+	output := view.View()
+	for _, want := range []string{"/review current", "checking", "I will inspect.", "● Read(main.go)", "执行中"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("live transient output missing %q: %q", want, output)
+		}
+	}
+	if len(view.messages) != 1 {
+		t.Fatalf("transient trace entered persistent messages: %#v", view.messages)
+	}
+
+	view.UpsertTransientTool("run-1", events.ToolDisplay{CallID: "call-1", Status: events.ToolDisplaySuccess, Summary: "done"})
+	output = view.View()
+	if !strings.Contains(output, "● Read(main.go)") || !strings.Contains(output, "done") || strings.Contains(output, "执行中") {
+		t.Fatalf("transient tool was not updated by CallID: %q", output)
+	}
+
+	view.ClearTransient("run-1")
+	output = view.View()
+	for _, gone := range []string{"checking", "I will inspect.", "● Read(main.go)", "done"} {
+		if strings.Contains(output, gone) {
+			t.Fatalf("cleared transient output still contains %q: %q", gone, output)
+		}
+	}
+	if !strings.Contains(output, "/review current") || len(view.messages) != 1 {
+		t.Fatalf("clearing transient changed persistent history: output=%q messages=%#v", output, view.messages)
+	}
+}
+
+func TestTransientMessagesAreIsolatedByIndependentID(t *testing.T) {
+	view := NewMessagesView(false)
+	view.AppendTransientAssistantDelta("run-1", "first")
+	view.AppendTransientAssistantDelta("run-2", "second")
+	view.ClearTransient("run-1")
+	output := view.View()
+	if strings.Contains(output, "first") || !strings.Contains(output, "second") {
+		t.Fatalf("transient traces were not isolated: %q", output)
+	}
+	view.Clear()
+	if output := view.View(); output != "" {
+		t.Fatalf("Clear retained transient trace: %q", output)
+	}
+}
+
+func TestTransientThinkingHonorsVisibility(t *testing.T) {
+	view := NewMessagesView(false)
+	view.AppendTransientThinkingDelta("run-1", "secret reasoning")
+	if output := view.View(); strings.Contains(output, "secret reasoning") {
+		t.Fatalf("hidden thinking was rendered: %q", output)
+	}
+}
+
+func TestSetMessagesDropsTransientTrace(t *testing.T) {
+	view := NewMessagesView(false)
+	view.AppendAssistantDelta("parent preamble")
+	view.AppendThinkingDelta("parent thinking")
+	view.AppendTransientAssistantDelta("run-1", "temporary")
+	view.SetMessages([]conversation.Message{{Role: conversation.RoleAssistant, Content: "saved"}})
+	output := view.View()
+	if strings.Contains(output, "temporary") || strings.Contains(output, "parent preamble") || strings.Contains(output, "parent thinking") || !strings.Contains(output, "saved") {
+		t.Fatalf("history reload retained transient trace: %q", output)
+	}
+}
