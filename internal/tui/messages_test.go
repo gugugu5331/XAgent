@@ -165,3 +165,22 @@ func TestMessagesViewCanAppendAfterValueCopy(t *testing.T) {
 		t.Fatalf("unexpected copied view output: %q", output)
 	}
 }
+
+func TestMessagesViewClearDoesNotModifySourceAndCanAppend(t *testing.T) {
+	messages := []conversation.Message{{Role: conversation.RoleUser, Content: "keep"}}
+	view := NewMessagesView(true)
+	view.SetMessages(messages)
+	view.AppendAssistantDelta("assistant")
+	view.AppendThinkingDelta("thinking")
+	view.Clear()
+	if output := view.View(); output != "" {
+		t.Fatalf("cleared view is not empty: %q", output)
+	}
+	if len(messages) != 1 || messages[0].Content != "keep" {
+		t.Fatalf("source messages changed: %#v", messages)
+	}
+	view.AppendUser("new")
+	if output := view.View(); !strings.Contains(output, "new") || strings.Contains(output, "keep") {
+		t.Fatalf("unexpected output after append: %q", output)
+	}
+}

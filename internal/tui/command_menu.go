@@ -1,0 +1,76 @@
+package tui
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+type CommandMenuItem struct {
+	Name        string
+	Description string
+	ArgHint     string
+}
+
+type CommandMenu struct {
+	Items    []CommandMenuItem
+	Selected int
+	Visible  bool
+}
+
+func (m *CommandMenu) Open(items []CommandMenuItem) {
+	m.Items = append([]CommandMenuItem(nil), items...)
+	m.Selected = 0
+	m.Visible = len(m.Items) > 0
+}
+
+func (m *CommandMenu) Close() {
+	m.Items = nil
+	m.Selected = 0
+	m.Visible = false
+}
+
+func (m *CommandMenu) Move(delta int) {
+	if !m.Visible || len(m.Items) == 0 || delta == 0 {
+		return
+	}
+	m.Selected = (m.Selected + delta) % len(m.Items)
+	if m.Selected < 0 {
+		m.Selected += len(m.Items)
+	}
+}
+
+func (m CommandMenu) SelectedItem() (CommandMenuItem, bool) {
+	if !m.Visible || m.Selected < 0 || m.Selected >= len(m.Items) {
+		return CommandMenuItem{}, false
+	}
+	return m.Items[m.Selected], true
+}
+
+func (m CommandMenu) View() string {
+	if !m.Visible || len(m.Items) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for index, item := range m.Items {
+		prefix := "  "
+		if index == m.Selected {
+			prefix = "› "
+		}
+		line := prefix + "/" + item.Name
+		if strings.TrimSpace(item.ArgHint) != "" {
+			line += " " + item.ArgHint
+		}
+		if strings.TrimSpace(item.Description) != "" {
+			line += " — " + item.Description
+		}
+		if index == m.Selected {
+			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(line)
+		}
+		builder.WriteString(line)
+		if index < len(m.Items)-1 {
+			builder.WriteByte('\n')
+		}
+	}
+	return builder.String()
+}

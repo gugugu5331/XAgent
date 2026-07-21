@@ -146,6 +146,18 @@ func (o *Orchestrator) Send(ctx context.Context, conv *conversation.Conversation
 	if err != nil {
 		return nil, err
 	}
+	return o.SendWithMode(ctx, conv, req.UserText, req.Mode)
+}
+
+func (o *Orchestrator) SendWithMode(ctx context.Context, conv *conversation.Conversation, userText string, mode RunMode) (<-chan events.Event, error) {
+	userText = strings.TrimSpace(userText)
+	if userText == "" {
+		return nil, fmt.Errorf("请输入非空内容")
+	}
+	if mode != RunModeDefault && mode != RunModePlan && mode != RunModeDo {
+		return nil, fmt.Errorf("运行模式无效: %s", mode)
+	}
+	req := RunRequest{UserText: userText, Mode: mode}
 	out := make(chan events.Event)
 	conversation.AppendUserMessage(conv, req.UserText)
 

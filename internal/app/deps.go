@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 
+	"xagent/internal/command"
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
@@ -32,4 +33,5 @@ type Deps struct {
 		Summary() mcpclient.StatusSummary
 		Diagnostics() []mcpclient.Diagnostic
 	}
+	CommandRegistry *command.Registry
 }

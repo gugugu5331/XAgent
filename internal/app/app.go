@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"xagent/internal/command"
 	"xagent/internal/config"
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
@@ -33,27 +34,35 @@ type RequestSession struct {
 }
 
 type Model struct {
-	deps         Deps
-	orchestrator *orchestrator.Orchestrator
-	screen       screen
-	list         list.Model
-	input        tui.Input
-	messages     tui.MessagesView
-	status       tui.Status
-	conversation *conversation.Conversation
-	request      *RequestSession
-	diagnostics  *diagnostics.Collector
-	streaming    bool
-	confirmation *Event
+	deps            Deps
+	orchestrator    *orchestrator.Orchestrator
+	screen          screen
+	list            list.Model
+	input           tui.Input
+	messages        tui.MessagesView
+	status          tui.Status
+	conversation    *conversation.Conversation
+	request         *RequestSession
+	diagnostics     *diagnostics.Collector
+	streaming       bool
+	confirmation    *Event
+	commandRegistry *command.Registry
+	commandMenu     tui.CommandMenu
+	mode            orchestrator.RunMode
+	lastError       error
+	messagesCleared bool
 }
 
 func New(deps Deps) Model {
 	ctx := context.Background()
+	if deps.CommandRegistry == nil {
+		deps.CommandRegistry = command.MustNew(command.Builtins()...)
+	}
 	if deps.Diagnostics == nil {
 		deps.Diagnostics = diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redact.Text})
 	}
 	conversations, _ := deps.Store.List(ctx)
-	orch := orchestrator.NewWithOptions(orchestrator.OrchestratorOptions{
+	orchOptions := orchestrator.OrchestratorOptions{
 		Provider:       deps.Provider,
 		Store:          deps.Store,
 		Resources:      deps.Resources,
@@ -61,23 +70,31 @@ func New(deps Deps) Model {
 		Registry:       deps.Registry,
 		Executor:       deps.Executor,
 		ContextManager: deps.ContextManager,
-		SessionContext: deps.SessionContext,
-		Memory:         deps.Memory,
 		Diagnostics:    deps.Diagnostics,
 		Agent:          deps.Config.Agent,
-	})
+	}
+	if deps.SessionContext != nil {
+		orchOptions.SessionContext = deps.SessionContext
+	}
+	if deps.Memory != nil {
+		orchOptions.Memory = deps.Memory
+	}
+	orch := orchestrator.NewWithOptions(orchOptions)
 	if mode, ok := permission.ParseMode(deps.Config.Permission.Mode); ok {
 		orch.SetPermissionMode(mode)
 	}
 	model := Model{
-		deps:         deps,
-		orchestrator: orch,
-		screen:       screenList,
-		list:         tui.NewConversationList(conversations),
-		input:        tui.NewInput(deps.Resources.UILabel("input_prompt")),
-		messages:     tui.NewMessagesView(deps.Config.LLM.Thinking.Show),
-		diagnostics:  deps.Diagnostics,
+		deps:            deps,
+		orchestrator:    orch,
+		screen:          screenList,
+		list:            tui.NewConversationList(conversations),
+		input:           tui.NewInput(deps.Resources.UILabel("input_prompt")),
+		messages:        tui.NewMessagesView(deps.Config.LLM.Thinking.Show),
+		diagnostics:     deps.Diagnostics,
+		commandRegistry: deps.CommandRegistry,
+		mode:            orchestrator.RunModeDefault,
 		status: tui.Status{
+			Mode:     string(orchestrator.RunModeDefault),
 			Provider: deps.Provider.Name(),
 			Model:    deps.Config.LLM.Model,
 		},
@@ -103,6 +120,9 @@ func (m Model) View() string {
 	if m.confirmation != nil && m.confirmation.Confirmation != nil {
 		footer = m.confirmation.Confirmation.Prompt
 	}
+	if menu := m.commandMenu.View(); menu != "" {
+		return fmt.Sprintf("%s\n\n%s\n%s\n%s\n%s", content, m.status.View(), m.input.Text.View(), menu, footer)
+	}
 	return fmt.Sprintf("%s\n\n%s\n%s\n%s", content, m.status.View(), m.input.Text.View(), footer)
 }
 
@@ -114,6 +134,7 @@ func (m *Model) startNewConversation() {
 	}
 	m.conversation = conv
 	m.messages.SetMessages(nil)
+	m.resetCommandState()
 	m.screen = screenChat
 }
 
@@ -125,8 +146,16 @@ func (m *Model) loadConversation(id string) {
 	}
 	m.conversation = conv
 	m.messages.SetMessages(conv.Messages)
+	m.resetCommandState()
 	m.status.Notice = recoveryNotice(report)
 	m.screen = screenChat
+}
+
+func (m *Model) resetCommandState() {
+	m.mode = orchestrator.RunModeDefault
+	m.status.Mode = string(orchestrator.RunModeDefault)
+	m.commandMenu.Close()
+	m.messagesCleared = false
 }
 
 func (m *Model) recoverOrLoadConversation(id string) (*conversation.Conversation, conversation.RecoveryReport, error) {

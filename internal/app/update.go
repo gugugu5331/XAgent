@@ -1,10 +1,8 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -19,165 +17,6 @@ func (m *Model) sendConfirmation(action events.PermissionAction, allowed bool) {
 	m.confirmation.Confirmation.Decision <- events.ToolConfirmationDecision{CallID: m.confirmation.Confirmation.CallID, Allowed: allowed, Action: action}
 	m.confirmation = nil
 	m.status.WaitingConfirmation = false
-}
-
-func (m *Model) handlePermissionsStatusCommand(text string) bool {
-	if strings.TrimSpace(text) != "/permissions status" {
-		return false
-	}
-	status := m.orchestrator.PermissionStatus()
-	m.status.Notice = fmt.Sprintf("本地权限状态，不会发送给模型: mode=%s session=%d local=%d project=%d user=%d load_errors=%d", status.Mode, status.SessionRules, status.LocalRules, status.ProjectRules, status.UserRules, status.LoadErrors)
-	m.status.Error = nil
-	return true
-}
-
-func (m *Model) handleMCPStatusCommand(text string) bool {
-	if strings.TrimSpace(text) != "/mcp status" {
-		return false
-	}
-	if m.deps.MCPStatus == nil {
-		m.status.Notice = "本地 MCP 状态: 未配置 MCP"
-		m.status.Error = nil
-		return true
-	}
-	summary := m.deps.MCPStatus.Summary()
-	parts := []string{fmt.Sprintf("本地 MCP 状态，不会发送给模型: configured=%d ready=%d failed=%d disabled=%d closed=%d", summary.Configured, summary.Ready, summary.Failed, summary.Disabled, summary.Closed)}
-	for _, item := range summary.Diagnostics {
-		text := redact.Text(strings.TrimSpace(item.Message))
-		if item.Server != "" {
-			text = redact.Text(item.Server) + ": " + text
-		}
-		if text != "" {
-			parts = append(parts, text)
-		}
-	}
-	m.status.Notice = strings.Join(parts, "；")
-	m.status.Error = nil
-	return true
-}
-
-func (m *Model) handleDiagnosticsCommand(text string) bool {
-	if strings.TrimSpace(text) != "/diagnostics" {
-		return false
-	}
-	collector := m.diagnostics
-	if collector == nil {
-		collector = m.deps.Diagnostics
-	}
-	items := collector.List()
-	if len(items) == 0 {
-		m.status.Notice = "本地诊断: 暂无诊断，不会发送给模型"
-		m.status.Error = nil
-		return true
-	}
-	parts := make([]string, 0, len(items))
-	for _, item := range items {
-		text := item.Safe(redact.Text).Text()
-		if item.Source != "" {
-			text += " source=" + redact.Text(item.Source)
-		}
-		if text != "" {
-			parts = append(parts, text)
-		}
-	}
-	m.status.Notice = "本地诊断，不会发送给模型: " + strings.Join(parts, "；")
-	m.status.Error = nil
-	return true
-}
-
-func (m *Model) handleMemoryCommand(text string) bool {
-	fields := strings.Fields(text)
-	if len(fields) == 0 || fields[0] != "/memory" {
-		return false
-	}
-	if m.deps.Memory == nil {
-		m.setMemoryError(fmt.Errorf("memory 管理器未启用"))
-		return true
-	}
-	if len(fields) == 1 {
-		m.setMemoryNotice("用法: /memory status|index|off|delete|rebuild")
-		return true
-	}
-	switch fields[1] {
-	case "status":
-		m.setMemoryNotice(formatMemoryStatus(m.deps.Memory.Status()))
-	case "index":
-		scope := memory.ScopeProject
-		if len(fields) > 2 {
-			parsed, err := parseMemoryScope(fields[2])
-			if err != nil {
-				m.setMemoryError(err)
-				return true
-			}
-			scope = parsed
-		}
-		index, err := m.deps.Memory.LoadIndex(scope)
-		if err != nil {
-			m.setMemoryError(err)
-			return true
-		}
-		m.setMemoryNotice(formatMemoryIndex(index))
-	case "off":
-		scope := memory.ScopeProject
-		if len(fields) > 2 {
-			parsed, err := parseMemoryScope(fields[2])
-			if err != nil {
-				m.setMemoryError(err)
-				return true
-			}
-			scope = parsed
-		}
-		m.deps.Memory.Disable(scope)
-		m.setMemoryNotice(fmt.Sprintf("memory %s 自动记忆已关闭", scope))
-	case "delete":
-		if len(fields) != 4 {
-			m.setMemoryError(fmt.Errorf("用法: /memory delete <user|project> <id>"))
-			return true
-		}
-		scope, err := parseMemoryScope(fields[2])
-		if err != nil {
-			m.setMemoryError(err)
-			return true
-		}
-		if err := m.deps.Memory.DeleteNote(scope, fields[3]); err != nil {
-			m.setMemoryError(err)
-			return true
-		}
-		m.setMemoryNotice(fmt.Sprintf("memory %s 记忆 %s 已删除", scope, redact.Text(fields[3])))
-	case "rebuild":
-		if len(fields) != 3 {
-			m.setMemoryError(fmt.Errorf("用法: /memory rebuild <user|project>"))
-			return true
-		}
-		scope, err := parseMemoryScope(fields[2])
-		if err != nil {
-			m.setMemoryError(err)
-			return true
-		}
-		index, err := m.deps.Memory.RebuildIndex(scope)
-		if err != nil {
-			m.setMemoryError(err)
-			return true
-		}
-		m.setMemoryNotice(fmt.Sprintf("memory %s 索引已重建，%d 条", scope, len(index.Entries)))
-	default:
-		m.setMemoryError(fmt.Errorf("未知 memory 命令: %s", redact.Text(fields[1])))
-	}
-	return true
-}
-
-func (m *Model) setMemoryNotice(message string) {
-	m.status.Notice = redact.Text(message)
-	m.status.Error = nil
-}
-
-func (m *Model) setMemoryError(err error) {
-	m.status.Notice = ""
-	if err == nil {
-		m.status.Error = nil
-		return
-	}
-	m.status.Error = fmt.Errorf("%s", redact.Text(err.Error()))
 }
 
 func (m *Model) cancelRequest(notice string) {
@@ -260,6 +99,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelRequest("请求已取消，可继续输入")
 			return m, nil
 		}
+		if m.confirmation == nil && m.commandMenu.Visible {
+			switch msg.String() {
+			case "up":
+				m.commandMenu.Move(-1)
+				return m, nil
+			case "down":
+				m.commandMenu.Move(1)
+				return m, nil
+			case "enter":
+				m.acceptCommandCompletion()
+				return m, nil
+			case "esc":
+				m.commandMenu.Close()
+				return m, nil
+			default:
+				m.commandMenu.Close()
+			}
+		}
+		if m.confirmation == nil && m.screen == screenChat && !m.streaming && msg.String() == "tab" {
+			m.completeCommand()
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.close()
@@ -312,73 +173,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.streaming {
 				return m, nil
 			}
-			text := sanitizeInput(m.input.Value())
-			if text == "" {
-				m.status.Error = nil
-				return m, nil
-			}
-			if text == "/compact" {
-				if m.conversation == nil {
-					m.status.Notice = "当前没有会话需要压缩"
-					m.status.Error = nil
-					m.input.Clear()
-					return m, nil
-				}
-				result, err := m.orchestrator.CompactContext(context.Background(), m.conversation)
-				if err != nil {
-					m.status.Error = err
-					m.status.Notice = ""
-					return m, nil
-				}
-				m.messages.SetMessages(m.conversation.Messages)
-				m.status.Notice = compactNotice(result.Changed, result.Externalized, result.Summarized)
-				m.status.Error = nil
-				m.input.Clear()
-				return m, nil
-			}
-			if m.handleMCPStatusCommand(text) {
-				m.input.Clear()
-				return m, nil
-			}
-			if m.handleDiagnosticsCommand(text) {
-				m.input.Clear()
-				return m, nil
-			}
-			if m.handlePermissionsStatusCommand(text) {
-				m.input.Clear()
-				return m, nil
-			}
-			if strings.HasPrefix(text, "/memory") && m.handleMemoryCommand(text) {
-				m.input.Clear()
-				return m, nil
-			}
-			if m.conversation == nil {
-				m.startNewConversation()
-			}
-			requestCtx, cancel := context.WithCancel(context.Background())
-			events, err := m.orchestrator.Send(requestCtx, m.conversation, text)
-			if err != nil {
-				cancel()
-				m.status.Error = err
-				return m, nil
-			}
-			m.request = &RequestSession{Cancel: cancel, StartedAt: time.Now(), Timeout: time.Duration(m.deps.Config.LLM.RequestTimeoutMS) * time.Millisecond}
-			m.input.Clear()
-			m.input.SetEnabled(false)
-			m.streaming = true
-			m.status.Streaming = true
-			m.status.WaitingConfirmation = false
-			m.status.AgentIteration = 0
-			m.status.AgentMaxIterations = 0
-			m.status.StopReason = ""
-			m.status.StopMessage = ""
-			m.status.InputTokens = 0
-			m.status.OutputTokens = 0
-			m.status.CacheCreationInputTokens = 0
-			m.status.CacheReadInputTokens = 0
-			m.status.Error = nil
-			m.status.Notice = ""
-			return m, listen(events)
+			return m, m.dispatchInput()
 		}
 	}
 
@@ -437,6 +232,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status.Streaming = false
 			m.status.WaitingConfirmation = false
 			m.status.Error = eventMsg.event.Err
+			m.lastError = eventMsg.event.Err
 			m.input.SetEnabled(true)
 			m.confirmation = nil
 			return m, nil

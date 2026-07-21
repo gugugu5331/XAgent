@@ -254,6 +254,56 @@ func TestParseRunRequestRejectsEmptyCommand(t *testing.T) {
 	}
 }
 
+func TestSendWithModeUsesExplicitModeAndStoresCleanUserText(t *testing.T) {
+	root := t.TempDir()
+	store, err := conversation.NewFileStore(filepath.Join(root, "conversations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv, err := store.Create(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &captureProvider{}
+	registry, err := tool.NewRegistry(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := tool.NewExecutor(registry, root, time.Second, 1024)
+	orch := NewWithTools(provider, store, resources.New(), config.ThinkingConfig{}, registry, executor)
+	events, err := orch.SendWithMode(context.Background(), conv, "  检查项目  ", RunModePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	if len(conv.Messages) == 0 || conv.Messages[0].Role != conversation.RoleUser || conv.Messages[0].Content != "检查项目" {
+		t.Fatalf("unexpected stored messages: %#v", conv.Messages)
+	}
+	if !strings.Contains(requestDynamicText(provider.request), "Plan Mode") {
+		t.Fatalf("explicit plan mode was not used: %#v", provider.request.DynamicSystem)
+	}
+}
+
+func TestSendWithModeRejectsEmptyAndInvalidModeWithoutWritingConversation(t *testing.T) {
+	conv := conversation.NewConversation("session", time.Now())
+	orch := &Orchestrator{}
+	for _, test := range []struct {
+		text string
+		mode RunMode
+	}{
+		{text: " ", mode: RunModeDefault},
+		{text: "hello", mode: RunMode("invalid")},
+	} {
+		if _, err := orch.SendWithMode(context.Background(), conv, test.text, test.mode); err == nil {
+			t.Fatalf("expected error for %#v", test)
+		}
+	}
+	if len(conv.Messages) != 0 {
+		t.Fatalf("invalid request changed conversation: %#v", conv.Messages)
+	}
+}
+
 type captureProvider struct {
 	request provider.ChatRequest
 }

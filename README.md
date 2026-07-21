@@ -101,6 +101,8 @@ go run ./cmd/xagent
 | 按键 | 作用 |
 | --- | --- |
 | `Enter` | 提交输入或选择会话 |
+| `Tab` | 补全斜杠命令；多项匹配时打开候选菜单 |
+| `↑` / `↓` | 在命令候选菜单中移动选择 |
 | `Esc` / `Ctrl+C` | 取消正在生成的请求 |
 | `q` / `Ctrl+C` | 空闲时退出程序 |
 | `y` | 本次允许工具操作 |
@@ -108,21 +110,24 @@ go run ./cmd/xagent
 | `p` | 永久允许（仅在该操作支持时可用） |
 | `n` / `Esc` | 拒绝或取消工具操作 |
 
-内置本地命令：
+斜杠命令会由本地注册中心直接分发。除 `/review` 外，它们不会作为用户消息发送给模型；命令名和别名不区分大小写。输入命令前缀后可按 `Tab` 补全，单个匹配直接写回，多个匹配显示选择菜单。
 
-| 命令 | 作用 |
-| --- | --- |
-| `/compact` | 手动压缩当前会话上下文 |
-| `/permissions status` | 查看权限模式与规则状态 |
-| `/mcp status` | 查看 MCP Server 状态与诊断 |
-| `/diagnostics` | 查看本地诊断信息 |
-| `/memory status` | 查看用户级和项目级记忆状态 |
-| `/memory index [user\|project]` | 查看记忆索引 |
-| `/memory off [user\|project]` | 关闭指定范围的自动记忆 |
-| `/memory delete <user\|project> <id>` | 删除一条记忆 |
-| `/memory rebuild <user\|project>` | 重建记忆索引 |
+| 命令 | 别名 | 类型 | 作用 |
+| --- | --- | --- | --- |
+| `/help` | `/h`、`/?` | 本地 | 显示公开命令、用法和参数提示 |
+| `/compact` | `/ctx` | 本地 | 手动压缩当前会话上下文 |
+| `/clear` | `/cls` | 界面 | 只清空当前消息显示，保留会话历史和 Agent 上下文 |
+| `/plan` | `/p` | 界面 | 进入当前会话的计划模式 |
+| `/do` | `/d` | 界面 | 退出计划模式，恢复默认执行模式 |
+| `/session` | `/sess` | 本地 | 显示会话 ID、消息数、模式和流式状态 |
+| `/memory` | `/mem` | 本地 | 显示用户级和项目级记忆状态及条目数 |
+| `/permission` | `/perm` | 本地 | 显示权限模式和各层规则数量 |
+| `/status` | `/st` | 本地 | 显示 Provider、模型、模式、Token、Cache、MCP 和最近错误 |
+| `/review` | `/rv` | 提示词 | 展开固定审查提示并交给 AI 审查未提交改动 |
 
-这些本地命令不会发送给模型。
+状态栏中的 `[DEFAULT]` 和 `[PLAN]` 表示当前会话模式。`/plan` 会让后续普通请求持续使用只读计划模式，直到执行 `/do`；新建、切换或重新打开会话时恢复 `[DEFAULT]`。模式本身不写入会话存储。
+
+为保持兼容，`/permissions status`、`/mcp status`、`/diagnostics` 以及 `/memory status|index|off|delete|rebuild` 仍可使用，但不出现在帮助和补全中。
 
 ## 权限模式
 

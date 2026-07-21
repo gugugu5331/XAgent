@@ -9,6 +9,7 @@ import (
 )
 
 type Status struct {
+	Mode                     string
 	Provider                 string
 	Model                    string
 	Streaming                bool
@@ -28,7 +29,7 @@ type Status struct {
 }
 
 func (s Status) View() string {
-	parts := []string{fmt.Sprintf("Provider: %s", s.Provider), fmt.Sprintf("Model: %s", s.Model)}
+	parts := []string{modeLabel(s.Mode), fmt.Sprintf("Provider: %s", s.Provider), fmt.Sprintf("Model: %s", s.Model)}
 	if s.WaitingConfirmation {
 		parts = append(parts, "等待工具确认")
 	} else if s.Streaming {
@@ -64,6 +65,13 @@ func (s Status) View() string {
 		parts = append(parts, "错误: "+s.Error.Error())
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(strings.Join(parts, " | "))
+}
+
+func modeLabel(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "plan") {
+		return "[PLAN]"
+	}
+	return "[DEFAULT]"
 }
 
 func stopReasonText(reason string) string {

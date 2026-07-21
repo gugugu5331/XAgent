@@ -23,6 +23,12 @@ func (i *Input) Clear() {
 	i.Text.SetValue("")
 }
 
+func (i *Input) SetValue(value string) {
+	i.Text.SetValue(value)
+	i.Text.CursorEnd()
+	i.Text.Focus()
+}
+
 func (i *Input) SetEnabled(enabled bool) {
 	if enabled {
 		i.Text.Focus()

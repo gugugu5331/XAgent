@@ -26,6 +26,12 @@ func (v *MessagesView) SetMessages(messages []conversation.Message) {
 	v.messages = append([]conversation.Message(nil), messages...)
 }
 
+func (v *MessagesView) Clear() {
+	v.messages = nil
+	v.assistantBuffer = ""
+	v.thinkingBuffer = ""
+}
+
 func (v *MessagesView) AppendUser(text string) {
 	v.messages = append(v.messages, conversation.Message{Role: conversation.RoleUser, Content: text})
 	v.assistantBuffer = ""
