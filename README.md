@@ -18,6 +18,18 @@ XAgent 是一个使用 Go 构建的终端 AI 编程助手。它在交互式 TUI 
 - 生命周期 Hook：用声明式事件、条件和固定动作自动执行 Shell、HTTP、Prompt 注入或预留的 SubAgent 流程。
 - 安全诊断：对 API Key、Token 等敏感内容进行运行时脱敏。
 
+## 功能规格与验收
+
+核心能力采用 `spec.md → plan.md → task.md → checklist.md` 的规格驱动流程，设计约束、实现拆分和可复现的验收证据都保存在仓库中：
+
+| 能力 | 规格 | 验收记录 |
+| --- | --- | --- |
+| 斜杠命令 | [Command System Spec](docs/command-system/spec.md) | [Command System Checklist](docs/command-system/checklist.md) |
+| 可复用 Skill | [Skill System Spec](docs/skill-system/spec.md) | [Skill System Checklist](docs/skill-system/checklist.md) |
+| 生命周期 Hook | [Hook System Spec](docs/hook-system/spec.md) | [Hook System Checklist](docs/hook-system/checklist.md) |
+
+Hook 系统的 C001–C101 自动化验收已通过；C102 的最终差异范围检查以及 E01–E10 真实 TUI 人工场景仍按清单保留待验收。
+
 ## 环境要求
 
 - Go 1.26.4 或更高版本
@@ -301,6 +313,7 @@ mcp:
 | `MEWCODE.md` | 默认项目指令文件 |
 | `~/.config/xagent/config.yaml` | 用户级配置 |
 | `~/.config/xagent/skills/` | 用户级 Skill 文件和能力包 |
+| `~/.config/xagent/hooks.yaml` | 用户级生命周期 Hook（对所有项目生效的受信代码） |
 
 不要把真实 API Key、Token 或本地权限文件提交到版本库。推荐始终使用环境变量引用敏感配置。
 
