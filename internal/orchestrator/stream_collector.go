@@ -126,10 +126,20 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 		return emitText(eventType, safe)
 	}
 	for {
+		if err := requestContextError(ctx); err != nil {
+			return collector, StopReasonCancelled, err
+		}
 		select {
 		case <-ctx.Done():
 			return collector, StopReasonCancelled, ctx.Err()
 		case event, ok := <-stream:
+			// Cancellation owns the turn terminal state when it races a Provider
+			// error or channel close. Re-check after the receive so selecting the
+			// stream arm cannot nondeterministically turn the same cancellation
+			// into a provider_error result.
+			if err := requestContextError(ctx); err != nil {
+				return collector, StopReasonCancelled, err
+			}
 			if !ok {
 				return collector, StopReasonProviderError, fmt.Errorf("provider 流异常结束")
 			}

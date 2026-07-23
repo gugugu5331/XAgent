@@ -4,10 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"xagent/internal/matcher"
 )
 
 type Call struct {
@@ -35,12 +39,24 @@ func NormalizeCall(call Call, projectRoot string) (NormalizedCall, error) {
 }
 
 func NormalizeCallWithReadRoots(call Call, projectRoot string, readRoots []string) (NormalizedCall, error) {
-	arguments := map[string]any{}
-	if strings.TrimSpace(call.ArgumentsJSON) != "" {
-		if err := json.Unmarshal([]byte(call.ArgumentsJSON), &arguments); err != nil {
-			return NormalizedCall{}, err
-		}
+	arguments, err := decodeArguments(call.ArgumentsJSON)
+	if err != nil {
+		return NormalizedCall{}, err
 	}
+	return normalizeArguments(call, arguments, projectRoot, readRoots)
+}
+
+// NormalizeArguments normalizes an already parsed argument map. The map is
+// intentionally retained, rather than round-tripped through JSON, so callers
+// can preserve json.Number and share one representation across safety stages.
+func NormalizeArguments(call Call, arguments map[string]any, context Context) (NormalizedCall, error) {
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
+	return normalizeArguments(call, arguments, context.ProjectRoot, context.ReadRoots)
+}
+
+func normalizeArguments(call Call, arguments map[string]any, projectRoot string, readRoots []string) (NormalizedCall, error) {
 	normalized := NormalizedCall{Call: call, Arguments: arguments, ProjectRoot: projectRoot, ReadRoots: append([]string(nil), readRoots...)}
 	switch call.Name {
 	case "Bash":
@@ -80,6 +96,29 @@ func NormalizeCallWithReadRoots(call Call, projectRoot string, readRoots []strin
 	return normalized, nil
 }
 
+func decodeArguments(raw string) (map[string]any, error) {
+	arguments := map[string]any{}
+	if strings.TrimSpace(raw) == "" {
+		return arguments, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&arguments); err != nil {
+		return nil, err
+	}
+	if arguments == nil { // Preserve the legacy treatment of JSON null as {}.
+		arguments = map[string]any{}
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = fmt.Errorf("additional JSON value")
+		}
+		return nil, fmt.Errorf("trailing tool arguments: %w", err)
+	}
+	return arguments, nil
+}
+
 func NormalizeCommand(command string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
 }
@@ -112,9 +151,9 @@ func MatchRule(rule Rule, normalized NormalizedCall) (bool, error) {
 		return false, err
 	}
 	if rule.MatchType == string(MatchExact) {
-		return value == normalizePattern(rule.Tool, rule.Pattern), nil
+		return matcher.MatchExact(value, normalizePattern(rule.Tool, rule.Pattern)), nil
 	}
-	return globMatch(filepath.ToSlash(normalizePattern(rule.Tool, rule.Pattern)), filepath.ToSlash(value))
+	return matcher.MatchGlob(filepath.ToSlash(value), filepath.ToSlash(normalizePattern(rule.Tool, rule.Pattern)))
 }
 
 func ruleValue(rule Rule, normalized NormalizedCall) (string, error) {
@@ -198,18 +237,6 @@ func (s ruleScore) betterThan(other ruleScore) bool {
 		return s.wildcards < other.wildcards
 	}
 	return s.order > other.order
-}
-
-func globMatch(pattern string, value string) (bool, error) {
-	if !strings.Contains(pattern, "**") {
-		return filepath.Match(pattern, value)
-	}
-	regexPattern := regexp.QuoteMeta(pattern)
-	regexPattern = strings.ReplaceAll(regexPattern, `\*\*/`, `(?:.*/)?`)
-	regexPattern = strings.ReplaceAll(regexPattern, `\*\*`, `.*`)
-	regexPattern = strings.ReplaceAll(regexPattern, `\*`, `[^/]*`)
-	regexPattern = strings.ReplaceAll(regexPattern, `\?`, `[^/]`)
-	return regexp.MatchString(`^`+regexPattern+`$`, value)
 }
 
 func literalCount(pattern string) int {

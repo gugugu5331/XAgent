@@ -1,9 +1,11 @@
 package diagnostics
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 
@@ -21,6 +23,30 @@ func TestDiagnosticSafeRedactsMessagePathAndSource(t *testing.T) {
 	}
 	if redacted.Severity != SeverityWarning {
 		t.Fatalf("expected default warning severity, got %q", redacted.Severity)
+	}
+}
+
+func TestDiagnosticAttributesCopyStableTextAndLegacyOutput(t *testing.T) {
+	legacy := New("legacy", SeverityInfo, "message").WithSource("source").WithPath("path")
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(encoded), `{"code":"legacy","message":"message","source":"source","path":"path","severity":"info"}`; got != want {
+		t.Fatalf("legacy JSON changed: %s", got)
+	}
+	if got, want := legacy.Text(), "legacy: message: path"; got != want {
+		t.Fatalf("legacy Text changed: %q", got)
+	}
+
+	attributes := map[string]string{"stage": "execute", "action": "command"}
+	withAttributes := legacy.WithAttributes(attributes)
+	attributes["stage"] = "mutated"
+	if got := withAttributes.Attributes["stage"]; got != "execute" {
+		t.Fatalf("WithAttributes retained caller map: %q", got)
+	}
+	if got, want := withAttributes.Text(), "legacy: message: path: action=command: stage=execute"; got != want {
+		t.Fatalf("attribute Text is not stable: %q", got)
 	}
 }
 
@@ -100,6 +126,97 @@ func TestCollectorRedactsSensitiveDiagnostics(t *testing.T) {
 	}
 	if items[0].Severity != SeverityWarning {
 		t.Fatalf("default severity = %q", items[0].Severity)
+	}
+}
+
+func TestCollectorAttributesAreBoundedSanitizedAndCopied(t *testing.T) {
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret("attribute-secret")
+	collector := NewCollector(CollectorOptions{Redactor: runtimeRedactor.Text})
+	original := map[string]string{
+		"stage":  "\x1b[31mexecute\x1b[0m",
+		"detail": "attribute-secret\x00" + string([]byte{0xff}),
+	}
+	collector.Add(New("hook", SeverityWarning, "safe").WithAttributes(original))
+	original["stage"] = "mutated"
+
+	items := collector.List()
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+	if got := items[0].Attributes["stage"]; got != "execute" {
+		t.Fatalf("stage was not sanitized/copied: %q", got)
+	}
+	if got := items[0].Attributes["detail"]; strings.Contains(got, "attribute-secret") || !utf8.ValidString(got) {
+		t.Fatalf("detail was not redacted/sanitized: %q", got)
+	}
+	items[0].Attributes["stage"] = "list-mutated"
+	if got := collector.List()[0].Attributes["stage"]; got != "execute" {
+		t.Fatalf("List returned mutable attributes: %q", got)
+	}
+	if !strings.Contains(collector.List()[0].Text(), "detail=[redacted]") {
+		t.Fatalf("Text did not include safe attributes: %q", collector.List()[0].Text())
+	}
+}
+
+func TestCollectorAttributesDropsWholeMapAtAnyBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		attributes map[string]string
+	}{
+		{name: "count", attributes: func() map[string]string {
+			values := map[string]string{}
+			for index := 0; index < MaxDiagnosticAttributes+1; index++ {
+				values[string(rune('a'+index))] = "value"
+			}
+			return values
+		}()},
+		{name: "key", attributes: map[string]string{strings.Repeat("k", MaxDiagnosticAttributeKeyBytes+1): "value"}},
+		{name: "value", attributes: map[string]string{"key": strings.Repeat("v", MaxDiagnosticAttributeValueBytes+1)}},
+		{name: "total", attributes: func() map[string]string {
+			values := map[string]string{}
+			for index := 0; index < MaxDiagnosticAttributes; index++ {
+				values[strings.Repeat(string(rune('a'+index)), MaxDiagnosticAttributeKeyBytes)] = strings.Repeat("v", MaxDiagnosticAttributeValueBytes)
+			}
+			return values
+		}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			collector := NewCollector(CollectorOptions{})
+			collector.Add(New("base", SeverityWarning, "retained").WithAttributes(test.attributes))
+			items := collector.List()
+			if len(items) != 1 || items[0].Code != "base" || items[0].Message != "retained" {
+				t.Fatalf("base diagnostic was not retained: %#v", items)
+			}
+			if items[0].Attributes != nil {
+				t.Fatalf("over-limit attributes were partially retained: %#v", items[0].Attributes)
+			}
+		})
+	}
+}
+
+func TestCollectorAttributesConcurrentAddAndList(t *testing.T) {
+	collector := NewCollector(CollectorOptions{Limit: 500})
+	var wait sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				collector.Add(New("concurrent", SeverityInfo, "message").WithAttributes(map[string]string{"stage": "execute"}))
+				items := collector.List()
+				if len(items) > 0 {
+					items[0].Attributes["stage"] = "caller mutation"
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	for _, item := range collector.List() {
+		if item.Attributes["stage"] != "execute" {
+			t.Fatalf("collector state was mutated: %#v", item.Attributes)
+		}
 	}
 }
 

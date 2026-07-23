@@ -127,20 +127,41 @@ func TestMemoryCommandsAreHandledLocally(t *testing.T) {
 	}
 }
 
-func TestModelTracksRequestSessionLifecycle(t *testing.T) {
-	cancelled := false
-	model := Model{streaming: true, request: &RequestSession{Cancel: func() { cancelled = true }}, input: tui.NewInput("")}
-	updated, _ := model.Update(keyMsg("esc"))
-	model = updated.(Model)
-	if !cancelled || model.request != nil || model.streaming || model.status.Streaming || !model.input.Text.Focused() {
-		t.Fatalf("request was not cancelled and cleared: cancelled=%v model=%#v", cancelled, model)
+func TestCancelWaitsForTurnEnd(t *testing.T) {
+	cancelled := 0
+	confirmation := &Event{Confirmation: &events.ToolConfirmationRequest{CallID: "call"}}
+	model := Model{
+		screen:       screenChat,
+		streaming:    true,
+		request:      &RequestSession{Cancel: func() { cancelled++ }},
+		input:        tui.NewInput(""),
+		confirmation: confirmation,
+		status:       tui.Status{Streaming: true, WaitingConfirmation: true, RequestModel: "model"},
 	}
 
-	model = Model{streaming: true, request: &RequestSession{Cancel: func() {}}, input: tui.NewInput("")}
-	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	updated, cmd := model.Update(keyMsg("esc"))
 	model = updated.(Model)
-	if model.request != nil || model.streaming || model.status.Streaming {
-		t.Fatalf("done did not clear request session: %#v", model)
+	if cmd != nil || cancelled != 1 || model.request == nil || !model.streaming || !model.status.Streaming {
+		t.Fatalf("cancel cleared the request before stream close: cancelled=%d request=%p streaming=%t", cancelled, model.request, model.streaming)
+	}
+	if model.confirmation != confirmation || !model.status.WaitingConfirmation || model.input.Text.Focused() {
+		t.Fatalf("cancel changed confirmation/input before turn cleanup: confirmation=%p status=%#v", model.confirmation, model.status)
+	}
+	updated, cmd = model.Update(keyMsg("q"))
+	model = updated.(Model)
+	if cmd != nil || cancelled != 1 || model.request == nil {
+		t.Fatalf("repeated cancel quit early or invoked cancel twice: cancelled=%d request=%p cmd=%v", cancelled, model.request, cmd)
+	}
+
+	updated, cmd = model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	model = updated.(Model)
+	if cmd == nil || model.request == nil || !model.streaming {
+		t.Fatalf("terminal event cleared request before channel close: request=%p streaming=%t cmd=%v", model.request, model.streaming, cmd)
+	}
+	updated, cmd = model.Update(cmd())
+	model = updated.(Model)
+	if cmd != nil || model.request != nil || model.streaming || model.status.Streaming || model.status.WaitingConfirmation || model.confirmation != nil || !model.input.Text.Focused() {
+		t.Fatalf("stream close did not finish request cleanup: %#v", model.status)
 	}
 }
 
@@ -173,8 +194,9 @@ func TestTransientEventLifecycle(t *testing.T) {
 	if strings.Contains(model.messages.View(), "temporary") || strings.Contains(model.messages.View(), "● Read") || !strings.Contains(model.messages.View(), "final summary") {
 		t.Fatalf("final summary did not replace transient trace: %q", model.messages.View())
 	}
-	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
+	updated, cmd := model.Update(eventMsg{event: events.Event{Type: events.Done}, events: closedEvents()})
 	model = updated.(Model)
+	model = finishClosedEventStream(t, model, cmd)
 	if model.request != nil || model.streaming || model.status.RequestModel != "" || model.status.ActiveSkills != "" {
 		t.Fatalf("done did not restore request status: %#v", model)
 	}
@@ -197,8 +219,12 @@ func TestTransientFailureAndCancelCleanup(t *testing.T) {
 	model := newModel(func() {})
 	updated, _ := model.Update(eventMsg{event: events.Event{Type: events.TextDelta, Text: "temporary", Transient: true, IndependentID: "run-1"}, events: closedEvents()})
 	model = updated.(Model)
-	updated, _ = model.Update(eventMsg{event: events.Event{Type: events.Error, Err: errors.New("failed")}, events: closedEvents()})
+	updated, cmd := model.Update(eventMsg{event: events.Event{Type: events.Error, Err: errors.New("failed")}, events: closedEvents()})
 	model = updated.(Model)
+	if !strings.Contains(model.messages.View(), "temporary") || model.request == nil {
+		t.Fatalf("terminal error cleared transient state before stream close: messages=%q request=%p", model.messages.View(), model.request)
+	}
+	model = finishClosedEventStream(t, model, cmd)
 	if strings.Contains(model.messages.View(), "temporary") || model.request != nil || model.status.RequestModel != "" || model.status.Error == nil {
 		t.Fatalf("failure retained transient state: messages=%q model=%#v", model.messages.View(), model)
 	}
@@ -209,8 +235,13 @@ func TestTransientFailureAndCancelCleanup(t *testing.T) {
 	model = updated.(Model)
 	updated, _ = model.Update(keyMsg("esc"))
 	model = updated.(Model)
-	if !cancelled || strings.Contains(model.messages.View(), "cancel me") || model.request != nil || model.status.RequestModel != "" {
-		t.Fatalf("cancel retained transient state: cancelled=%t messages=%q model=%#v", cancelled, model.messages.View(), model)
+	if !cancelled || !strings.Contains(model.messages.View(), "cancel me") || model.request == nil || model.status.RequestModel == "" {
+		t.Fatalf("cancel cleared transient state too early: cancelled=%t messages=%q request=%p", cancelled, model.messages.View(), model.request)
+	}
+	updated, _ = model.Update(eventStreamClosedMsg{})
+	model = updated.(Model)
+	if strings.Contains(model.messages.View(), "cancel me") || model.request != nil || model.status.RequestModel != "" {
+		t.Fatalf("stream close retained canceled state: messages=%q model=%#v", model.messages.View(), model)
 	}
 }
 
@@ -246,7 +277,7 @@ func TestStreamingKeysCancelBeforeQuit(t *testing.T) {
 	if cmd != nil || closer.closed {
 		t.Fatalf("ctrl+c during streaming should cancel, not quit: cmd=%v closer=%#v", cmd, closer)
 	}
-	if !cancelled || model.streaming || model.request != nil || !strings.Contains(model.status.Notice, "取消") {
+	if !cancelled || !model.streaming || model.request == nil || !strings.Contains(model.status.Notice, "取消") {
 		t.Fatalf("streaming ctrl+c did not cancel request: cancelled=%v model=%#v", cancelled, model)
 	}
 }
@@ -361,7 +392,7 @@ func TestPermanentConfirmationKeyIgnoredWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestQuitClosesDepsCloser(t *testing.T) {
+func TestQuitDefersProcessResourceClose(t *testing.T) {
 	closer := &fakeCloser{}
 	model := Model{deps: Deps{Closer: closer}}
 	updated, cmd := model.Update(keyMsg("q"))
@@ -369,24 +400,32 @@ func TestQuitClosesDepsCloser(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected quit command")
 	}
-	if !closer.closed {
-		t.Fatal("expected closer to be called")
+	if closer.closed {
+		t.Fatal("quit key must not close process-owned resources")
 	}
 }
 
-func TestCloseReportsMCPStatusAndCloseError(t *testing.T) {
+func TestAppCloseDoesNotOwnMCPCloser(t *testing.T) {
 	closer := &fakeCloser{status: "1 ready, 1 failed", err: errors.New("close failed")}
 	model := Model{deps: Deps{Closer: closer, MCPStatus: closer}}
-	model.close()
-	if !closer.closed {
-		t.Fatal("expected closer to be called")
+	if err := model.Close(context.Background()); err != nil {
+		t.Fatalf("process-owned closer error leaked into App.Close: %v", err)
 	}
-	if model.status.MCP != "1 ready, 1 failed" {
-		t.Fatalf("expected MCP status to refresh, got %q", model.status.MCP)
+	if closer.closed {
+		t.Fatal("App.Close closed the process-owned MCP resource")
 	}
-	if model.status.Error == nil || model.status.Error.Error() != "MCP close: close failed" {
-		t.Fatalf("expected close error to be visible, got %v", model.status.Error)
+}
+
+func finishClosedEventStream(t *testing.T, model Model, cmd tea.Cmd) Model {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("terminal event did not continue listening for stream close")
 	}
+	updated, next := model.Update(cmd())
+	if next != nil {
+		t.Fatalf("stream close unexpectedly scheduled another command: %v", next)
+	}
+	return updated.(Model)
 }
 
 func submitMemoryCommand(t *testing.T, model Model, command string) Model {

@@ -6,15 +6,41 @@ import (
 )
 
 func Build(req BuildRequest) Bundle {
-	stable := stableBlocks(req.OptionalStableSections)
+	fixed := fixedStableBlocks()
+	optional := optionalStableBlocks(req.OptionalStableSections)
+	stable := make([]Block, 0, len(fixed)+len(optional)+1)
+	stable = append(stable, fixed...)
+	stable = append(stable, optional...)
 	if catalog := strings.TrimSpace(req.SkillCatalog); catalog != "" {
 		stable = append(stable, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true})
 	}
-	return Bundle{StableBlocks: stable, DynamicBlocks: DynamicBlocks(req)}
+	dynamic := DynamicBlocks(req)
+	bundle := Bundle{StableBlocks: stable, DynamicBlocks: dynamic}
+
+	hooks := hookBlocks(req.HookBlocks)
+	if len(hooks) == 0 {
+		return bundle
+	}
+	ordered := make([]Block, 0, len(fixed)+len(hooks)+len(optional)+1+len(dynamic))
+	ordered = append(ordered, fixed...)
+	ordered = append(ordered, hooks...)
+	ordered = append(ordered, optional...)
+	if catalog := strings.TrimSpace(req.SkillCatalog); catalog != "" {
+		ordered = append(ordered, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true})
+	}
+	ordered = append(ordered, dynamic...)
+	bundle.OrderedBlocks = ordered
+	bundle.SystemBreakpointName = fixed[len(fixed)-1].Name
+	return bundle
 }
 
 func StableSections(optional []Section) []Section {
 	sections := append([]Section{}, fixedStableSections()...)
+	sections = append(sections, normalizedOptionalStableSections(optional)...)
+	return sections
+}
+
+func normalizedOptionalStableSections(optional []Section) []Section {
 	seen := map[string]bool{}
 	filtered := make([]Section, 0, len(optional))
 	for _, section := range optional {
@@ -32,12 +58,18 @@ func StableSections(optional []Section) []Section {
 		}
 		return filtered[i].Priority < filtered[j].Priority
 	})
-	sections = append(sections, filtered...)
-	return sections
+	return filtered
 }
 
-func stableBlocks(optional []Section) []Block {
-	sections := StableSections(optional)
+func fixedStableBlocks() []Block {
+	return sectionBlocks(fixedStableSections())
+}
+
+func optionalStableBlocks(optional []Section) []Block {
+	return sectionBlocks(normalizedOptionalStableSections(optional))
+}
+
+func sectionBlocks(sections []Section) []Block {
 	blocks := make([]Block, 0, len(sections))
 	for _, section := range sections {
 		content := strings.TrimSpace(section.Content)
@@ -47,6 +79,20 @@ func stableBlocks(optional []Section) []Block {
 		blocks = append(blocks, Block{Name: section.Name, Content: content, Stable: true})
 	}
 	return blocks
+}
+
+func hookBlocks(blocks []Block) []Block {
+	result := make([]Block, 0, len(blocks))
+	for _, block := range blocks {
+		block.Name = strings.TrimSpace(block.Name)
+		block.Content = strings.TrimSpace(block.Content)
+		if block.Content == "" {
+			continue
+		}
+		block.Stable = false
+		result = append(result, block)
+	}
+	return result
 }
 
 func JoinBlocks(blocks []Block) string {

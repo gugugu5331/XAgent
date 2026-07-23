@@ -90,6 +90,7 @@ const (
 	ErrMultipleToolCallsUnsupported = "multiple_tool_calls_not_supported"
 	ErrCommandFailed                = "command_failed"
 	ErrPermissionDenied             = "permission_denied"
+	ErrHookDenied                   = "hook_denied"
 	ErrNoResults                    = "no_results"
 	ErrInternalRoutingRequired      = "internal_routing_required"
 )

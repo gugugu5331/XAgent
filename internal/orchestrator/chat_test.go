@@ -531,7 +531,7 @@ func TestStopRunWithErrorRedactsRuntimeSecrets(t *testing.T) {
 	runtimeRedactor.RegisterSecret(secret)
 	orch := NewWithOptions(OrchestratorOptions{Redact: runtimeRedactor.Text, RedactionLookbehind: runtimeRedactor.MaxSecretBytes()})
 	out := make(chan events.Event, 2)
-	orch.stopRunWithError(
+	terminalErr := orch.stopRunWithError(
 		context.Background(),
 		conversation.NewConversation("redacted-error", time.Now()),
 		&executionState{profile: skill.ExecutionProfile{}},
@@ -542,6 +542,7 @@ func TestStopRunWithErrorRedactsRuntimeSecrets(t *testing.T) {
 		"provider failed: "+secret,
 		fmt.Errorf("provider failed: %s", secret),
 	)
+	orch.emitTerminalEvent(context.Background(), out, RunResult{Reason: StopReasonProviderError, Err: terminalErr})
 	close(out)
 	var sawProgress, sawError bool
 	for event := range out {

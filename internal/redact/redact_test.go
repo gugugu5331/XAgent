@@ -3,6 +3,7 @@ package redact
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -130,6 +131,64 @@ func TestRuntimeRedactorReplacesOverlappingSecretsLongestFirst(t *testing.T) {
 	assertNoLeak(t, got, []string{"abc", "def", "abcdef"})
 	if !strings.Contains(got, "[redacted]") {
 		t.Fatalf("overlapping secret was not replaced: %q", got)
+	}
+}
+
+func TestRuntimeRedactorShortSecretsMatchWholeTokensAndFieldValues(t *testing.T) {
+	redactor := NewRuntimeRedactor()
+	redactor.RegisterSecret("")
+	redactor.RegisterSecret("x")
+	redactor.RegisterSecret("ab")
+	redactor.RegisterSecret("abc")
+
+	got := redactor.Text("x ab abc xagent alphabet abcdef suffix-x punctuation(ab)")
+	for _, leaked := range []string{" x ", " ab ", " abc "} {
+		if strings.Contains(" "+got+" ", leaked) {
+			t.Fatalf("whole short token %q leaked: %q", leaked, got)
+		}
+	}
+	for _, ordinary := range []string{"xagent", "alphabet", "abcdef"} {
+		if !strings.Contains(got, ordinary) {
+			t.Fatalf("short secret damaged ordinary text %q: %q", ordinary, got)
+		}
+	}
+	if strings.Contains(got, "suffix-x") || strings.Contains(got, "(ab)") {
+		t.Fatalf("punctuation-delimited token was not redacted: %q", got)
+	}
+	if got := redactor.Text("x"); got != marker {
+		t.Fatalf("complete field value = %q, want marker", got)
+	}
+	redactedMap := redactor.Map(map[string]any{"ordinary": "x", "api_key": "not-registered"})
+	if redactedMap["ordinary"] != marker || redactedMap["api_key"] != marker {
+		t.Fatalf("field values were not safely redacted: %#v", redactedMap)
+	}
+	if got := redactor.MaxSecretBytes(); got != len("abc") {
+		t.Fatalf("MaxSecretBytes() = %d, want %d", got, len("abc"))
+	}
+}
+
+func TestRuntimeRedactorSecretsConcurrentRegistrationAndUse(t *testing.T) {
+	redactor := NewRuntimeRedactor()
+	secrets := []string{"a", "bb", "long-secret", "long-secret", ""}
+	var wait sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				for _, secret := range secrets {
+					redactor.RegisterSecret(secret)
+				}
+				_ = redactor.Text("a bb long-secret ordinary")
+				_ = redactor.MaxSecretBytes()
+			}
+		}()
+	}
+	wait.Wait()
+	got := redactor.Text("a bb long-secret ordinary")
+	assertNoLeak(t, got, []string{" a ", " bb ", "long-secret"})
+	if !strings.Contains(got, "ordinary") {
+		t.Fatalf("ordinary text was damaged: %q", got)
 	}
 }
 

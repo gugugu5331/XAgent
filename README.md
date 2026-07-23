@@ -15,6 +15,7 @@ XAgent 是一个使用 Go 构建的终端 AI 编程助手。它在交互式 TUI 
 - 会话恢复：使用 JSONL 持久化会话，可跳过损坏记录并恢复未正常结束的会话。
 - 指令与记忆：加载项目级/用户级指令，维护可检索的长期记忆。
 - 可复用 Skill：按需加载 Markdown SOP，支持共享会话、独立执行、工具白名单和动态斜杠命令。
+- 生命周期 Hook：用声明式事件、条件和固定动作自动执行 Shell、HTTP、Prompt 注入或预留的 SubAgent 流程。
 - 安全诊断：对 API Key、Token 等敏感内容进行运行时脱敏。
 
 ## 环境要求
@@ -194,6 +195,46 @@ shared Skill 会立即执行并保持活动，后续每轮都携带其 SOP。多
 
 首版不提供 Skill 市场、远程安装、版本/依赖管理、自定义权限规则、底层工具注册、命令别名、逐个卸载或后台文件监听。
 
+## 生命周期 Hook
+
+Hook 用“事件 + 可选条件 + 动作”描述固定的自动化流程。XAgent 启动时按固定顺序读取两个文件：
+
+1. 用户级：`~/.config/xagent/hooks.yaml`
+2. 项目级：`<项目根目录>/.xagent/hooks.yaml`
+
+两个文件中的有效规则会按“用户级在前、项目级在后”累加执行，不做同名覆盖。文件必须使用严格的 schema v1；未知字段、无效枚举、重复 YAML key、超限内容或不合法组合都会让启动立即失败。修改 Hook 后必须重启 XAgent，本版本不支持热更新。
+
+最小配置如下，完整的四类动作与执行控制示例见 [`docs/hook-system/example.yaml`](docs/hook-system/example.yaml)：
+
+```yaml
+version: 1
+hooks:
+  - event: tool_before
+    if:
+      all:
+        - field: tool.name
+          match: exact
+          value: Bash
+    timeout: 3s
+    action:
+      type: command
+      command: ./scripts/check-command.sh
+      decision: true
+```
+
+生命周期事件覆盖 `system_*`、`session_*`、`turn_*`、`message_*`、`tool_*` 和 `compact_*`。条件组必须且只能选择 `all` 或 `any`；每个条件支持 `exact`、`glob`、`regex` 以及 `negate` 反向匹配。规则可用 `once` 限制为本进程只成功运行一次，Command、HTTP 和预留 SubAgent 动作可设置 Go duration 格式的 `timeout`，非拦截动作还可设 `async: true` 在受限队列中后台执行。
+
+动作类型及边界：
+
+- `command`：在项目根目录执行固定 Shell 命令；`tool_before` 的同步动作可启用 `decision`，只接受规范的 stdout allow/deny 响应。
+- `http`：向启动时已确定的公网 HTTPS 地址发送请求，可选择携带经过边界限制的事件 JSON；同步 `tool_before` 同样可启用 `decision`。
+- `prompt`：注入固定或受限占位符生成的系统提示词；`scope` 可为下一次请求的 `next`、当前轮次的 `turn` 或当前会话的 `session`，可用范围取决于事件。
+- `subagent`：当前版本只校验配置并记录占位诊断，不会真的启动子 Agent。
+
+> **安全警告：项目 Hook 属于受信代码。** Hook 的 Shell 与 HTTP 动作可以在普通工具权限确认前产生副作用，HTTP 还可能把事件内容外传；动态 system Prompt 存在 Prompt injection 风险。动作发生技术失败时系统采用 **fail-open**，只写安全诊断并继续 Agent 主流程，因此不要把关键拒绝策略只放在 Hook 中。打开不可信项目之前，务必先检查 `.xagent/hooks.yaml` 及其调用的脚本和网络目标。
+
+同步规则按声明顺序执行。单条 Command、HTTP 或 SubAgent 的 `timeout` 最长可配置为 10 分钟，两个文件又可累加大量规则，因此恶意或错误配置可能让一次 dispatch 长时间阻塞。本版本没有 aggregate timeout，也没有 Hook 热更新；检查配置后需要重启。
+
 ## 权限模式
 
 在 `config.yaml` 中设置：
@@ -253,6 +294,7 @@ mcp:
 | --- | --- |
 | `config.yaml` | 项目配置，已被 Git 忽略 |
 | `.xagent/skills/` | 项目级 Skill 文件和能力包 |
+| `.xagent/hooks.yaml` | 项目级生命周期 Hook（受信代码，可选择提交） |
 | `.xagent/conversations/` | 上下文管理产生的外置工具结果 |
 | `.mewcode/sessions/` | 可恢复的 JSONL 会话数据 |
 | `.mewcode/memory/` | 项目级长期记忆与索引 |
@@ -277,6 +319,7 @@ internal/contextmgr/    上下文压缩和大型结果外置
 internal/instructions/  项目/用户指令加载
 internal/memory/        长期记忆管理
 internal/skill/         Skill 发现、快照、活动状态与执行配置
+internal/hook/          生命周期 Hook 加载、校验、执行与异步收束
 internal/tui/           终端界面组件
 docs/                   功能规格、计划与验收记录
 ```

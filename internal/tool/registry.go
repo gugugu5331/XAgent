@@ -81,6 +81,9 @@ func (r *Registry) Register(tool Tool) error {
 }
 
 func (r *Registry) Get(name string) (Tool, bool) {
+	if r == nil {
+		return nil, false
+	}
 	tool, ok := r.tools[name]
 	return tool, ok
 }

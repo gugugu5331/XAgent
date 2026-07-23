@@ -2,9 +2,8 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
@@ -49,44 +48,38 @@ func (o *Orchestrator) PrepareSkill(invocation skill.Invocation, activity *skill
 	}, nil
 }
 
-type loadSkillArguments struct {
-	Name string `json:"name"`
-	Args string `json:"args"`
-}
-
-func parseLoadSkillCall(call tool.Call) (skill.Invocation, error) {
+func parseLoadSkillCall(validated tool.ValidatedCall) (skill.Invocation, error) {
+	call := validated.Call
 	if len(call.ArgumentsJSON) > skill.DefaultMaxArgsBytes*8+2048 {
 		return skill.Invocation{}, fmt.Errorf("load_skill 参数超过大小限制")
 	}
-	decoder := json.NewDecoder(strings.NewReader(call.ArgumentsJSON))
-	decoder.DisallowUnknownFields()
-	var args loadSkillArguments
-	if err := decoder.Decode(&args); err != nil {
-		return skill.Invocation{}, fmt.Errorf("load_skill 参数无效: %w", err)
+	for key := range validated.Arguments {
+		if key != "name" && key != "args" {
+			return skill.Invocation{}, fmt.Errorf("load_skill 参数无效: 未知字段 %q", key)
+		}
 	}
-	if err := ensureJSONEOF(decoder); err != nil {
-		return skill.Invocation{}, fmt.Errorf("load_skill 参数无效: %w", err)
+	name, ok := validated.Arguments["name"].(string)
+	if !ok {
+		return skill.Invocation{}, fmt.Errorf("load_skill.name 必须是字符串")
 	}
-	if strings.TrimSpace(args.Name) == "" {
+	args := ""
+	if rawArgs, exists := validated.Arguments["args"]; exists {
+		var argsOK bool
+		args, argsOK = rawArgs.(string)
+		if !argsOK {
+			return skill.Invocation{}, fmt.Errorf("load_skill.args 必须是字符串")
+		}
+	}
+	if strings.TrimSpace(name) == "" {
 		return skill.Invocation{}, fmt.Errorf("load_skill.name 不能为空")
 	}
-	if len(strings.TrimSpace(args.Name)) > skill.MaxSkillNameLength {
+	if len(strings.TrimSpace(name)) > skill.MaxSkillNameLength {
 		return skill.Invocation{}, fmt.Errorf("load_skill.name 超过大小限制")
 	}
-	if len(args.Args) > skill.DefaultMaxArgsBytes {
+	if len(args) > skill.DefaultMaxArgsBytes {
 		return skill.Invocation{}, fmt.Errorf("load_skill.args 超过大小限制")
 	}
-	return skill.Invocation{Name: args.Name, Args: args.Args, Raw: call.ArgumentsJSON, Origin: skill.OriginAgentTool}, nil
-}
-
-func ensureJSONEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); err == io.EOF {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return fmt.Errorf("包含多余 JSON 值")
+	return skill.Invocation{Name: name, Args: args, Raw: call.ArgumentsJSON, Origin: skill.OriginAgentTool}, nil
 }
 
 func (o *Orchestrator) handleSkillToolCalls(
@@ -99,7 +92,7 @@ func (o *Orchestrator) handleSkillToolCalls(
 	calls []tool.Call,
 	out chan<- events.Event,
 ) (terminal *RunResult, stopReason StopReason, unknownTools int, fatal error) {
-	registry, err := o.registryForProfile(req.Mode, iterationProfile)
+	registry, err := o.preflightRegistryForProfile(req.Mode, iterationProfile)
 	if err != nil {
 		return nil, StopReasonProviderError, 0, err
 	}
@@ -109,7 +102,7 @@ func (o *Orchestrator) handleSkillToolCalls(
 	}
 	for index, call := range calls {
 		if call.Name != tool.LoadSkillToolName {
-			executions, reason, err := o.executeToolBatchesWithRegistry(execCtx, req.Mode, registry, []ToolBatch{{Calls: []indexedToolCall{{Call: call, Index: index}}}}, out)
+			executions, reason, err := o.executeToolBatchesWithRegistryAndRef(execCtx, req.Mode, registry, []ToolBatch{{Calls: []indexedToolCall{{Call: call, Index: index}}}}, state.ref, out)
 			for _, execution := range executions {
 				o.appendToolMessages(conv, execution.Call, execution.Result)
 			}
@@ -119,21 +112,33 @@ func (o *Orchestrator) handleSkillToolCalls(
 			}
 			continue
 		}
-		invocation, err := parseLoadSkillCall(call)
+		execution := o.prepareToolExecutionWithRegistryAndRef(execCtx, req.Mode, registry, indexedToolCall{Call: call, Index: index}, state.ref, out)
+		if execution.Err != nil {
+			return nil, execution.StopReason, unknownTools, execution.Err
+		}
+		if execution.Result.CallID != "" {
+			o.appendToolMessages(conv, call, execution.Result)
+			unknownTools += countUnknownToolResults([]ToolExecution{execution})
+			continue
+		}
+		handlerStarted := time.Now()
+		invocation, err := parseLoadSkillCall(execution.Validated)
 		if err != nil {
 			result := o.loadSkillFailure(call, err)
+			execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 			o.appendToolMessages(conv, call, result)
-			if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-				return nil, StopReasonCancelled, unknownTools, ctx.Err()
+			if execution.Err != nil {
+				return nil, execution.StopReason, unknownTools, execution.Err
 			}
 			continue
 		}
 		prepared, err := o.PrepareSkill(invocation, state.activity)
 		if err != nil {
 			result := o.loadSkillFailure(call, err)
+			execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 			o.appendToolMessages(conv, call, result)
-			if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-				return nil, StopReasonCancelled, unknownTools, ctx.Err()
+			if execution.Err != nil {
+				return nil, execution.StopReason, unknownTools, execution.Err
 			}
 			continue
 		}
@@ -143,9 +148,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 					prepared.Activity.Clear()
 				}
 				result := o.loadSkillFailure(call, fmt.Errorf("独立 Skill 必须作为本轮唯一工具调用"))
+				execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 				o.appendToolMessages(conv, call, result)
-				if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-					return nil, StopReasonCancelled, unknownTools, ctx.Err()
+				if execution.Err != nil {
+					return nil, execution.StopReason, unknownTools, execution.Err
 				}
 				continue
 			}
@@ -154,9 +160,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 					prepared.Activity.Clear()
 				}
 				result := o.loadSkillFailure(call, fmt.Errorf("独立 Skill 内不能再次启动独立 Skill"))
+				execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 				o.appendToolMessages(conv, call, result)
-				if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-					return nil, StopReasonCancelled, unknownTools, ctx.Err()
+				if execution.Err != nil {
+					return nil, execution.StopReason, unknownTools, execution.Err
 				}
 				continue
 			}
@@ -165,22 +172,34 @@ func (o *Orchestrator) handleSkillToolCalls(
 				if prepared.Activity != nil {
 					prepared.Activity.Clear()
 				}
+				cancelResult := o.loadSkillFailure(call, ctx.Err())
+				o.completeSystemToolExecution(ctx, execution, cancelResult, handlerStarted, out)
 				cancelled := finishRunResult(RunResult{}, time.Now(), StopReasonCancelled)
 				return &cancelled, StopReasonCancelled, unknownTools, ctx.Err()
 			}
 			result, err := o.runAgentTriggeredIndependent(ctx, conv, req, state, prepared, out)
 			if err != nil {
+				toolResult := o.loadSkillFailure(call, err)
+				o.completeSystemToolExecution(ctx, execution, toolResult, handlerStarted, out)
 				return &result, result.Reason, unknownTools, err
+			}
+			toolResult := loadSkillSuccess(call, prepared.Activated.Name)
+			execution = o.completeSystemToolExecution(ctx, execution, toolResult, handlerStarted, out)
+			if execution.Err != nil {
+				return &result, StopReasonCancelled, unknownTools, execution.Err
 			}
 			return &result, result.Reason, unknownTools, nil
 		}
 		if err := o.refreshExecutionProfile(req.Mode, state); err != nil {
+			result := o.loadSkillFailure(call, err)
+			o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 			return nil, StopReasonProviderError, unknownTools, err
 		}
 		result := loadSkillSuccess(call, prepared.Activated.Name)
+		execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 		o.appendToolMessages(conv, call, result)
-		if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-			return nil, StopReasonCancelled, unknownTools, ctx.Err()
+		if execution.Err != nil {
+			return nil, execution.StopReason, unknownTools, execution.Err
 		}
 	}
 	return nil, "", unknownTools, nil
@@ -207,13 +226,22 @@ func loadSkillSuccess(call tool.Call, name string) tool.Result {
 }
 
 func (o *Orchestrator) loadSkillFailure(call tool.Call, err error) tool.Result {
+	if err == nil {
+		err = context.Canceled
+	}
 	message := o.redactText(err.Error())
+	status := tool.StatusError
+	code := tool.ErrInvalidArguments
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		status = tool.StatusTimeout
+		code = tool.ErrTimeout
+	}
 	return tool.Result{
 		CallID:  call.ID,
 		Name:    call.Name,
-		Status:  tool.StatusError,
+		Status:  status,
 		Summary: "Skill 加载失败",
 		Content: message,
-		Error:   &tool.Error{Code: tool.ErrInvalidArguments, Message: message, Recoverable: true},
+		Error:   &tool.Error{Code: code, Message: message, Recoverable: true},
 	}
 }

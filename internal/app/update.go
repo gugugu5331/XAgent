@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -20,20 +21,19 @@ func (m *Model) sendConfirmation(action events.PermissionAction, allowed bool) {
 }
 
 func (m *Model) cancelRequest(notice string) {
-	if m.request != nil && m.request.Cancel != nil {
-		m.request.Cancel()
+	if m.lifecycle == nil {
+		m.lifecycle = newLifecycleState()
+		if m.request != nil {
+			m.lifecycle.begin(m.request)
+		}
 	}
-	m.clearRequestTransient()
-	m.request = nil
-	m.streaming = false
-	m.status.Streaming = false
-	m.status.WaitingConfirmation = false
-	m.status.Notice = notice
+	if !m.lifecycle.cancel() {
+		return
+	}
+	m.status.Notice = m.redactText(notice)
 	m.status.Error = nil
-	m.status.RequestModel = ""
-	m.syncSkillStatus()
-	m.input.SetEnabled(true)
-	m.confirmation = nil
+	m.status.Streaming = true
+	m.input.SetEnabled(false)
 }
 
 func parseMemoryScope(value string) (memory.Scope, error) {
@@ -96,10 +96,18 @@ func enabledText(enabled bool) string {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.lifecycle == nil {
+		m.lifecycle = newLifecycleState()
+		if m.request != nil {
+			m.lifecycle.begin(m.request)
+		}
+	}
+	request, _, _ := m.lifecycle.active()
+	m.request = request
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if m.streaming && (msg.String() == "esc" || msg.String() == "ctrl+c") {
-			m.cancelRequest("请求已取消，可继续输入")
+		if m.streaming && (msg.String() == "esc" || msg.String() == "ctrl+c" || msg.String() == "q") {
+			m.cancelRequest("正在取消请求，等待当前轮次收尾")
 			return m, nil
 		}
 		if m.confirmation == nil && m.commandMenu.Visible {
@@ -126,7 +134,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.String() {
 		case "ctrl+c", "q":
-			m.close()
 			return m, tea.Quit
 		case "y":
 			if m.confirmation != nil && m.confirmation.Confirmation != nil {
@@ -186,6 +193,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if _, ok := msg.(eventStreamClosedMsg); ok {
+		m.finishRequestAfterStream()
+		return m, nil
+	}
+
 	if eventMsg, ok := msg.(eventMsg); ok {
 		if eventMsg.event.Transient {
 			m.trackTransientID(eventMsg.event.IndependentID)
@@ -233,7 +245,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.AgentIteration = eventMsg.event.Progress.Iteration
 				m.status.AgentMaxIterations = eventMsg.event.Progress.Max
 				m.status.StopReason = eventMsg.event.Progress.StopReason
-				m.status.StopMessage = eventMsg.event.Progress.Message
+				m.status.StopMessage = m.redactText(eventMsg.event.Progress.Message)
 			}
 		case EventUsageUpdated:
 			if eventMsg.event.Usage != nil {
@@ -247,32 +259,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messages.SetMessages(m.conversation.Messages)
 			}
 		case EventDone:
-			m.clearRequestTransient()
 			m.messages.CommitAssistant()
-			m.request = nil
-			m.streaming = false
-			m.status.Streaming = false
-			m.status.WaitingConfirmation = false
-			m.status.RequestModel = ""
-			m.syncSkillStatus()
 			m.status.Duration = formatDuration(eventMsg.event.Duration)
-			m.input.SetEnabled(true)
-			m.confirmation = nil
-			return m, nil
+			m.lifecycle.markTerminal()
+			return m, listen(eventMsg.events)
 		case EventError:
-			m.clearRequestTransient()
 			m.messages.CommitAssistant()
-			m.request = nil
-			m.streaming = false
-			m.status.Streaming = false
-			m.status.WaitingConfirmation = false
-			m.status.RequestModel = ""
-			m.syncSkillStatus()
-			m.status.Error = eventMsg.event.Err
-			m.lastError = eventMsg.event.Err
-			m.input.SetEnabled(true)
-			m.confirmation = nil
-			return m, nil
+			safe := m.redactError(eventMsg.event.Err)
+			m.status.Error = safe
+			m.lastError = safe
+			m.lifecycle.markTerminal()
+			return m, listen(eventMsg.events)
 		}
 		return m, listen(eventMsg.events)
 	}
@@ -298,6 +295,9 @@ func (m *Model) trackTransientID(independentID string) {
 	request := *m.request
 	request.TransientIDs = append(append([]string(nil), m.request.TransientIDs...), independentID)
 	m.request = &request
+	if m.lifecycle != nil {
+		m.lifecycle.replace(m.request)
+	}
 }
 
 func (m *Model) clearRequestTransient() {
@@ -311,7 +311,28 @@ func (m *Model) clearRequestTransient() {
 		request := *m.request
 		request.TransientIDs = nil
 		m.request = &request
+		if m.lifecycle != nil {
+			m.lifecycle.replace(m.request)
+		}
 	}
+}
+
+func (m *Model) finishRequestAfterStream() {
+	if m.orchestrator != nil {
+		_ = m.orchestrator.WaitIdle(context.Background())
+	}
+	m.clearRequestTransient()
+	if m.lifecycle != nil {
+		m.lifecycle.finish()
+	}
+	m.request = nil
+	m.streaming = false
+	m.status.Streaming = false
+	m.status.WaitingConfirmation = false
+	m.status.RequestModel = ""
+	m.syncSkillStatus()
+	m.input.SetEnabled(true)
+	m.confirmation = nil
 }
 
 func compactNotice(changed bool, externalized int, summarized bool) string {

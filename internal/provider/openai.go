@@ -32,6 +32,15 @@ func (p *OpenAIProvider) Name() string {
 }
 
 func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
+	attempt := newRequestAttempt(req.Observer)
+	ctx = attempt.traceContext(ctx)
+	returnedStream := false
+	defer func() {
+		if !returnedStream {
+			attempt.finish()
+		}
+	}()
+
 	out := make(chan StreamEvent)
 	body, err := json.Marshal(openAIRequest{
 		Model:         requestModel(req.Model, p.cfg.Model),
@@ -60,6 +69,9 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI 请求失败: %w", err)
 	}
+	// A response proves the request crossed the transport boundary even when a
+	// custom RoundTripper does not expose net/http trace callbacks.
+	attempt.markSent()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -69,9 +81,11 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 	go func() {
 		defer close(out)
 		defer resp.Body.Close()
+		defer attempt.finish()
 		calls := map[int]*openAIToolCallState{}
 		for event := range ReadSSE(resp.Body) {
 			if event.Data == "[DONE]" {
+				attempt.finish()
 				if len(calls) > 0 {
 					emitStreamEvent(ctx, out, newToolCallsEvent(openAIToolCalls(calls)))
 					return
@@ -81,6 +95,7 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 			}
 			var chunk openAIChunk
 			if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
+				attempt.finish()
 				emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventError, Err: fmt.Errorf("解析 OpenAI 流式响应失败: %w", err)})
 				return
 			}
@@ -112,12 +127,14 @@ func (p *OpenAIProvider) StreamChat(ctx context.Context, req ChatRequest) (<-cha
 					}
 				}
 				if choice.FinishReason != "" && choice.FinishReason != "tool_calls" {
+					attempt.finish()
 					emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventDone})
 					return
 				}
 			}
 		}
 	}()
+	returnedStream = true
 	return out, nil
 }
 
@@ -221,9 +238,16 @@ func openAITools(req ChatRequest) []tool.OpenAIDefinition {
 }
 
 func toOpenAIMessages(req ChatRequest) []openAIMessage {
-	messages := make([]openAIMessage, 0, len(req.Messages)+1)
-	system := joinedSystemBlocks(req)
-	if system != "" {
+	systemCount := 1
+	if usesOrderedSystem(req) {
+		systemCount = len(req.System)
+	}
+	messages := make([]openAIMessage, 0, len(req.Messages)+systemCount)
+	if usesOrderedSystem(req) {
+		for _, block := range systemBlocks(req) {
+			messages = append(messages, openAIMessage{Role: "system", Content: block.Content})
+		}
+	} else if system := joinedSystemBlocks(req); system != "" {
 		messages = append(messages, openAIMessage{Role: "system", Content: system})
 	}
 	for _, message := range req.Messages {

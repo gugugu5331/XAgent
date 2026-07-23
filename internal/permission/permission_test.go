@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -142,6 +143,49 @@ func TestDecodeRuleFileRejectsUnknownFields(t *testing.T) {
 	_, err := DecodeRuleFile([]byte("version: 1\nrules:\n  - tool: Bash\n    pattern: git status\n    match_type: exact\n    effect: allow\n    typo: nope\n"))
 	if err == nil {
 		t.Fatal("expected unknown field error")
+	}
+}
+
+func TestPermissionYAMLRejectsHookOnlyMatchers(t *testing.T) {
+	for name, input := range map[string]string{
+		"regex":  "version: 1\nrules:\n  - tool: Bash\n    pattern: 'git .*'\n    match_type: regex\n    effect: allow\n",
+		"negate": "version: 1\nrules:\n  - tool: Bash\n    pattern: git status\n    match_type: exact\n    effect: allow\n    negate: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeRuleFile([]byte(input)); err == nil {
+				t.Fatalf("permission YAML accepted Hook-only %s syntax", name)
+			}
+		})
+	}
+}
+
+func TestPermissionMatcherCompatibility(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name    string
+		call    Call
+		rule    Rule
+		matched bool
+	}{
+		{name: "bash exact normalizes whitespace", call: Call{Name: "Bash", ArgumentsJSON: `{"command":"  git   status "}`}, rule: Rule{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact)}, matched: true},
+		{name: "exact stays case sensitive", call: Call{Name: "Bash", ArgumentsJSON: `{"command":"git Status"}`}, rule: Rule{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact)}},
+		{name: "path doublestar", call: Call{Name: "Read", ArgumentsJSON: `{"path":"internal/deep/file.go"}`}, rule: Rule{Tool: "Read", Pattern: "internal/**/*.go", MatchType: string(MatchGlob)}, matched: true},
+		{name: "glob does not become regex", call: Call{Name: "Bash", ArgumentsJSON: `{"command":"git status"}`}, rule: Rule{Tool: "Bash", Pattern: `git .+`, MatchType: string(MatchGlob)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, err := NormalizeCall(test.call, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matched, err := MatchRule(test.rule, normalized)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matched != test.matched {
+				t.Fatalf("MatchRule() = %v, want %v", matched, test.matched)
+			}
+		})
 	}
 }
 
@@ -335,6 +379,174 @@ func TestMCPFingerprintSeparatesRegisteredNameAndArguments(t *testing.T) {
 	}
 	if Fingerprint(first) == Fingerprint(third) {
 		t.Fatalf("different arguments reused fingerprint: %q", Fingerprint(first))
+	}
+}
+
+func TestNormalizeArgumentsMapPreservesNumbersAndRepresentation(t *testing.T) {
+	arguments := map[string]any{
+		"large":   json.Number("9007199254740993"),
+		"decimal": json.Number("1.2300"),
+		"nested":  map[string]any{"enabled": true},
+	}
+	call := Call{ID: "1", Name: "mcp__server__tool", ArgumentsJSON: `{"large":9007199254740993,"decimal":1.2300,"nested":{"enabled":true}}`}
+	normalized, err := NormalizeArguments(call, arguments, Context{ProjectRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := normalized.Arguments["large"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("large number changed: %#v", normalized.Arguments["large"])
+	}
+	if got, ok := normalized.Arguments["decimal"].(json.Number); !ok || got.String() != "1.2300" {
+		t.Fatalf("decimal changed: %#v", normalized.Arguments["decimal"])
+	}
+	arguments["same_map"] = true
+	if normalized.Arguments["same_map"] != true {
+		t.Fatalf("NormalizeArguments copied/reparsed the argument map")
+	}
+	legacy, err := NormalizeCall(call, normalized.ProjectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Fingerprint(legacy) != Fingerprint(normalized) {
+		t.Fatalf("map and legacy normalization fingerprints differ:\nlegacy=%s\nmap=%s", Fingerprint(legacy), Fingerprint(normalized))
+	}
+}
+
+func TestCheckHardSeparatesNonOverridableConstraints(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name       string
+		authorizer Authorizer
+		call       Call
+		wantReason DenyReason
+	}{
+		{name: "config corruption", authorizer: Authorizer{LoadErrors: []LoadError{{Err: os.ErrInvalid}}}, call: Call{Name: "Write", ArgumentsJSON: `{"path":"file.txt","content":"x"}`}, wantReason: ReasonConfigError},
+		{name: "write permission config", call: Call{Name: "Write", ArgumentsJSON: `{"path":".xagent/permissions.yaml","content":"x"}`}, wantReason: ReasonSandbox},
+		{name: "bash permission config", call: Call{Name: "Bash", ArgumentsJSON: `{"command":"sed -i x .xagent/permissions.local.yaml"}`}, wantReason: ReasonSandbox},
+		{name: "bash blacklist", call: Call{Name: "Bash", ArgumentsJSON: `{"command":"git reset --hard"}`}, wantReason: ReasonBlacklist},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			normalized, err := NormalizeCall(test.call, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision := test.authorizer.CheckHard(normalized, Context{ProjectRoot: root, PlanMode: true})
+			if decision == nil || decision.Kind != DecisionDeny || decision.Reason != test.wantReason {
+				t.Fatalf("CheckHard() = %#v, want deny %s", decision, test.wantReason)
+			}
+		})
+	}
+
+	ordinary, err := NormalizeCall(Call{Name: "Write", ArgumentsJSON: `{"path":"ordinary.txt","content":"x"}`}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := Authorizer{User: RuleLayer{Rules: []Rule{{Tool: "Write", Pattern: "ordinary.txt", MatchType: string(MatchExact), Effect: string(EffectDeny)}}}}
+	if hard := authorizer.CheckHard(ordinary, Context{ProjectRoot: root, PlanMode: true}); hard != nil {
+		t.Fatalf("CheckHard included Plan or ordinary rules: %#v", hard)
+	}
+	if decision := authorizer.DecideOrdinary(ordinary, Context{ProjectRoot: root, Mode: ModePermissive}); decision.Kind != DecisionDeny || decision.Reason != ReasonRuleDeny {
+		t.Fatalf("ordinary rule was not retained: %#v", decision)
+	}
+	if _, err := NormalizeArguments(Call{Name: "Write"}, map[string]any{"path": "../outside"}, Context{ProjectRoot: root}); err == nil {
+		t.Fatal("path sandbox did not reject outside path during normalization")
+	}
+}
+
+func TestDecideCompatibility(t *testing.T) {
+	root := t.TempDir()
+	authorizer := Authorizer{
+		User: RuleLayer{Source: Source{Kind: SourceUserRule}, Rules: []Rule{
+			{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)},
+			{Tool: "Write", Pattern: "blocked.txt", MatchType: string(MatchExact), Effect: string(EffectDeny)},
+		}},
+	}
+	for _, call := range []Call{
+		{ID: "read", Name: "Read", ArgumentsJSON: `{"path":"file.txt"}`},
+		{ID: "allow", Name: "Bash", ArgumentsJSON: `{"command":"git status"}`},
+		{ID: "deny", Name: "Write", ArgumentsJSON: `{"path":"blocked.txt","content":"x"}`},
+		{ID: "ask", Name: "Write", ArgumentsJSON: `{"path":"other.txt","content":"x"}`},
+	} {
+		context := Context{ProjectRoot: root, Mode: ModeDefault}
+		legacy := authorizer.Decide(call, context)
+		normalized, err := NormalizeCall(call, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		staged := authorizer.DecideOrdinary(normalized, context)
+		if hard := authorizer.CheckHard(normalized, context); hard != nil {
+			staged = *hard
+		}
+		if !reflect.DeepEqual(legacy, staged) {
+			t.Fatalf("legacy/staged mismatch for %s:\nlegacy=%#v\nstaged=%#v", call.ID, legacy, staged)
+		}
+	}
+}
+
+func TestResolveNormalizedUserDecisionPreservesFingerprint(t *testing.T) {
+	root := t.TempDir()
+	call := Call{ID: "large", Name: "mcp__server__tool", ArgumentsJSON: `{"large":9007199254740993}`}
+	arguments := map[string]any{"large": json.Number("9007199254740993")}
+	normalized, err := NormalizeArguments(call, arguments, Context{ProjectRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := Authorizer{}
+	decision := authorizer.ResolveNormalizedUserDecision(normalized, Context{ProjectRoot: root}, ActionAllowOnce)
+	if decision.Kind != DecisionAllow || decision.Grant == nil || decision.Grant.Fingerprint != Fingerprint(normalized) {
+		t.Fatalf("normalized allow changed fingerprint: %#v", decision)
+	}
+	if got, ok := normalized.Arguments["large"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("normalized arguments changed: %#v", normalized.Arguments)
+	}
+	for _, action := range []UserAction{ActionDeny, ActionCancel} {
+		got := authorizer.ResolveNormalizedUserDecision(normalized, Context{ProjectRoot: root}, action)
+		if got.Kind != DecisionDeny || !got.Recoverable {
+			t.Fatalf("action %s changed: %#v", action, got)
+		}
+	}
+	legacy := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root}, ActionAllowOnce)
+	if !reflect.DeepEqual(legacy, decision) {
+		t.Fatalf("legacy normalized resolution differs:\nlegacy=%#v\nnormalized=%#v", legacy, decision)
+	}
+}
+
+func TestDecideStagedCompatibility(t *testing.T) {
+	root := t.TempDir()
+	authorizer := Authorizer{User: RuleLayer{Source: Source{Kind: SourceUserRule}, Rules: []Rule{{Tool: "Bash", Pattern: "git *", MatchType: string(MatchGlob), Effect: string(EffectAllow)}}}}
+	tests := []struct {
+		call    Call
+		context Context
+	}{
+		{call: Call{ID: "allow", Name: "Read", ArgumentsJSON: `{"path":"file.txt"}`}, context: Context{ProjectRoot: root, Mode: ModeDefault}},
+		{call: Call{ID: "ask", Name: "Write", ArgumentsJSON: `{"path":"file.txt","content":"x"}`}, context: Context{ProjectRoot: root, Mode: ModeDefault}},
+		{call: Call{ID: "hard", Name: "Bash", ArgumentsJSON: `{"command":"git reset --hard"}`}, context: Context{ProjectRoot: root, Mode: ModePermissive}},
+		{call: Call{ID: "plan", Name: "Write", ArgumentsJSON: `{"path":"file.txt","content":"x"}`}, context: Context{ProjectRoot: root, Mode: ModePermissive, PlanMode: true}},
+		{call: Call{ID: "large", Name: "mcp__server__tool", ArgumentsJSON: `{"large":9007199254740993}`}, context: Context{ProjectRoot: root, Mode: ModeDefault}},
+	}
+	for _, test := range tests {
+		legacy := authorizer.Decide(test.call, test.context)
+		normalized, err := NormalizeCallWithReadRoots(test.call, test.context.ProjectRoot, test.context.ReadRoots)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var staged Decision
+		if test.context.PlanMode && isWriteOrBash(test.call.Name) {
+			staged = deny(test.call, ReasonPlanMode, Source{Kind: SourceHardConstraint, Description: "plan mode"}, "Plan Mode 下不允许执行写工具或 Bash", "Plan Mode allows only read-only tools.")
+		} else if hard := authorizer.CheckHard(normalized, test.context); hard != nil {
+			staged = *hard
+		} else {
+			staged = authorizer.DecideOrdinary(normalized, test.context)
+		}
+		if !reflect.DeepEqual(legacy, staged) {
+			t.Fatalf("legacy/staged mismatch for %s:\nlegacy=%#v\nstaged=%#v", test.call.ID, legacy, staged)
+		}
+		if test.call.ID == "large" {
+			if _, ok := normalized.Arguments["large"].(json.Number); !ok {
+				t.Fatalf("large argument lost json.Number: %#v", normalized.Arguments["large"])
+			}
+		}
 	}
 }
 

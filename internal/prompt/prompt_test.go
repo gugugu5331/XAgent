@@ -174,6 +174,81 @@ func TestSkillCatalogWithoutActivationDoesNotCreateActiveBlock(t *testing.T) {
 	}
 }
 
+func TestHookBlockOrder(t *testing.T) {
+	bundle := Build(BuildRequest{
+		Mode:         RunModePlan,
+		Iteration:    1,
+		ProjectRoot:  "/repo",
+		HookBlocks:   []Block{{Name: "/repo/.xagent/hooks.yaml#1", Content: "HOOK ONE", Stable: true}, {Name: "user-hook#2", Content: "HOOK TWO"}},
+		SkillCatalog: "SKILL CATALOG",
+		ActiveSkills: "ACTIVE SOP",
+		OptionalStableSections: []Section{{
+			Name: "project-instructions", Priority: 100, Content: "PROJECT RULES", Stable: true,
+		}},
+	})
+	if !bundle.UsesOrderedBlocks() {
+		t.Fatal("Hook blocks did not enable ordered prompt path")
+	}
+	wants := []string{
+		"身份",
+		"系统约束",
+		"任务模式",
+		"动作执行",
+		"工具使用",
+		"语气风格",
+		"文本输出",
+		"/repo/.xagent/hooks.yaml#1",
+		"user-hook#2",
+		"project-instructions",
+		SkillCatalogBlockName,
+		ActiveSkillsBlockName,
+		"runtime-system-reminder",
+	}
+	if got := blockNames(bundle.OrderedBlocks); !reflect.DeepEqual(got, wants) {
+		t.Fatalf("ordered prompt blocks mismatch:\n got=%#v\nwant=%#v", got, wants)
+	}
+	if bundle.SystemBreakpointName != "文本输出" {
+		t.Fatalf("unexpected fixed system breakpoint: %q", bundle.SystemBreakpointName)
+	}
+	for _, block := range bundle.OrderedBlocks[7:9] {
+		if block.Stable {
+			t.Fatalf("Hook block is cacheable: %#v", block)
+		}
+	}
+	if got := bundle.OrderedBlocks[7].Content; got != "HOOK ONE" {
+		t.Fatalf("Hook source boundary/content changed: %q", got)
+	}
+}
+
+func TestLegacyPromptUnchanged(t *testing.T) {
+	req := BuildRequest{
+		Mode:         RunModeDo,
+		Iteration:    2,
+		ProjectRoot:  "/repo",
+		SkillCatalog: "catalog",
+		ActiveSkills: "active",
+		OptionalStableSections: []Section{{
+			Name: "project", Priority: 100, Content: "project rules", Stable: true,
+		}},
+	}
+	baseline := Build(req)
+	withEmptyHooks := Build(BuildRequest{
+		Mode:                   req.Mode,
+		Iteration:              req.Iteration,
+		ProjectRoot:            req.ProjectRoot,
+		HookBlocks:             []Block{{Name: "ignored", Content: "  ", Stable: true}},
+		SkillCatalog:           req.SkillCatalog,
+		ActiveSkills:           req.ActiveSkills,
+		OptionalStableSections: req.OptionalStableSections,
+	})
+	if baseline.UsesOrderedBlocks() || withEmptyHooks.UsesOrderedBlocks() {
+		t.Fatal("empty Hook input enabled ordered path")
+	}
+	if !reflect.DeepEqual(baseline, withEmptyHooks) {
+		t.Fatalf("empty Hook input changed legacy prompt:\nbaseline=%#v\nactual=%#v", baseline, withEmptyHooks)
+	}
+}
+
 func findBlock(blocks []Block, name string) (Block, int) {
 	for index, block := range blocks {
 		if block.Name == name {

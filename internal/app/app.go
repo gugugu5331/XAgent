@@ -14,6 +14,7 @@ import (
 	"xagent/internal/config"
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
+	"xagent/internal/hook"
 	"xagent/internal/orchestrator"
 	"xagent/internal/permission"
 	"xagent/internal/redact"
@@ -58,6 +59,8 @@ type Model struct {
 	mode            orchestrator.RunMode
 	lastError       error
 	messagesCleared bool
+	lifecycle       *lifecycleState
+	hooks           hook.Runtime
 }
 
 func New(deps Deps) Model {
@@ -66,7 +69,11 @@ func New(deps Deps) Model {
 		deps.CommandRegistry = command.MustNew(command.Builtins()...)
 	}
 	if deps.Diagnostics == nil {
-		deps.Diagnostics = diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redact.Text})
+		redactor := deps.Redact
+		if redactor == nil {
+			redactor = redact.Text
+		}
+		deps.Diagnostics = diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: redactor})
 	}
 	conversations, _ := deps.Store.List(ctx)
 	orchOptions := orchestrator.OrchestratorOptions{
@@ -83,6 +90,7 @@ func New(deps Deps) Model {
 		DefaultModel:        deps.Config.LLM.Model,
 		Redact:              deps.Redact,
 		RedactionLookbehind: deps.RedactionLookbehind,
+		Hooks:               deps.Hooks,
 	}
 	if deps.SessionContext != nil {
 		orchOptions.SessionContext = deps.SessionContext
@@ -93,6 +101,10 @@ func New(deps Deps) Model {
 	orch := orchestrator.NewWithOptions(orchOptions)
 	if mode, ok := permission.ParseMode(deps.Config.Permission.Mode); ok {
 		orch.SetPermissionMode(mode)
+	}
+	hooks := deps.Hooks
+	if hooks == nil {
+		hooks = hook.Noop()
 	}
 	model := Model{
 		deps:            deps,
@@ -106,6 +118,8 @@ func New(deps Deps) Model {
 		baseCommands:    deps.CommandRegistry.Definitions(),
 		skillActivity:   skill.NewActivity(),
 		mode:            orchestrator.RunModeDefault,
+		lifecycle:       newLifecycleState(),
+		hooks:           hooks,
 		status: tui.Status{
 			Mode:     string(orchestrator.RunModeDefault),
 			Provider: deps.Provider.Name(),
@@ -115,6 +129,7 @@ func New(deps Deps) Model {
 	model.installInitialSkillCommands()
 	model.refreshMCPStatus()
 	model.syncMCPDiagnostics()
+	model.hooks.SystemStart(context.Background())
 	if deps.Config.UI.StartMode == config.StartModeNew {
 		model.startNewConversation()
 	}
@@ -143,26 +158,63 @@ func (m Model) View() string {
 func (m *Model) startNewConversation() {
 	conv, err := m.deps.Store.Create(context.Background())
 	if err != nil {
-		m.status.Error = err
+		m.status.Error = m.redactError(err)
 		return
 	}
-	m.conversation = conv
-	m.messages.SetMessages(nil)
-	m.resetCommandState()
-	m.screen = screenChat
+	m.transitionConversation(conv, conversation.RecoveryReport{}, true)
 }
 
 func (m *Model) loadConversation(id string) {
 	conv, report, err := m.recoverOrLoadConversation(id)
 	if err != nil {
-		m.status.Error = err
+		m.status.Error = m.redactError(err)
 		return
 	}
-	m.conversation = conv
-	m.messages.SetMessages(conv.Messages)
+	m.transitionConversation(conv, report, false)
+}
+
+// transitionConversation activates an already-created candidate. Candidate
+// creation/recovery happens before this method so a failed candidate never
+// mutates the current session.
+func (m *Model) transitionConversation(candidate *conversation.Conversation, report conversation.RecoveryReport, created bool) {
+	if candidate == nil {
+		m.status.Error = m.redactError(fmt.Errorf("候选会话不能为空"))
+		return
+	}
+	var transitionErrors []string
+	if m.conversation != nil {
+		if m.orchestrator != nil {
+			if err := m.orchestrator.WaitIdle(context.Background()); err != nil {
+				m.status.Error = m.redactError(err)
+				return
+			}
+		}
+		if m.deps.Store != nil {
+			if err := m.deps.Store.Save(context.Background(), m.conversation); err != nil {
+				transitionErrors = append(transitionErrors, "旧会话保存: "+m.redactText(err.Error()))
+			}
+		}
+		m.hookRuntime().SessionEnd(context.Background(), m.conversation.ID, hook.SessionEndSwitch)
+	}
 	m.resetCommandState()
-	m.status.Notice = recoveryNotice(report)
+	m.conversation = candidate
+	if created {
+		m.messages.SetMessages(nil)
+	} else {
+		m.messages.SetMessages(candidate.Messages)
+	}
+	m.status.Notice = recoveryNotice(report, m.redactText)
 	m.screen = screenChat
+	state := hook.SessionResumed
+	if created {
+		state = hook.SessionNew
+	}
+	m.hookRuntime().SessionStart(context.Background(), candidate.ID, state)
+	if len(transitionErrors) > 0 {
+		m.status.Error = m.redactError(fmt.Errorf("%s", strings.Join(transitionErrors, "; ")))
+	} else {
+		m.status.Error = nil
+	}
 }
 
 func (m *Model) resetCommandState() {
@@ -178,6 +230,13 @@ func (m *Model) resetCommandState() {
 	m.messagesCleared = false
 }
 
+func (m *Model) hookRuntime() hook.Runtime {
+	if m == nil || m.hooks == nil {
+		return hook.Noop()
+	}
+	return m.hooks
+}
+
 func (m *Model) recoverOrLoadConversation(id string) (*conversation.Conversation, conversation.RecoveryReport, error) {
 	ctx := context.Background()
 	if recovering, ok := m.deps.Store.(conversation.RecoveringStore); ok {
@@ -188,7 +247,10 @@ func (m *Model) recoverOrLoadConversation(id string) (*conversation.Conversation
 	return conv, conversation.RecoveryReport{}, err
 }
 
-func recoveryNotice(report conversation.RecoveryReport) string {
+func recoveryNotice(report conversation.RecoveryReport, redactor func(string) string) string {
+	if redactor == nil {
+		redactor = redact.Text
+	}
 	parts := []string{}
 	if report.SkippedLines > 0 {
 		parts = append(parts, fmt.Sprintf("跳过 %d 行损坏会话记录", report.SkippedLines))
@@ -200,7 +262,7 @@ func recoveryNotice(report conversation.RecoveryReport) string {
 		parts = append(parts, "已插入会话时间跨度提醒")
 	}
 	for _, diagnostic := range report.Diagnostics {
-		text := strings.TrimSpace(diagnostic.Safe(redact.Text).Text())
+		text := strings.TrimSpace(diagnostic.Safe(redactor).Text())
 		if text != "" {
 			parts = append(parts, text)
 		}
@@ -212,30 +274,86 @@ func recoveryNotice(report conversation.RecoveryReport) string {
 }
 
 func (m *Model) close() {
-	var closeErrors []string
-	if m.conversation != nil {
-		_ = m.deps.Store.Save(context.Background(), m.conversation)
+	_ = m.Close(context.Background())
+}
+
+// Close owns only the App/session lifecycle. Process resources such as Hook
+// workers and MCP transports are closed by the main coordinator after this
+// method returns.
+func (m *Model) Close(ctx context.Context) error {
+	if m == nil {
+		return nil
 	}
-	if m.skillActivity != nil {
-		m.skillActivity.Clear()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if m.deps.Closer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := m.deps.Closer.Close(ctx); err != nil {
-			closeErrors = append(closeErrors, "MCP close: "+redact.Text(err.Error()))
+	if m.lifecycle == nil {
+		m.lifecycle = newLifecycleState()
+		if m.request != nil {
+			m.lifecycle.begin(m.request)
 		}
 	}
-	if len(closeErrors) > 0 {
-		m.status.Error = fmt.Errorf("%s", strings.Join(closeErrors, "; "))
-	}
-	m.refreshMCPStatus()
+	return m.lifecycle.close(func() error {
+		if request, _, _ := m.lifecycle.active(); request != nil {
+			m.request = request
+		}
+		m.lifecycle.cancel()
+		var closeErrors []string
+		if m.orchestrator != nil {
+			if err := m.orchestrator.WaitIdle(ctx); err != nil {
+				closeErrors = append(closeErrors, "等待 Agent 收尾: "+m.redactText(err.Error()))
+			}
+		}
+		if m.conversation != nil && m.deps.Store != nil {
+			if err := m.deps.Store.Save(ctx, m.conversation); err != nil {
+				closeErrors = append(closeErrors, "会话保存: "+m.redactText(err.Error()))
+			}
+		}
+		if m.conversation != nil {
+			m.hookRuntime().SessionEnd(context.Background(), m.conversation.ID, hook.SessionEndExit)
+		}
+		if m.skillActivity != nil {
+			m.skillActivity.Clear()
+		}
+		m.mode = orchestrator.RunModeDefault
+		m.status.Mode = string(orchestrator.RunModeDefault)
+		m.status.ActiveSkills = ""
+		m.status.RequestModel = ""
+		m.clearRequestTransient()
+		m.request = nil
+		m.streaming = false
+		m.status.Streaming = false
+		m.status.WaitingConfirmation = false
+		m.confirmation = nil
+		m.conversation = nil
+		m.lifecycle.finish()
+		if len(closeErrors) == 0 {
+			return nil
+		}
+		err := m.redactError(fmt.Errorf("%s", strings.Join(closeErrors, "; ")))
+		m.status.Error = err
+		return err
+	})
 }
 
 func (m *Model) refreshMCPStatus() {
 	if m.deps.MCPStatus != nil {
-		m.status.MCP = m.deps.MCPStatus.StatusLine()
+		m.status.MCP = m.redactText(m.deps.MCPStatus.StatusLine())
 	}
+}
+
+func (m *Model) redactText(value string) string {
+	if m != nil && m.deps.Redact != nil {
+		return m.deps.Redact(value)
+	}
+	return redact.Text(value)
+}
+
+func (m *Model) redactError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", m.redactText(err.Error()))
 }
 
 func (m *Model) syncMCPDiagnostics() {
@@ -251,7 +369,7 @@ func listen(events <-chan Event) tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-events
 		if !ok {
-			return nil
+			return eventStreamClosedMsg{}
 		}
 		return eventMsg{event: event, events: events}
 	}
@@ -261,6 +379,8 @@ type eventMsg struct {
 	event  Event
 	events <-chan Event
 }
+
+type eventStreamClosedMsg struct{}
 
 func sanitizeInput(value string) string {
 	return strings.TrimSpace(value)

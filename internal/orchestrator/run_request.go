@@ -31,6 +31,7 @@ type RunResult struct {
 	Usage     provider.Usage
 	Duration  time.Duration
 	Reason    StopReason
+	Err       error
 }
 
 type RunOptions struct {

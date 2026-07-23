@@ -2,6 +2,7 @@ config.yaml
 .xagent/*
 !.xagent/
 !.xagent/permissions.yaml
+!.xagent/hooks.yaml
 .xagent/permissions.local.yaml
 .xagent/tmp-*
 /xagent

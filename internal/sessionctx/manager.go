@@ -32,6 +32,10 @@ type ContextPreparer interface {
 	Prepare(ctx context.Context, conv *conversation.Conversation, mode contextmgr.Mode) (contextmgr.Result, error)
 }
 
+type ContextOptionsPreparer interface {
+	PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts contextmgr.PrepareOptions) (contextmgr.Result, error)
+}
+
 type Manager struct {
 	Instructions InstructionLoader
 	Memory       MemoryIndexProvider
@@ -46,12 +50,27 @@ type PreparedContext struct {
 }
 
 func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, mode PrepareMode) (PreparedContext, error) {
+	return m.PrepareWithOptions(ctx, conv, contextmgr.PrepareOptions{
+		Mode:             contextMode(mode),
+		PersistArtifacts: true,
+	})
+}
+
+func (m *Manager) PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts contextmgr.PrepareOptions) (PreparedContext, error) {
 	prepared := m.PrepareStable(ctx)
 	if m == nil {
 		return prepared, nil
 	}
 	if m.Context != nil && conv != nil {
-		result, err := m.Context.Prepare(ctx, conv, contextMode(mode))
+		var result contextmgr.Result
+		var err error
+		if optionsPreparer, ok := m.Context.(ContextOptionsPreparer); ok {
+			result, err = optionsPreparer.PrepareWithOptions(ctx, conv, opts)
+		} else if opts.PersistArtifacts {
+			// Legacy preparers cannot promise transient/no-artifact behavior.
+			// Retain their old path only for persistent main-session prepares.
+			result, err = m.Context.Prepare(ctx, conv, opts.Mode)
+		}
 		prepared.ContextResult = result
 		if result.Changed {
 			prepared.MessagesChanged = true
@@ -65,8 +84,9 @@ func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, 
 }
 
 // PrepareStable loads system instructions and memory without compacting,
-// externalizing, or otherwise mutating a Conversation. Independent Skill
-// executions use this path so their temporary conversations remain in-memory.
+// externalizing, or otherwise mutating a Conversation. Callers that need an
+// in-memory transient summary use PrepareWithOptions with PersistArtifacts
+// disabled instead.
 func (m *Manager) PrepareStable(ctx context.Context) PreparedContext {
 	prepared := PreparedContext{}
 	if m == nil {

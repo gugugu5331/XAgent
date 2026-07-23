@@ -2,7 +2,7 @@ package tool
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -34,14 +34,38 @@ func (e *Executor) NeedsConfirmation(call Call) bool {
 }
 
 func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, grant permission.Grant) Result {
-	permissionCall := permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
+	validated, err := e.Registry.ValidateCall(call)
+	if err != nil {
+		return e.validationFailure(call, err)
+	}
+	return e.ExecuteValidatedAuthorized(ctx, validated, grant)
+}
+
+// ExecuteValidatedAuthorized verifies a grant and executes the already parsed
+// call without decoding its arguments again.
+func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated ValidatedCall, grant permission.Grant) Result {
+	call := validated.Call
+	registeredTool, ok := e.Registry.Get(call.Name)
+	if !ok {
+		return e.validationFailure(call, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name))
+	}
+	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.Arguments == nil {
+		return e.validationFailure(call, fmt.Errorf("validated call is inconsistent"))
+	}
+	// Always execute the registry member, even if a caller manually assembled a
+	// ValidatedCall with another Tool implementation bearing the same name.
+	validated.Tool = registeredTool
 	var readRoots []string
 	if scope, scopeErr := effectiveReadScope(ctx, e.ProjectRoot); scopeErr == nil {
 		readRoots = scope.ExtraRoots
 	} else {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool read scope is invalid for permission checking.", Recoverable: true})
 	}
-	normalized, err := permission.NormalizeCallWithReadRoots(permissionCall, e.ProjectRoot, readRoots)
+	normalized, err := permission.NormalizeArguments(
+		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
+		validated.Arguments,
+		permission.Context{ProjectRoot: e.ProjectRoot, ReadRoots: readRoots},
+	)
 	if err != nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
 	}
@@ -51,40 +75,25 @@ func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, grant permi
 	if grant.CallID != "" && grant.CallID != call.ID && grant.Scope == permission.GrantOnce {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Permission grant does not match this tool call.", Recoverable: true})
 	}
-	return e.Execute(ctx, call)
+	return e.executeValidated(ctx, validated)
 }
 
 func (e *Executor) Execute(ctx context.Context, call Call) Result {
-	registeredTool, ok := e.Registry.Get(call.Name)
-	if !ok {
-		return Result{
-			CallID:  call.ID,
-			Name:    call.Name,
-			Status:  StatusError,
-			Summary: fmt.Sprintf("未知工具: %s", call.Name),
-			Error:   &Error{Code: ErrToolNotFound, Message: fmt.Sprintf("工具 %q 未注册", call.Name), Recoverable: true},
-		}
+	validated, err := e.Registry.ValidateCall(call)
+	if err != nil {
+		return e.validationFailure(call, err)
 	}
+	return e.executeValidated(ctx, validated)
+}
 
-	arguments := map[string]any{}
-	if strings.TrimSpace(call.ArgumentsJSON) != "" {
-		if err := json.Unmarshal([]byte(call.ArgumentsJSON), &arguments); err != nil {
-			return Result{
-				CallID:  call.ID,
-				Name:    call.Name,
-				Status:  StatusError,
-				Summary: "工具参数不是有效 JSON",
-				Error:   &Error{Code: ErrInvalidArguments, Message: err.Error(), Recoverable: true},
-			}
-		}
-	}
-
+func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall) Result {
+	call := validated.Call
 	execCtx, cancel := context.WithTimeout(ctx, e.Timeout)
 	defer cancel()
 
 	resultCh := make(chan Result, 1)
 	go func() {
-		resultCh <- registeredTool.Execute(execCtx, Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: arguments})
+		resultCh <- validated.Tool.Execute(execCtx, Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: validated.Arguments})
 	}()
 
 	select {
@@ -99,6 +108,25 @@ func (e *Executor) Execute(ctx context.Context, call Call) Result {
 		}
 	case result := <-resultCh:
 		return e.truncate(result)
+	}
+}
+
+func (e *Executor) validationFailure(call Call, err error) Result {
+	if errors.Is(err, errToolNotRegistered) {
+		return Result{
+			CallID:  call.ID,
+			Name:    call.Name,
+			Status:  StatusError,
+			Summary: fmt.Sprintf("未知工具: %s", call.Name),
+			Error:   &Error{Code: ErrToolNotFound, Message: fmt.Sprintf("工具 %q 未注册", call.Name), Recoverable: true},
+		}
+	}
+	return Result{
+		CallID:  call.ID,
+		Name:    call.Name,
+		Status:  StatusError,
+		Summary: "工具参数不是有效 JSON",
+		Error:   &Error{Code: ErrInvalidArguments, Message: err.Error(), Recoverable: true},
 	}
 }
 
@@ -127,33 +155,84 @@ func (e *Executor) Denied(call Call) Result {
 }
 
 func (e *Executor) truncate(result Result) Result {
-	content, truncated := truncateString(result.Content, e.MaxOutputBytes)
+	outputLimit := e.MaxOutputBytes
+	if outputLimit <= 0 {
+		outputLimit = 32 * 1024
+	}
+	fieldLimit := outputLimit
+	if fieldLimit < len("（输出已截断）") {
+		fieldLimit = len("（输出已截断）")
+	}
+	originalSummary := result.Summary
+	result.Summary, _ = truncateString(result.Summary, fieldLimit)
+	if result.Error != nil {
+		cloned := *result.Error
+		cloned.Message, result.Truncated = truncateAndMark(cloned.Message, fieldLimit, result.Truncated)
+		result.Error = &cloned
+	}
+	content, truncated := truncateString(result.Content, outputLimit)
 	result.Content = content
 	if truncated {
 		result.Truncated = true
 	}
+	dataLimit := outputLimit / 2
+	if dataLimit < 1 {
+		dataLimit = 1
+	}
 	for _, key := range []string{"stdout", "stderr", "content"} {
 		if value, ok := result.Data[key].(string); ok {
-			truncatedValue, wasTruncated := truncateString(value, e.MaxOutputBytes/2)
+			truncatedValue, wasTruncated := truncateString(value, dataLimit)
 			result.Data[key] = truncatedValue
 			if wasTruncated {
 				result.Truncated = true
 			}
 		}
 	}
+	if len(originalSummary) > fieldLimit {
+		result.Truncated = true
+	}
 	if result.Truncated && !strings.Contains(result.Summary, "截断") {
-		result.Summary += "（输出已截断）"
+		result.Summary = truncatedSummary(originalSummary, fieldLimit)
 	}
 	return result
+}
+
+func truncateAndMark(value string, maxBytes int, alreadyTruncated bool) (string, bool) {
+	value, truncated := truncateString(value, maxBytes)
+	return value, alreadyTruncated || truncated
+}
+
+func truncatedSummary(value string, maxBytes int) string {
+	const suffix = "（输出已截断）"
+	if maxBytes < len(suffix) {
+		maxBytes = len(suffix)
+	}
+	prefix, _ := utf8Prefix(value, maxBytes-len(suffix))
+	return prefix + suffix
 }
 
 func truncateString(value string, maxBytes int) (string, bool) {
 	if maxBytes <= 0 || len(value) <= maxBytes {
 		return value, false
 	}
-	truncated := value[:maxBytes]
-	for !utf8.ValidString(truncated) && len(truncated) > 0 {
-		truncated = truncated[:len(truncated)-1]
+	const marker = "\n...[truncated]"
+	if maxBytes <= len(marker) {
+		return marker[:maxBytes], true
 	}
-	return truncated + "\n...[truncated]", true
+	prefix, _ := utf8Prefix(value, maxBytes-len(marker))
+	return prefix + marker, true
+}
+
+func utf8Prefix(value string, maxBytes int) (string, bool) {
+	if maxBytes <= 0 {
+		return "", value != ""
+	}
+	if len(value) <= maxBytes {
+		return value, false
+	}
+	prefix := value[:maxBytes]
+	for !utf8.ValidString(prefix) && len(prefix) > 0 {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix, true
 }

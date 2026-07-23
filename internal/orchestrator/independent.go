@@ -9,6 +9,7 @@ import (
 
 	"xagent/internal/conversation"
 	"xagent/internal/events"
+	"xagent/internal/hook"
 	"xagent/internal/skill"
 )
 
@@ -24,6 +25,11 @@ type IndependentRequest struct {
 var independentSequence atomic.Uint64
 
 func (o *Orchestrator) RunIndependent(ctx context.Context, request IndependentRequest, out chan<- events.Event) (RunResult, error) {
+	endRun := func() {}
+	if o != nil && o.runs != nil {
+		endRun = o.runs.begin()
+	}
+	defer endRun()
 	if request.Main == nil {
 		return RunResult{}, fmt.Errorf("主会话不能为空")
 	}
@@ -60,14 +66,19 @@ func (o *Orchestrator) RunIndependent(ctx context.Context, request IndependentRe
 	if userText == "" {
 		userText = o.skillInvocationText(request.Invocation)
 	}
-	conversation.AppendUserMessage(temporary, userText)
-
 	state := &executionState{activity: activity, profile: profile}
+	runtime := o.hookRuntime()
+	state.ref = runtime.BeginTurn(requestCtxOrBackground(ctx), request.Main.ID, hook.ExecutionIsolatedSkill, hookMode(request.Mode))
+	message := runtime.BeginMessage(requestCtxOrBackground(ctx), state.ref, hook.MessageUser, userText)
+	conversation.AppendUserMessage(temporary, userText)
+	runtime.EndMessage(requestCtxOrBackground(ctx), message)
 	runRequest := RunRequest{UserText: userText, Mode: request.Mode, Profile: profile, Activity: activity}
 	childEvents := make(chan events.Event)
 	resultCh := make(chan RunResult, 1)
 	go func() {
-		resultCh <- o.runAgentLoop(ctx, temporary, runRequest, state, childEvents, time.Now())
+		result := o.runAgentLoop(ctx, temporary, runRequest, state, childEvents, time.Now())
+		o.endTurn(state.ref, result)
+		resultCh <- result
 		close(childEvents)
 	}()
 
@@ -119,6 +130,17 @@ func (o *Orchestrator) SendSkill(
 	activity *skill.Activity,
 	mode RunMode,
 ) (<-chan events.Event, skill.PreparedInvocation, error) {
+	endRun := func() {}
+	if o != nil && o.runs != nil {
+		endRun = o.runs.begin()
+	}
+	runHandedOff := false
+	defer func() {
+		if !runHandedOff {
+			endRun()
+		}
+	}()
+
 	if main == nil {
 		return nil, skill.PreparedInvocation{}, fmt.Errorf("会话不能为空")
 	}
@@ -155,6 +177,7 @@ func (o *Orchestrator) SendSkill(
 	conversation.AppendUserMessage(main, raw)
 	go func() {
 		defer close(out)
+		defer endRun()
 		start := time.Now()
 		if !emitEvent(requestCtxOrBackground(ctx), out, events.Event{Type: events.UserSubmitted, Text: raw}) {
 			if prepared.Activity != nil {
@@ -188,6 +211,7 @@ func (o *Orchestrator) SendSkill(
 		}
 		emitEvent(ctx, out, events.Event{Type: events.Done, Duration: time.Since(start)})
 	}()
+	runHandedOff = true
 	return out, prepared, nil
 }
 
@@ -221,9 +245,6 @@ func (o *Orchestrator) runAgentTriggeredIndependent(
 		return result, ctx.Err()
 	}
 	if !emitEvent(ctx, out, progressEvent(1, 1, string(StopReasonCompleted), "已完成")) {
-		return result, ctx.Err()
-	}
-	if !emitEvent(ctx, out, events.Event{Type: events.Done, Duration: result.Duration}) {
 		return result, ctx.Err()
 	}
 	result.Reason = StopReasonCompleted

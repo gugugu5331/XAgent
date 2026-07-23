@@ -8,6 +8,7 @@ import (
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
+	"xagent/internal/hook"
 	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
 	"xagent/internal/provider"
@@ -31,6 +32,7 @@ type Deps struct {
 	SkillManager        *skill.Manager
 	Redact              func(string) string
 	RedactionLookbehind int
+	Hooks               hook.Runtime
 	Closer              interface{ Close(context.Context) error }
 	MCPStatus           interface {
 		StatusLine() string

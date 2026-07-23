@@ -16,6 +16,7 @@ import (
 	"xagent/internal/command"
 	"xagent/internal/config"
 	"xagent/internal/conversation"
+	"xagent/internal/hook"
 	"xagent/internal/provider"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
@@ -92,7 +93,7 @@ func writeAppSkill(t *testing.T, root string, spec appSkillSpec) string {
 	return path
 }
 
-func newSkillAppModel(t *testing.T, skillRoot string, providerImpl provider.Provider) Model {
+func newSkillAppModel(t *testing.T, skillRoot string, providerImpl provider.Provider, hooks ...hook.Runtime) Model {
 	t.Helper()
 	projectRoot := t.TempDir()
 	registry, err := tool.NewRegistry(projectRoot)
@@ -114,10 +115,102 @@ func newSkillAppModel(t *testing.T, skillRoot string, providerImpl provider.Prov
 	cfg := testAppConfig()
 	cfg.UI.StartMode = config.StartModeNew
 	executor := tool.NewExecutor(registry, projectRoot, time.Second, 1024)
-	return New(Deps{
+	deps := Deps{
 		Config: cfg, Provider: providerImpl, Store: &fakeRecoveringStore{}, Resources: fakeResources{},
 		Registry: registry, Executor: executor, SkillManager: manager,
+	}
+	if len(hooks) > 0 {
+		deps.Hooks = hooks[0]
+	}
+	return New(deps)
+}
+
+func TestNoHookCommandSkillCompatibility(t *testing.T) {
+	root := t.TempDir()
+	writeAppSkill(t, root, appSkillSpec{
+		name: "compat", mode: skill.ModeShared, model: "compat-model", tools: []string{"Read"},
+		body: "COMPAT SOP {{args}}",
 	})
+
+	type snapshot struct {
+		planNotice       string
+		planStatus       string
+		doNotice         string
+		activeNames      []string
+		activeTools      []string
+		requestModel     string
+		requestTools     []string
+		hasSOP           bool
+		orderedSystem    int
+		hasObserver      bool
+		visibleMessages  string
+		visibleStatus    string
+		conversationText []string
+		clearNotice      string
+		clearActive      int
+		clearStatus      string
+		diagnostics      int
+	}
+
+	var baseline *snapshot
+	for _, item := range noHookRuntimeCases(t) {
+		providerImpl := &skillAppProvider{}
+		model := newSkillAppModel(t, root, providerImpl, item.runtime)
+
+		model = runCommandInput(t, model, "/plan")
+		got := snapshot{planNotice: model.status.Notice, planStatus: model.status.View()}
+		model = runCommandInput(t, model, "/do")
+		got.doNotice = model.status.Notice
+		model = runCommandInput(t, model, "/compat inspect")
+		// Wall-clock duration is intentionally visible but is not stable across
+		// equivalent executions; normalize it before comparing UI state.
+		model.status.Duration = 0
+
+		activity := model.skillActivity.Snapshot()
+		for _, active := range activity.Active {
+			got.activeNames = append(got.activeNames, active.Name)
+		}
+		got.activeTools = append(got.activeTools, activity.AllowedTools...)
+		got.visibleMessages = model.messages.View()
+		got.visibleStatus = model.status.View()
+		for _, message := range model.conversation.Messages {
+			got.conversationText = append(got.conversationText, string(message.Role)+":"+message.Content)
+		}
+		requests := providerImpl.Requests()
+		if len(requests) != 1 {
+			t.Fatalf("%s Provider requests = %d, want 1", item.name, len(requests))
+		}
+		request := requests[0]
+		got.requestModel = request.Model
+		for _, definition := range request.Tools {
+			got.requestTools = append(got.requestTools, definition.Name)
+		}
+		got.hasSOP = requestContainsDynamic(request, "COMPAT SOP inspect")
+		got.orderedSystem = len(request.System)
+		got.hasObserver = request.Observer != nil
+
+		model = runCommandInput(t, model, "/clear")
+		got.clearNotice = model.status.Notice
+		got.clearActive = len(model.skillActivity.Snapshot().Active)
+		got.clearStatus = model.status.ActiveSkills + "|" + model.status.RequestModel + "|" + model.messages.View()
+		got.diagnostics = model.diagnostics.Count()
+		if err := model.Close(context.Background()); err != nil {
+			t.Fatalf("%s App.Close: %v", item.name, err)
+		}
+
+		if baseline == nil {
+			copy := got
+			baseline = &copy
+		} else if !reflect.DeepEqual(*baseline, got) {
+			t.Fatalf("%s changed command/Skill compatibility:\nlegacy=%#v\nactual=%#v", item.name, *baseline, got)
+		}
+	}
+	if baseline == nil || !strings.Contains(baseline.planStatus, "[PLAN]") || baseline.requestModel != "compat-model" ||
+		strings.Join(baseline.activeNames, ",") != "compat" || strings.Join(baseline.activeTools, ",") != "Read" ||
+		strings.Join(baseline.requestTools, ",") != "Read,load_skill" || !baseline.hasSOP || baseline.orderedSystem != 0 ||
+		baseline.hasObserver || baseline.clearActive != 0 || baseline.clearStatus != "||" || baseline.diagnostics != 0 {
+		t.Fatalf("legacy command/Skill golden changed: %#v", baseline)
+	}
 }
 
 func appReservedCommands() []string {

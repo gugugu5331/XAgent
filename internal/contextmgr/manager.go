@@ -22,6 +22,26 @@ const (
 	ModeManual Mode = "manual"
 )
 
+// CompactionObserver observes a single real compaction attempt. The token
+// returned by Before is request-local and is passed back unchanged to After.
+// Implementations must not mutate the Conversation through this interface.
+type CompactionObserver interface {
+	Before(context.Context, Attempt) any
+	After(context.Context, any, Result, error)
+}
+
+type Attempt struct {
+	Reason          string
+	Messages        int
+	EstimatedTokens int64
+}
+
+type PrepareOptions struct {
+	Mode             Mode
+	PersistArtifacts bool
+	Observer         CompactionObserver
+}
+
 type Manager struct {
 	provider provider.Provider
 	dataDir  string
@@ -29,12 +49,17 @@ type Manager struct {
 }
 
 type Result struct {
-	Changed       bool
-	Externalized  int
-	Summarized    bool
-	Estimated     int64
-	Message       string
-	CircuitBroken bool
+	Changed      bool
+	Externalized int
+	Summarized   bool
+	// Estimated retains the legacy pre-summary estimate returned by Prepare.
+	Estimated int64
+	// AfterMessages and AfterEstimatedTokens describe the post-attempt view
+	// delivered to CompactionObserver.After without changing legacy fields.
+	AfterMessages        int
+	AfterEstimatedTokens int64
+	Message              string
+	CircuitBroken        bool
 }
 
 func New(provider provider.Provider, dataDir string, cfg config.ContextConfig) *Manager {
@@ -42,16 +67,42 @@ func New(provider provider.Provider, dataDir string, cfg config.ContextConfig) *
 }
 
 func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, mode Mode) (Result, error) {
-	var result Result
+	return m.PrepareWithOptions(ctx, conv, PrepareOptions{Mode: mode, PersistArtifacts: true})
+}
+
+func (m *Manager) PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts PrepareOptions) (result Result, err error) {
 	if m == nil || conv == nil || !config.Enabled(m.cfg.Enabled, true) {
 		return result, nil
 	}
-	externalized, err := m.externalizeLargeToolResults(conv)
-	if err != nil {
-		return result, err
+	if opts.Mode == "" {
+		opts.Mode = ModeAuto
 	}
-	result.Externalized = externalized
-	result.Changed = externalized > 0
+	preflight := m.preflight(conv, opts)
+	var attemptErr error
+	var observerToken any
+	if preflight.realAttempt {
+		observerToken = notifyCompactionBefore(ctx, opts.Observer, preflight.attempt)
+	}
+	defer func() {
+		result.AfterMessages = len(conversation.ContextMessages(conv))
+		result.AfterEstimatedTokens = EstimateConversationTokens(conv)
+		if result.Summarized {
+			result.AfterEstimatedTokens = int64(countConversationChars(conv) / 4)
+		}
+		if preflight.realAttempt {
+			notifyCompactionAfter(ctx, opts.Observer, observerToken, result, attemptErr)
+		}
+	}()
+
+	if opts.PersistArtifacts && len(preflight.externalize) > 0 {
+		externalized, externalizeErr := m.externalizeMessages(conv, preflight.externalize)
+		result.Externalized = externalized
+		result.Changed = externalized > 0
+		if externalizeErr != nil {
+			attemptErr = externalizeErr
+			return result, externalizeErr
+		}
+	}
 
 	estimated := EstimateConversationTokens(conv)
 	result.Estimated = estimated
@@ -59,25 +110,27 @@ func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, 
 	meta.LastEstimatedTokens = estimated
 	meta.LastEstimatedCharacters = countConversationChars(conv)
 
-	if !m.shouldSummarize(conv, estimated, mode) {
-		if externalized > 0 {
-			result.Message = fmt.Sprintf("已外置 %d 条大型工具结果", externalized)
+	if !m.shouldSummarize(conv, estimated, opts.Mode) {
+		if result.Externalized > 0 {
+			result.Message = fmt.Sprintf("已外置 %d 条大型工具结果", result.Externalized)
 		}
 		return result, nil
 	}
 	if meta.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
 		result.CircuitBroken = true
-		if mode == ModeManual {
-			return result, fmt.Errorf("上下文摘要连续失败 %d 次，已熔断", meta.SummaryFailureCount)
+		if opts.Mode == ModeManual {
+			attemptErr = fmt.Errorf("上下文摘要连续失败 %d 次，已熔断", meta.SummaryFailureCount)
+			return result, attemptErr
 		}
 		return result, nil
 	}
 
-	summary, cutoff, err := m.summarize(ctx, conv)
-	if err != nil {
+	summary, cutoff, summaryErr := m.summarize(ctx, conv)
+	if summaryErr != nil {
+		attemptErr = summaryErr
 		meta.SummaryFailureCount++
-		if mode == ModeManual || meta.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
-			return result, err
+		if opts.Mode == ModeManual || meta.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
+			return result, summaryErr
 		}
 		return result, nil
 	}
@@ -89,7 +142,53 @@ func (m *Manager) Prepare(ctx context.Context, conv *conversation.Conversation, 
 }
 
 func (m *Manager) CompactNow(ctx context.Context, conv *conversation.Conversation) (Result, error) {
-	return m.Prepare(ctx, conv, ModeManual)
+	return m.PrepareWithOptions(ctx, conv, PrepareOptions{Mode: ModeManual, PersistArtifacts: true})
+}
+
+type compactionPreflight struct {
+	attempt     Attempt
+	externalize []int
+	realAttempt bool
+}
+
+func (m *Manager) preflight(conv *conversation.Conversation, opts PrepareOptions) compactionPreflight {
+	estimated := EstimateConversationTokens(conv)
+	plan := compactionPreflight{attempt: Attempt{
+		Reason:          string(opts.Mode),
+		Messages:        len(conversation.ContextMessages(conv)),
+		EstimatedTokens: estimated,
+	}}
+	if opts.PersistArtifacts {
+		plan.externalize = externalizationCandidates(conv, m.cfg)
+	}
+	summaryAttempt := m.shouldSummarize(conv, estimated, opts.Mode)
+	if conv.Context != nil && conv.Context.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
+		summaryAttempt = false
+	}
+	plan.realAttempt = opts.Mode == ModeManual || len(plan.externalize) > 0 || summaryAttempt
+	return plan
+}
+
+func notifyCompactionBefore(ctx context.Context, observer CompactionObserver, attempt Attempt) (token any) {
+	if observer == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			token = nil
+		}
+	}()
+	return observer.Before(ctx, attempt)
+}
+
+func notifyCompactionAfter(ctx context.Context, observer CompactionObserver, token any, result Result, err error) {
+	if observer == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	observer.After(ctx, token, result, err)
 }
 
 func (m *Manager) UpdateUsage(conv *conversation.Conversation, usage *provider.Usage) {
@@ -104,6 +203,21 @@ func (m *Manager) UpdateUsage(conv *conversation.Conversation, usage *provider.U
 }
 
 func (m *Manager) externalizeLargeToolResults(conv *conversation.Conversation) (int, error) {
+	return m.externalizeMessages(conv, externalizationCandidates(conv, m.cfg))
+}
+
+func (m *Manager) externalizeMessages(conv *conversation.Conversation, indexes []int) (int, error) {
+	count := 0
+	for _, index := range indexes {
+		if err := m.externalizeMessage(conv, index); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func externalizationCandidates(conv *conversation.Conversation, cfg config.ContextConfig) []int {
 	large := make([]int, 0)
 	total := 0
 	for index, message := range conv.Messages {
@@ -115,11 +229,11 @@ func (m *Manager) externalizeLargeToolResults(conv *conversation.Conversation) (
 			size = len(message.Content)
 		}
 		total += size
-		if size > m.cfg.ToolResultThresholdChars {
+		if size > cfg.ToolResultThresholdChars {
 			large = append(large, index)
 		}
 	}
-	if total > m.cfg.ToolResultsThresholdChars {
+	if total > cfg.ToolResultsThresholdChars {
 		indexes := make([]int, 0)
 		for index, message := range conv.Messages {
 			if message.Role == conversation.RoleToolResult && !message.Externalized {
@@ -135,19 +249,12 @@ func (m *Manager) externalizeLargeToolResults(conv *conversation.Conversation) (
 			}
 			large = append(large, index)
 			total -= toolResultSize(conv.Messages[index])
-			if total <= m.cfg.ToolResultsThresholdChars {
+			if total <= cfg.ToolResultsThresholdChars {
 				break
 			}
 		}
 	}
-	count := 0
-	for _, index := range large {
-		if err := m.externalizeMessage(conv, index); err != nil {
-			return count, err
-		}
-		count++
-	}
-	return count, nil
+	return large
 }
 
 func (m *Manager) externalizeMessage(conv *conversation.Conversation, index int) error {
@@ -272,7 +379,10 @@ func EstimateConversationTokens(conv *conversation.Conversation) int64 {
 		return 0
 	}
 	chars := countConversationChars(conv)
-	meta := conversation.EnsureContext(conv)
+	meta := conv.Context
+	if meta == nil {
+		return int64(chars / 4)
+	}
 	if meta.LastInputTokens > 0 && meta.LastEstimatedCharacters > 0 {
 		delta := chars - meta.LastEstimatedCharacters
 		if delta < 0 {

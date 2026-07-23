@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"xagent/internal/hook"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
@@ -11,6 +12,7 @@ import (
 type executionState struct {
 	activity *skill.Activity
 	profile  skill.ExecutionProfile
+	ref      hook.ExecutionRef
 }
 
 func (o *Orchestrator) newExecutionState(req RunRequest) (*executionState, error) {
@@ -87,6 +89,39 @@ func (o *Orchestrator) registryForProfile(mode RunMode, profile skill.ExecutionP
 		AllowedNames:  profile.AllowedTools,
 		AlwaysInclude: always,
 		ReadOnly:      mode == RunModePlan,
+	})
+}
+
+// preflightRegistryForProfile applies the active Skill visibility policy but
+// deliberately does not apply Plan Mode's read-only filter. That policy is a
+// separate, later gate so fabricated provider calls are rejected at the
+// correct boundary and never reach permission normalization or Hooks.
+func (o *Orchestrator) preflightRegistryForProfile(mode RunMode, profile skill.ExecutionProfile) (*tool.Registry, error) {
+	if o.registry == nil {
+		return nil, nil
+	}
+	allowed := profile.AllowedTools
+	if mode == RunModePlan {
+		// BuildProfile records the unfiltered Skill whitelist on Activity even
+		// though AllowedTools itself has already been intersected with Plan.
+		// Reconstruct only that Skill restriction here.
+		if profile.Activity.AllowedTools == nil {
+			allowed = nil
+		} else {
+			allowed = make(map[string]struct{}, len(profile.Activity.AllowedTools))
+			for _, name := range profile.Activity.AllowedTools {
+				allowed[name] = struct{}{}
+			}
+		}
+	}
+	always := []string{}
+	if _, ok := o.registry.Get(tool.LoadSkillToolName); ok {
+		always = append(always, tool.LoadSkillToolName)
+	}
+	return o.registry.View(tool.ViewOptions{
+		AllowedNames:  allowed,
+		AlwaysInclude: always,
+		ReadOnly:      false,
 	})
 }
 

@@ -305,6 +305,39 @@ func TestExecutorTruncatesUTF8Safely(t *testing.T) {
 	}
 }
 
+func TestExecutorBoundsEveryModelVisibleResultField(t *testing.T) {
+	const limit = 64
+	executor := &Executor{MaxOutputBytes: limit}
+	result := executor.truncate(Result{
+		Summary: strings.Repeat("摘", 100),
+		Content: strings.Repeat("内", 100),
+		Data: map[string]any{
+			"stdout":  strings.Repeat("出", 100),
+			"stderr":  strings.Repeat("错", 100),
+			"content": strings.Repeat("数", 100),
+		},
+		Error: &Error{Code: ErrCommandFailed, Message: strings.Repeat("误", 100)},
+	})
+	if !result.Truncated || !strings.Contains(result.Summary, "截断") {
+		t.Fatalf("bounded result did not report truncation: %#v", result)
+	}
+	for name, value := range map[string]string{
+		"summary": result.Summary,
+		"content": result.Content,
+		"error":   result.Error.Message,
+	} {
+		if len(value) > limit || !utf8.ValidString(value) {
+			t.Fatalf("%s is not safely bounded: bytes=%d value=%q", name, len(value), value)
+		}
+	}
+	for _, key := range []string{"stdout", "stderr", "content"} {
+		value, _ := result.Data[key].(string)
+		if len(value) > limit/2 || !utf8.ValidString(value) {
+			t.Fatalf("data.%s is not safely bounded: bytes=%d value=%q", key, len(value), value)
+		}
+	}
+}
+
 func TestExecuteAuthorizedRejectsMismatchedGrant(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
@@ -331,6 +364,119 @@ func TestExecuteAuthorizedAllowsMatchingGrant(t *testing.T) {
 	result := executor.ExecuteAuthorized(context.Background(), call, permission.Grant{CallID: "1", Tool: "Write", Fingerprint: permission.Fingerprint(normalized), Scope: permission.GrantOnce})
 	if result.Status != StatusSuccess {
 		t.Fatalf("expected authorized write success, got %#v", result)
+	}
+}
+
+func TestRegistryValidateCall(t *testing.T) {
+	registry := &Registry{tools: map[string]Tool{}}
+	recorder := &recordingTool{name: "Recorder"}
+	if err := registry.Register(recorder); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := registry.ValidateCall(Call{Name: "Missing", ArgumentsJSON: `not json`}); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Fatalf("unknown tool was not rejected before JSON parsing: %v", err)
+	}
+	for _, raw := range []string{"", " \n\t "} {
+		validated, err := registry.ValidateCall(Call{ID: "blank", Name: "Recorder", ArgumentsJSON: raw})
+		if err != nil {
+			t.Fatalf("blank arguments failed: %v", err)
+		}
+		if validated.Tool != recorder || len(validated.Arguments) != 0 {
+			t.Fatalf("blank arguments were not normalized to {}: %#v", validated)
+		}
+	}
+
+	validated, err := registry.ValidateCall(Call{ID: "numbers", Name: "Recorder", ArgumentsJSON: `{"large":9007199254740993,"decimal":1.2300,"nested":{"items":[2]}}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := validated.Arguments["large"].(json.Number); !ok || got.String() != "9007199254740993" {
+		t.Fatalf("large number lost precision/type: %#v", validated.Arguments["large"])
+	}
+	if got, ok := validated.Arguments["decimal"].(json.Number); !ok || got.String() != "1.2300" {
+		t.Fatalf("decimal lost lexical precision/type: %#v", validated.Arguments["decimal"])
+	}
+
+	for _, raw := range []string{
+		`[]`, `"scalar"`, `1`, `true`, `null`, `{broken`, `{} {}`, `{} trailing`, `{"one":1}\n{"two":2}`,
+	} {
+		if _, err := registry.ValidateCall(Call{Name: "Recorder", ArgumentsJSON: raw}); err == nil {
+			t.Fatalf("ValidateCall accepted non-object/trailing input %q", raw)
+		}
+	}
+}
+
+func TestExecuteValidatedAuthorizedPreservesArgumentsAndGrant(t *testing.T) {
+	registry := &Registry{tools: map[string]Tool{}}
+	recorder := &recordingTool{name: "Recorder", mutate: true}
+	if err := registry.Register(recorder); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(registry, t.TempDir(), time.Second, 1024)
+	call := Call{ID: "call-1", Name: "Recorder", ArgumentsJSON: `{"large":9007199254740993,"decimal":1.25}`}
+	validated, err := registry.ValidateCall(call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := permission.NormalizeArguments(
+		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
+		validated.Arguments,
+		permission.Context{ProjectRoot: executor.ProjectRoot},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := permission.Grant{CallID: call.ID, Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: permission.Fingerprint(normalized)}
+	result := executor.ExecuteValidatedAuthorized(context.Background(), validated, grant)
+	if result.Status != StatusSuccess {
+		t.Fatalf("validated execution failed: %#v", result)
+	}
+	if validated.Arguments["observed"] != true {
+		t.Fatalf("tool did not receive the same arguments map: %#v", validated.Arguments)
+	}
+	if _, ok := recorder.last.Arguments["large"].(json.Number); !ok {
+		t.Fatalf("tool received lossy number: %#v", recorder.last.Arguments["large"])
+	}
+
+	for name, badGrant := range map[string]permission.Grant{
+		"tool":        {CallID: call.ID, Tool: "Other", Scope: permission.GrantOnce, Fingerprint: grant.Fingerprint},
+		"call id":     {CallID: "other-call", Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: grant.Fingerprint},
+		"fingerprint": {CallID: call.ID, Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: "wrong"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := executor.ExecuteValidatedAuthorized(context.Background(), validated, badGrant)
+			if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied {
+				t.Fatalf("mismatched grant was not rejected: %#v", result)
+			}
+		})
+	}
+	compatibility := executor.ExecuteAuthorized(context.Background(), call, grant)
+	if compatibility.Status != StatusSuccess {
+		t.Fatalf("legacy ExecuteAuthorized wrapper changed: %#v", compatibility)
+	}
+}
+
+func TestHookDeniedError(t *testing.T) {
+	denied := Result{
+		CallID:  "call-1",
+		Name:    "Bash",
+		Status:  StatusDenied,
+		Content: "blocked by trusted project policy",
+		Error:   &Error{Code: ErrHookDenied, Message: "blocked by trusted project policy", Recoverable: true},
+	}
+	encoded, err := json.Marshal(denied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"status":"denied"`) || !strings.Contains(string(encoded), `"code":"hook_denied"`) || !strings.Contains(string(encoded), `"recoverable":true`) {
+		t.Fatalf("hook deny serialization is incomplete: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "blocked by trusted project policy") {
+		t.Fatalf("model-visible safe reason is missing: %s", encoded)
+	}
+	if ErrHookDenied == ErrPermissionDenied {
+		t.Fatalf("hook and permission denial codes are conflated: %q", ErrHookDenied)
 	}
 }
 
@@ -378,6 +524,24 @@ func (f fakeTool) Description() string                   { return "fake tool" }
 func (f fakeTool) Schema() Schema                        { return f.schema }
 func (f fakeTool) Risk() Risk                            { return RiskSafe }
 func (f fakeTool) Execute(context.Context, Input) Result { return Result{} }
+
+type recordingTool struct {
+	name   string
+	mutate bool
+	last   Input
+}
+
+func (r *recordingTool) Name() string        { return r.name }
+func (r *recordingTool) Description() string { return "records input" }
+func (r *recordingTool) Schema() Schema      { return Schema{Type: "object"} }
+func (r *recordingTool) Risk() Risk          { return RiskDangerous }
+func (r *recordingTool) Execute(_ context.Context, input Input) Result {
+	r.last = input
+	if r.mutate {
+		input.Arguments["observed"] = true
+	}
+	return Success(input, "recorded", "recorded", nil)
+}
 
 func TestToolDescriptionsReinforcePromptRules(t *testing.T) {
 	registry, err := NewRegistry(t.TempDir())

@@ -6,9 +6,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 const marker = "[redacted]"
+
+const shortSecretRuneLimit = 4
 
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key\s*[=:]\s*)[^\s,;]+`),
@@ -119,9 +123,62 @@ func (r *RuntimeRedactor) Text(value string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, secret := range r.secrets {
+		if utf8.RuneCountInString(secret) < shortSecretRuneLimit {
+			redacted = replaceWholeToken(redacted, secret)
+			continue
+		}
 		redacted = strings.ReplaceAll(redacted, secret, marker)
 	}
 	return redacted
+}
+
+func replaceWholeToken(value string, secret string) string {
+	if secret == "" {
+		return value
+	}
+	var result strings.Builder
+	searchFrom := 0
+	for searchFrom < len(value) {
+		relative := strings.Index(value[searchFrom:], secret)
+		if relative < 0 {
+			break
+		}
+		start := searchFrom + relative
+		end := start + len(secret)
+		if tokenBoundaryBefore(value, start) && tokenBoundaryAfter(value, end) {
+			result.WriteString(value[searchFrom:start])
+			result.WriteString(marker)
+			searchFrom = end
+			continue
+		}
+		result.WriteString(value[searchFrom:end])
+		searchFrom = end
+	}
+	if searchFrom == 0 {
+		return value
+	}
+	result.WriteString(value[searchFrom:])
+	return result.String()
+}
+
+func tokenBoundaryBefore(value string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(value[:index])
+	return !isTokenRune(r)
+}
+
+func tokenBoundaryAfter(value string, index int) bool {
+	if index == len(value) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(value[index:])
+	return !isTokenRune(r)
+}
+
+func isTokenRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
 }
 
 func (r *RuntimeRedactor) Any(value any) any {

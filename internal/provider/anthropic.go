@@ -37,11 +37,14 @@ func (p *AnthropicProvider) Name() string {
 }
 
 func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
+	attempt := newRequestAttempt(req.Observer)
+	ctx = attempt.traceContext(ctx)
 	out := make(chan StreamEvent)
 	params := anthropicMessageParams(p.cfg.Model, req)
 
 	go func() {
 		defer close(out)
+		defer attempt.finish()
 		stream := p.client.Messages.NewStreaming(ctx, params)
 		toolCalls := map[int64]*anthropicToolCallState{}
 		for stream.Next() {
@@ -76,6 +79,7 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 					return
 				}
 			case anthropic.MessageStopEvent:
+				attempt.finish()
 				if len(toolCalls) > 0 {
 					emitStreamEvent(ctx, out, newToolCallsEvent(anthropicToolCalls(toolCalls)))
 					return
@@ -85,6 +89,7 @@ func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-
 			}
 		}
 		if err := stream.Err(); err != nil {
+			attempt.finish()
 			emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventError, Err: err})
 		}
 	}()
@@ -169,16 +174,21 @@ func toAnthropicSystemBlocks(req ChatRequest) []anthropic.TextBlockParam {
 		return nil
 	}
 	params := make([]anthropic.TextBlockParam, 0, len(blocks))
-	lastCacheable := -1
+	breakpoint := -1
+	targetName := strings.TrimSpace(req.Cache.SystemBreakpointName)
 	for _, block := range blocks {
 		param := anthropic.TextBlockParam{Text: block.Content}
-		if block.Cacheable {
-			lastCacheable = len(params)
+		if usesOrderedSystem(req) {
+			if breakpoint < 0 && targetName != "" && block.Cacheable && block.Name == targetName {
+				breakpoint = len(params)
+			}
+		} else if block.Cacheable {
+			breakpoint = len(params)
 		}
 		params = append(params, param)
 	}
-	if req.Cache.EnablePromptCache && lastCacheable >= 0 {
-		params[lastCacheable].CacheControl = anthropic.NewCacheControlEphemeralParam()
+	if req.Cache.EnablePromptCache && breakpoint >= 0 {
+		params[breakpoint].CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}
 	return params
 }
@@ -197,7 +207,7 @@ func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
 		}
 		tools = append(tools, anthropic.ToolUnionParam{OfTool: &param})
 	}
-	if req.Cache.EnablePromptCache {
+	if req.Cache.EnablePromptCache && (!usesOrderedSystem(req) || req.Cache.CacheTools) {
 		last := len(tools) - 1
 		tools[last].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}

@@ -12,6 +12,7 @@ import (
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
 	"xagent/internal/events"
+	"xagent/internal/hook"
 	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
 	"xagent/internal/permission"
@@ -40,6 +41,7 @@ type OrchestratorOptions struct {
 	DefaultModel        string
 	Redact              func(string) string
 	RedactionLookbehind int
+	Hooks               hook.Runtime
 }
 
 type sessionPreparer interface {
@@ -48,6 +50,10 @@ type sessionPreparer interface {
 
 type stableSessionPreparer interface {
 	PrepareStable(ctx context.Context) sessionctx.PreparedContext
+}
+
+type optionsSessionPreparer interface {
+	PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts contextmgr.PrepareOptions) (sessionctx.PreparedContext, error)
 }
 
 type memoryUpdater interface {
@@ -73,6 +79,8 @@ type Orchestrator struct {
 	redactionLookbehind int
 	permissionMode      permission.Mode
 	runOptions          RunOptions
+	runs                *runTracker
+	hooks               hook.Runtime
 }
 
 func New(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
@@ -111,7 +119,28 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 	if lookbehind < 64 {
 		lookbehind = 64
 	}
-	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, skillManager: options.SkillManager, defaultModel: strings.TrimSpace(options.DefaultModel), redact: redactor, redactionLookbehind: lookbehind, permissionMode: permission.ModeDefault, runOptions: runOptions}
+	hooks := options.Hooks
+	if hooks == nil {
+		hooks = hook.Noop()
+	}
+	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, skillManager: options.SkillManager, defaultModel: strings.TrimSpace(options.DefaultModel), redact: redactor, redactionLookbehind: lookbehind, permissionMode: permission.ModeDefault, runOptions: runOptions, runs: newRunTracker(), hooks: hooks}
+}
+
+// WaitIdle waits until every main or independent Agent run has completed its
+// lifecycle finalizer. It is safe to call on an Orchestrator created by any of
+// the compatibility constructors.
+func (o *Orchestrator) WaitIdle(ctx context.Context) error {
+	if o == nil || o.runs == nil {
+		return nil
+	}
+	return o.runs.wait(ctx)
+}
+
+func (o *Orchestrator) hookRuntime() hook.Runtime {
+	if o == nil || o.hooks == nil {
+		return hook.Noop()
+	}
+	return o.hooks
 }
 
 func (o *Orchestrator) redactText(value string) string {
@@ -171,7 +200,15 @@ func (o *Orchestrator) CompactContext(ctx context.Context, conv *conversation.Co
 	if o.contextManager == nil {
 		return contextmgr.Result{}, fmt.Errorf("上下文管理未启用")
 	}
-	result, err := o.contextManager.CompactNow(ctx, conv)
+	binding := hook.CompactBinding{}
+	if conv != nil {
+		binding.SessionID = conv.ID
+	}
+	result, err := o.contextManager.PrepareWithOptions(ctx, conv, contextmgr.PrepareOptions{
+		Mode:             contextmgr.ModeManual,
+		PersistArtifacts: true,
+		Observer:         hookCompactionObserver{runtime: o.hookRuntime(), binding: binding, redact: o.redactText},
+	})
 	if result.Changed {
 		if saveErr := o.store.Save(ctx, conv); saveErr != nil {
 			return result, saveErr
@@ -193,6 +230,17 @@ func (o *Orchestrator) SendWithMode(ctx context.Context, conv *conversation.Conv
 }
 
 func (o *Orchestrator) SendRequest(ctx context.Context, conv *conversation.Conversation, req RunRequest) (<-chan events.Event, error) {
+	endRun := func() {}
+	if o != nil && o.runs != nil {
+		endRun = o.runs.begin()
+	}
+	runHandedOff := false
+	defer func() {
+		if !runHandedOff {
+			endRun()
+		}
+	}()
+
 	req.UserText = strings.TrimSpace(req.UserText)
 	if req.UserText == "" {
 		return nil, fmt.Errorf("请输入非空内容")
@@ -207,18 +255,76 @@ func (o *Orchestrator) SendRequest(ctx context.Context, conv *conversation.Conve
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan events.Event)
+	runtime := o.hookRuntime()
+	state.ref = runtime.BeginTurn(requestCtxOrBackground(ctx), conv.ID, hook.ExecutionMain, hookMode(req.Mode))
+	message := runtime.BeginMessage(requestCtxOrBackground(ctx), state.ref, hook.MessageUser, req.UserText)
 	conversation.AppendUserMessage(conv, req.UserText)
+	runtime.EndMessage(requestCtxOrBackground(ctx), message)
+	out := make(chan events.Event)
 
 	go func() {
 		defer close(out)
+		defer endRun()
 		start := time.Now()
+		result := RunResult{}
 		if !emitEvent(ctx, out, events.Event{Type: events.UserSubmitted, Text: req.UserText}) {
-			return
+			result = finishRunResult(result, start, StopReasonCancelled, ctx.Err())
+		} else {
+			result = o.runAgentLoop(ctx, conv, req, state, out, start)
 		}
-		o.runAgentLoop(ctx, conv, req, state, out, start)
+		o.endTurn(state.ref, result)
+		o.emitTerminalEvent(ctx, out, result)
 	}()
+	runHandedOff = true
 	return out, nil
+}
+
+func (o *Orchestrator) endTurn(ref hook.ExecutionRef, result RunResult) {
+	o.hookRuntime().EndTurn(context.Background(), ref, hookTurnStatus(result), hookTurnError(result))
+}
+
+func hookTurnError(result RunResult) string {
+	switch result.Reason {
+	case StopReasonCancelled:
+		return "request canceled"
+	case StopReasonUnknownTool:
+		return "unknown tool call limit reached"
+	case StopReasonProviderError:
+		return "agent run failed"
+	default:
+		if result.Err != nil {
+			return "agent run failed"
+		}
+		return ""
+	}
+}
+
+func hookMode(mode RunMode) hook.HookMode {
+	if mode == RunModePlan {
+		return hook.ModePlan
+	}
+	return hook.ModeDefault
+}
+
+func hookTurnStatus(result RunResult) hook.TurnStatus {
+	switch result.Reason {
+	case StopReasonCompleted:
+		return hook.TurnCompleted
+	case StopReasonMaxIterations:
+		return hook.TurnMaxIterations
+	case StopReasonCancelled:
+		return hook.TurnCanceled
+	default:
+		return hook.TurnError
+	}
+}
+
+func (o *Orchestrator) emitTerminalEvent(ctx context.Context, out chan<- events.Event, result RunResult) {
+	if result.Err != nil {
+		emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.redactError(result.Err)})
+		return
+	}
+	emitEvent(ctx, out, events.Event{Type: events.Done, Duration: result.Duration})
 }
 
 func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, mode RunMode, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
@@ -230,11 +336,31 @@ func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversati
 }
 
 func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
+	return o.streamWithExecution(ctx, conv, mode, profile, includeTools, iteration, hook.ExecutionRef{})
+}
+
+func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int, ref hook.ExecutionRef) (<-chan provider.StreamEvent, error) {
 	optionalSections := []prompt.Section{}
+	binding := hook.CompactBinding{}
+	if conv != nil {
+		binding.SessionID = conv.ID
+	}
+	if ref.ExecutionID != "" {
+		refCopy := ref
+		binding.SessionID = ref.SessionID
+		binding.Execution = &refCopy
+	}
+	prepareOptions := contextmgr.PrepareOptions{
+		Mode:             contextmgr.ModeAuto,
+		PersistArtifacts: profile.Persist,
+		Observer:         hookCompactionObserver{runtime: o.hookRuntime(), binding: binding, redact: o.redactText},
+	}
 	if o.sessionContext != nil {
 		var prepared sessionctx.PreparedContext
 		var err error
-		if !profile.Persist {
+		if options, ok := o.sessionContext.(optionsSessionPreparer); ok {
+			prepared, err = options.PrepareWithOptions(ctx, conv, prepareOptions)
+		} else if !profile.Persist {
 			if stable, ok := o.sessionContext.(stableSessionPreparer); ok {
 				prepared = stable.PrepareStable(ctx)
 			}
@@ -253,8 +379,8 @@ func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation
 				return nil, err
 			}
 		}
-	} else if o.contextManager != nil && profile.Persist {
-		result, err := o.contextManager.Prepare(ctx, conv, contextmgr.ModeAuto)
+	} else if o.contextManager != nil {
+		result, err := o.contextManager.PrepareWithOptions(ctx, conv, prepareOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -264,6 +390,34 @@ func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation
 			}
 		}
 	}
+	var requestRegistry *tool.Registry
+	if includeTools {
+		var err error
+		requestRegistry, err = o.registryForProfile(mode, profile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var hookBlocks []prompt.Block
+	var lease hook.PromptLease
+	if ref.ExecutionID != "" {
+		acquired, err := o.hookRuntime().AcquirePrompts(requestCtxOrBackground(ctx), ref)
+		if err != nil {
+			return nil, err
+		}
+		var blocks []hook.PromptBlock
+		if acquired != nil {
+			blocks = acquired.Blocks()
+			if len(blocks) == 0 {
+				acquired.Release()
+			} else {
+				lease = acquired
+			}
+		}
+		for _, block := range blocks {
+			hookBlocks = append(hookBlocks, prompt.Block{Name: block.Name, Content: o.redactText(block.Content), Stable: false})
+		}
+	}
 	bundle := prompt.Build(prompt.BuildRequest{
 		Mode:                   promptRunMode(mode),
 		Iteration:              iteration,
@@ -271,6 +425,7 @@ func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation
 		SkillCatalog:           skill.CatalogPromptWithRedactor(profile.Catalog, o.redactText),
 		ActiveSkills:           skill.ActivePromptWithRedactor(profile.Activity, o.redactText),
 		OptionalStableSections: optionalSections,
+		HookBlocks:             hookBlocks,
 	})
 	request := provider.ChatRequest{
 		Model:         profile.Model,
@@ -281,11 +436,17 @@ func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation
 		Cache:         provider.CachePolicy{EnablePromptCache: true},
 	}
 	if includeTools {
-		registry, err := o.registryForProfile(mode, profile)
-		if err != nil {
-			return nil, err
-		}
-		request.Tools = toolDefinitionsFromRegistry(registry)
+		request.Tools = toolDefinitionsFromRegistry(requestRegistry)
+	}
+	if bundle.UsesOrderedBlocks() {
+		request.System = providerOrderedBlocks(bundle.OrderedBlocks)
+		request.StableSystem = nil
+		request.DynamicSystem = nil
+		request.Cache.SystemBreakpointName = bundle.SystemBreakpointName
+		request.Cache.CacheTools = false
+	}
+	if lease != nil {
+		request.Observer = newPromptLeaseObserver(lease)
 	}
 	return o.provider.StreamChat(ctx, request)
 }
@@ -320,6 +481,14 @@ func providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
 		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: false})
+	}
+	return result
+}
+
+func providerOrderedBlocks(blocks []prompt.Block) []provider.SystemBlock {
+	result := make([]provider.SystemBlock, 0, len(blocks))
+	for _, block := range blocks {
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: block.Stable})
 	}
 	return result
 }

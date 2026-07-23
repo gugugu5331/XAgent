@@ -2,6 +2,7 @@ package sessionctx
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +98,179 @@ func TestSessionContextPriority(t *testing.T) {
 	)
 }
 
+func TestPrepareWithOptions(t *testing.T) {
+	preparer := &fakeContextPreparer{changed: true}
+	manager := &Manager{
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Content: "stable project rules", Stable: true}}},
+		Context:      preparer,
+	}
+	conv := conversation.NewConversation("c", zeroTime())
+
+	if _, err := manager.Prepare(context.Background(), conv, PrepareAuto); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Prepare(context.Background(), conv, PrepareManual); err != nil {
+		t.Fatal(err)
+	}
+	observer := sessionCompactionObserver{}
+	prepared, err := manager.PrepareWithOptions(context.Background(), conv, contextmgr.PrepareOptions{
+		Mode:             contextmgr.ModeAuto,
+		PersistArtifacts: false,
+		Observer:         observer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared.MessagesChanged || !strings.Contains(joinSections(prepared.StableSections), "stable project rules") {
+		t.Fatalf("options prepare dropped prepared context: %#v", prepared)
+	}
+	if len(preparer.options) != 3 {
+		t.Fatalf("PrepareWithOptions calls = %#v", preparer.options)
+	}
+	assertPrepareOption := func(index int, mode contextmgr.Mode, persist bool) {
+		t.Helper()
+		got := preparer.options[index]
+		if got.Mode != mode || got.PersistArtifacts != persist {
+			t.Fatalf("options[%d] = %#v, want mode=%s persist=%v", index, got, mode, persist)
+		}
+	}
+	assertPrepareOption(0, contextmgr.ModeAuto, true)
+	assertPrepareOption(1, contextmgr.ModeManual, true)
+	assertPrepareOption(2, contextmgr.ModeAuto, false)
+	if preparer.options[2].Observer == nil {
+		t.Fatal("transient observer was not passed through")
+	}
+
+	legacy := &legacyContextPreparer{}
+	legacyManager := &Manager{Context: legacy}
+	if _, err := legacyManager.PrepareWithOptions(context.Background(), conv, contextmgr.PrepareOptions{Mode: contextmgr.ModeAuto, PersistArtifacts: false}); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.calls != 0 {
+		t.Fatalf("transient prepare fell back to artifact-capable legacy path: calls=%d", legacy.calls)
+	}
+}
+
+func TestNoHookContextCompatibility(t *testing.T) {
+	newManager := func(preparer *fakeContextPreparer) *Manager {
+		return &Manager{
+			Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Priority: 1000, Content: "stable project rules", Stable: true}}},
+			Memory: fakeMemoryProvider{indices: map[memory.Scope]memory.Index{
+				memory.ScopeProject: {Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "project", Title: "knowledge", Body: "stable memory"}}},
+				memory.ScopeUser:    {Scope: memory.ScopeUser},
+			}},
+			Context: preparer,
+		}
+	}
+	type snapshot struct {
+		prepared PreparedContext
+		messages []conversation.Message
+		options  []contextmgr.PrepareOptions
+	}
+	observers := []struct {
+		name     string
+		observer contextmgr.CompactionObserver
+	}{{name: "nil", observer: nil}, {name: "noop", observer: sessionCompactionObserver{}}}
+	var baseline *snapshot
+	for _, item := range observers {
+		preparer := &fakeContextPreparer{changed: true}
+		manager := newManager(preparer)
+		conv := conversation.NewConversation("compat", zeroTime())
+		conversation.AppendUserMessage(conv, "unchanged message")
+		for index := range conv.Messages {
+			conv.Messages[index].CreatedAt = time.Time{}
+		}
+		prepared, err := manager.PrepareWithOptions(context.Background(), conv, contextmgr.PrepareOptions{
+			Mode: contextmgr.ModeAuto, PersistArtifacts: false, Observer: item.observer,
+		})
+		if err != nil {
+			t.Fatalf("%s prepare: %v", item.name, err)
+		}
+		options := append([]contextmgr.PrepareOptions(nil), preparer.options...)
+		for index := range options {
+			options[index].Observer = nil
+		}
+		got := snapshot{prepared: prepared, messages: append([]conversation.Message(nil), conv.Messages...), options: options}
+		if baseline == nil {
+			copy := got
+			baseline = &copy
+		} else if !reflect.DeepEqual(*baseline, got) {
+			t.Fatalf("%s observer changed session context:\nlegacy=%#v\nactual=%#v", item.name, *baseline, got)
+		}
+	}
+	if baseline == nil || !baseline.prepared.MessagesChanged || len(baseline.prepared.Diagnostics) != 0 ||
+		!strings.Contains(joinSections(baseline.prepared.StableSections), "stable project rules") ||
+		!strings.Contains(joinSections(baseline.prepared.StableSections), "stable memory") || len(baseline.messages) != 1 || len(baseline.options) != 1 {
+		t.Fatalf("legacy session-context golden changed: %#v", baseline)
+	}
+}
+
+func TestNoHookSessionCompatibility(t *testing.T) {
+	type snapshot struct {
+		newPrepared    PreparedContext
+		resumePrepared PreparedContext
+		newMessages    []conversation.Message
+		resumeMessages []conversation.Message
+		contextCalls   int
+		contextOptions []contextmgr.PrepareOptions
+	}
+	observers := []struct {
+		name     string
+		observer contextmgr.CompactionObserver
+	}{{name: "nil", observer: nil}, {name: "noop", observer: sessionCompactionObserver{}}}
+	var baseline *snapshot
+	for _, item := range observers {
+		preparer := &fakeContextPreparer{}
+		manager := &Manager{
+			Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "session-policy", Content: "same session policy", Stable: true}}},
+			Context:      preparer,
+		}
+		newConversation := conversation.NewConversation("new", zeroTime())
+		resumedConversation := conversation.NewConversation("resumed", zeroTime())
+		conversation.AppendUserMessage(newConversation, "new message")
+		conversation.AppendAssistantMessage(resumedConversation, "restored message")
+		for _, conv := range []*conversation.Conversation{newConversation, resumedConversation} {
+			for index := range conv.Messages {
+				conv.Messages[index].CreatedAt = time.Time{}
+			}
+			conv.UpdatedAt = time.Time{}
+		}
+		opts := contextmgr.PrepareOptions{Mode: contextmgr.ModeAuto, PersistArtifacts: true, Observer: item.observer}
+		newPrepared, err := manager.PrepareWithOptions(context.Background(), newConversation, opts)
+		if err != nil {
+			t.Fatalf("%s new session prepare: %v", item.name, err)
+		}
+		resumePrepared, err := manager.PrepareWithOptions(context.Background(), resumedConversation, opts)
+		if err != nil {
+			t.Fatalf("%s resumed session prepare: %v", item.name, err)
+		}
+		options := append([]contextmgr.PrepareOptions(nil), preparer.options...)
+		for index := range options {
+			options[index].Observer = nil
+		}
+		got := snapshot{
+			newPrepared: newPrepared, resumePrepared: resumePrepared,
+			newMessages:    append([]conversation.Message(nil), newConversation.Messages...),
+			resumeMessages: append([]conversation.Message(nil), resumedConversation.Messages...),
+			contextCalls:   preparer.calls, contextOptions: options,
+		}
+		if baseline == nil {
+			copy := got
+			baseline = &copy
+		} else if !reflect.DeepEqual(*baseline, got) {
+			t.Fatalf("%s observer changed per-session state:\nlegacy=%#v\nactual=%#v", item.name, *baseline, got)
+		}
+	}
+	if baseline == nil || baseline.contextCalls != 2 || len(baseline.contextOptions) != 2 ||
+		len(baseline.newPrepared.Diagnostics) != 0 || len(baseline.resumePrepared.Diagnostics) != 0 ||
+		!strings.Contains(joinSections(baseline.newPrepared.StableSections), "same session policy") ||
+		!reflect.DeepEqual(baseline.newPrepared.StableSections, baseline.resumePrepared.StableSections) ||
+		len(baseline.newMessages) != 1 || baseline.newMessages[0].Content != "new message" ||
+		len(baseline.resumeMessages) != 1 || baseline.resumeMessages[0].Content != "restored message" {
+		t.Fatalf("legacy per-session golden changed: %#v", baseline)
+	}
+}
+
 type fakeInstructionLoader struct {
 	sections    []prompt.Section
 	diagnostics []diagnostics.Diagnostic
@@ -131,11 +305,31 @@ func (p fakeMemoryProvider) Diagnostics() []diagnostics.Diagnostic { return p.di
 type fakeContextPreparer struct {
 	changed bool
 	calls   int
+	options []contextmgr.PrepareOptions
 }
 
 func (p *fakeContextPreparer) Prepare(ctx context.Context, conv *conversation.Conversation, mode contextmgr.Mode) (contextmgr.Result, error) {
 	p.calls++
 	return contextmgr.Result{Changed: p.changed}, nil
+}
+
+func (p *fakeContextPreparer) PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts contextmgr.PrepareOptions) (contextmgr.Result, error) {
+	p.calls++
+	p.options = append(p.options, opts)
+	return contextmgr.Result{Changed: p.changed}, nil
+}
+
+type sessionCompactionObserver struct{}
+
+func (sessionCompactionObserver) Before(context.Context, contextmgr.Attempt) any { return nil }
+
+func (sessionCompactionObserver) After(context.Context, any, contextmgr.Result, error) {}
+
+type legacyContextPreparer struct{ calls int }
+
+func (p *legacyContextPreparer) Prepare(context.Context, *conversation.Conversation, contextmgr.Mode) (contextmgr.Result, error) {
+	p.calls++
+	return contextmgr.Result{Changed: true}, nil
 }
 
 type assertErr string

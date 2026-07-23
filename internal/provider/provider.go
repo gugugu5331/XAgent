@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http/httptrace"
 	"strings"
+	"sync"
 
 	"xagent/internal/config"
 	"xagent/internal/conversation"
@@ -11,6 +13,7 @@ import (
 
 type ChatRequest struct {
 	Model         string
+	System        []SystemBlock
 	StableSystem  []SystemBlock
 	DynamicSystem []SystemBlock
 	SystemPrompt  string
@@ -19,6 +22,7 @@ type ChatRequest struct {
 	Tools         []ToolDefinition
 	ToolDefs      *tool.Registry
 	Cache         CachePolicy
+	Observer      RequestObserver
 }
 
 type SystemBlock struct {
@@ -34,7 +38,20 @@ type ToolDefinition struct {
 }
 
 type CachePolicy struct {
-	EnablePromptCache bool
+	EnablePromptCache    bool
+	SystemBreakpointName string
+	CacheTools           bool
+}
+
+// RequestObserver observes one Provider request attempt. Providers call
+// MarkSent when an outbound transport crosses the irreversible write
+// boundary, and call Finish exactly once on every return path.
+//
+// Finish(false) is only valid after the transport and all related callbacks
+// are quiescent; a later MarkSent is forbidden. Callers may pass nil.
+type RequestObserver interface {
+	MarkSent()
+	Finish(sent bool)
 }
 
 type Usage struct {
@@ -70,6 +87,9 @@ type Provider interface {
 }
 
 func systemBlocks(req ChatRequest) []SystemBlock {
+	if len(req.System) > 0 {
+		return nonEmptySystemBlocks(req.System)
+	}
 	blocks := make([]SystemBlock, 0, len(req.StableSystem)+len(req.DynamicSystem)+1)
 	blocks = append(blocks, nonEmptySystemBlocks(req.StableSystem)...)
 	blocks = append(blocks, nonEmptySystemBlocks(req.DynamicSystem)...)
@@ -77,6 +97,10 @@ func systemBlocks(req ChatRequest) []SystemBlock {
 		blocks = append(blocks, SystemBlock{Name: "legacy-system-prompt", Content: strings.TrimSpace(req.SystemPrompt), Cacheable: true})
 	}
 	return blocks
+}
+
+func usesOrderedSystem(req ChatRequest) bool {
+	return len(req.System) > 0
 }
 
 func joinedSystemBlocks(req ChatRequest) string {
@@ -145,5 +169,88 @@ func emitStreamEvent(ctx context.Context, out chan<- StreamEvent, event StreamEv
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+type requestAttempt struct {
+	observer  RequestObserver
+	mu        sync.Mutex
+	cond      *sync.Cond
+	sent      bool
+	notifying bool
+	finished  bool
+}
+
+func newRequestAttempt(observer RequestObserver) *requestAttempt {
+	attempt := &requestAttempt{observer: observer}
+	attempt.cond = sync.NewCond(&attempt.mu)
+	return attempt
+}
+
+func (a *requestAttempt) traceContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			a.markSent()
+		},
+	})
+}
+
+func (a *requestAttempt) markSent() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	if a.finished {
+		observer := a.observer
+		a.mu.Unlock()
+		// Forward a contract violation so strict test observers can detect a
+		// late callback. Production observers are required to be defensive.
+		if observer != nil {
+			observer.MarkSent()
+		}
+		return
+	}
+	if a.sent {
+		a.mu.Unlock()
+		return
+	}
+	a.sent = true
+	observer := a.observer
+	if observer == nil {
+		a.mu.Unlock()
+		return
+	}
+	a.notifying = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.notifying = false
+		a.cond.Broadcast()
+		a.mu.Unlock()
+	}()
+	observer.MarkSent()
+}
+
+func (a *requestAttempt) finish() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	for a.notifying {
+		a.cond.Wait()
+	}
+	if a.finished {
+		a.mu.Unlock()
+		return
+	}
+	a.finished = true
+	sent := a.sent
+	observer := a.observer
+	a.mu.Unlock()
+	if observer != nil {
+		observer.Finish(sent)
 	}
 }

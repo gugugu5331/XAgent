@@ -140,6 +140,10 @@ func (m *Model) beginRequest(cancel context.CancelFunc, eventStream <-chan Event
 	m.request = &RequestSession{
 		Cancel: cancel, StartedAt: time.Now(), Timeout: timeout, Independent: independent,
 	}
+	if m.lifecycle == nil {
+		m.lifecycle = newLifecycleState()
+	}
+	m.lifecycle.begin(m.request)
 	m.input.Clear()
 	m.input.SetEnabled(false)
 	m.streaming = true
@@ -186,10 +190,7 @@ func (m *Model) exposeSkillNotice() {
 }
 
 func (m *Model) redactSkillText(value string) string {
-	if m != nil && m.deps.Redact != nil {
-		return m.deps.Redact(value)
-	}
-	return redact.Text(value)
+	return m.redactText(value)
 }
 
 func formatSkillDiagnostics(prefix string, items []diagnostics.Diagnostic, err error, redactor func(string) string) string {

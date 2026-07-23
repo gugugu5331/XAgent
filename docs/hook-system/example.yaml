@@ -1,0 +1,74 @@
+version: 1
+hooks:
+  # Session-scoped reminders remain active until the session ends.
+  - event: session_start
+    once: true
+    action:
+      type: prompt
+      scope: session
+      content: "Keep changes focused and report the verification evidence."
+
+  # Turn-scoped prompts affect only the turn that triggered this rule.
+  - event: turn_start
+    action:
+      type: prompt
+      scope: turn
+      content: "Check the active execution mode before choosing tools."
+
+  # A next-scoped prompt is consumed by the next outbound model request.
+  - event: tool_after
+    action:
+      type: prompt
+      scope: next
+      content: "Review the preceding tool result before continuing."
+
+  # Command actions receive the event as bounded JSON on stdin. This example
+  # uses only a fixed command and a non-secret environment value.
+  - event: message_after
+    if:
+      all:
+        - field: message.role
+          match: exact
+          value: assistant
+        - field: execution.kind
+          match: glob
+          value: "*"
+          negate: false
+    async: true
+    timeout: 5s
+    action:
+      type: command
+      command: "printf '%s\n' 'XAgent Hook example fired'"
+      env:
+        XAGENT_HOOK_EXAMPLE: "1"
+
+  # Synchronous tool_before Command/HTTP actions may return a decision. The
+  # reserved .invalid host is a safe placeholder and must be replaced locally.
+  - event: tool_before
+    if:
+      any:
+        - field: tool.name
+          match: exact
+          value: Bash
+        - field: tool.name
+          match: regex
+          value: "^mcp__example__"
+    timeout: 3s
+    action:
+      type: http
+      url: https://policy.example.invalid/xagent/hook
+      method: POST
+      headers:
+        X-XAgent-Example: safe-placeholder
+      send_event: true
+      decision: true
+
+  # SubAgent is a schema placeholder in this release; it validates and emits a
+  # diagnostic but does not start a child Agent yet.
+  - event: turn_end
+    async: true
+    timeout: 10s
+    action:
+      type: subagent
+      agent: example-auditor
+      input: "Summarize the completed turn for an audit log."

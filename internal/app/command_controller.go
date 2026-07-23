@@ -10,7 +10,6 @@ import (
 	"xagent/internal/command"
 	"xagent/internal/memory"
 	"xagent/internal/orchestrator"
-	"xagent/internal/redact"
 )
 
 type commandController struct {
@@ -21,7 +20,7 @@ type commandController struct {
 var _ command.Controller = (*commandController)(nil)
 
 func (c *commandController) DisplayNotice(text string) {
-	c.model.status.Notice = redact.Text(text)
+	c.model.status.Notice = c.model.redactText(text)
 	c.model.status.Error = nil
 }
 
@@ -30,7 +29,7 @@ func (c *commandController) DisplayError(err error) {
 		c.model.status.Error = nil
 		return
 	}
-	safe := fmt.Errorf("%s", redact.Text(err.Error()))
+	safe := c.model.redactError(err)
 	c.model.status.Notice = ""
 	c.model.status.Error = safe
 	c.model.lastError = safe
@@ -117,17 +116,17 @@ func (c *commandController) MemoryStatus() command.MemoryStatus {
 	result.User.Enabled = !status.UserDisabled
 	result.Project.Enabled = !status.ProjectDisabled
 	for _, item := range status.Diagnostics {
-		if text := item.Safe(redact.Text).Text(); text != "" {
+		if text := item.Safe(c.model.redactText).Text(); text != "" {
 			result.Diagnostics = append(result.Diagnostics, text)
 		}
 	}
 	if index, err := manager.LoadIndex(memory.ScopeUser); err != nil {
-		result.Diagnostics = append(result.Diagnostics, err.Error())
+		result.Diagnostics = append(result.Diagnostics, c.model.redactText(err.Error()))
 	} else {
 		result.User.Count = len(index.Entries)
 	}
 	if index, err := manager.LoadIndex(memory.ScopeProject); err != nil {
-		result.Diagnostics = append(result.Diagnostics, err.Error())
+		result.Diagnostics = append(result.Diagnostics, c.model.redactText(err.Error()))
 	} else {
 		result.Project.Count = len(index.Entries)
 	}
@@ -254,7 +253,7 @@ func (c *commandController) LegacyMCPStatus() (string, error) {
 			parts = append(parts, text)
 		}
 	}
-	return strings.Join(parts, "；"), nil
+	return c.model.redactText(strings.Join(parts, "；")), nil
 }
 
 func (c *commandController) LegacyDiagnostics() (string, error) {
@@ -267,13 +266,13 @@ func (c *commandController) LegacyDiagnostics() (string, error) {
 	}
 	parts := make([]string, 0)
 	for _, item := range collector.List() {
-		text := item.Safe(redact.Text).Text()
+		text := item.Safe(c.model.redactText).Text()
 		if item.Source != "" {
-			text += " source=" + redact.Text(item.Source)
+			text += " source=" + c.model.redactText(item.Source)
 		}
 		if text != "" {
 			parts = append(parts, text)
 		}
 	}
-	return "本地诊断，不会发送给模型: " + strings.Join(parts, "；"), nil
+	return c.model.redactText("本地诊断，不会发送给模型: " + strings.Join(parts, "；")), nil
 }

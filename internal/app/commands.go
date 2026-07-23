@@ -51,7 +51,7 @@ func (m *Model) submitUserMessage(text string) tea.Cmd {
 		m.skillActivity = skill.NewActivity()
 	}
 	if m.orchestrator == nil {
-		err := fmt.Errorf("Orchestrator 未启用")
+		err := m.redactError(fmt.Errorf("Orchestrator 未启用"))
 		m.status.Error = err
 		m.lastError = err
 		m.exposeSkillNotice()
@@ -59,8 +59,9 @@ func (m *Model) submitUserMessage(text string) tea.Cmd {
 	}
 	profile, err := m.orchestrator.BuildExecutionProfile(m.mode, m.skillActivity, 0)
 	if err != nil {
-		m.status.Error = err
-		m.lastError = err
+		safe := m.redactError(err)
+		m.status.Error = safe
+		m.lastError = safe
 		m.exposeSkillNotice()
 		return nil
 	}
@@ -70,8 +71,9 @@ func (m *Model) submitUserMessage(text string) tea.Cmd {
 	})
 	if err != nil {
 		cancel()
-		m.status.Error = err
-		m.lastError = err
+		safe := m.redactError(err)
+		m.status.Error = safe
+		m.lastError = safe
 		m.exposeSkillNotice()
 		return nil
 	}
