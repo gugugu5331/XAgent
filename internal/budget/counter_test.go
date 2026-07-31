@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -145,5 +146,87 @@ func TestLimitsRejectNegativeAndAboveHardCap(t *testing.T) {
 
 	if _, err := NewLimits(Limit{Dimension: dimensionCount, Value: 1}); err == nil {
 		t.Fatal("unknown dimension was accepted")
+	}
+}
+
+func TestCounterConsumesAtomically(t *testing.T) {
+	effective, err := NewLimits(
+		Limit{Dimension: Bytes, Value: 1_000},
+		Limit{Dimension: Items, Value: 100},
+	)
+	if err != nil {
+		t.Fatal("create effective limits failed")
+	}
+	hard, err := NewLimits(
+		Limit{Dimension: Bytes, Value: 2_000},
+		Limit{Dimension: Items, Value: 200},
+	)
+	if err != nil {
+		t.Fatal("create hard limits failed")
+	}
+	counter, err := NewCounter(effective, hard)
+	if err != nil {
+		t.Fatal("create counter failed")
+	}
+
+	consumeBatch := func(workers int) {
+		t.Helper()
+		failures := make(chan error, workers*2)
+		var wait sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				if err := counter.Consume(Bytes, 10); err != nil {
+					failures <- err
+				}
+				if err := counter.Consume(Items, 1); err != nil {
+					failures <- err
+				}
+			}()
+		}
+		wait.Wait()
+		close(failures)
+		for range failures {
+			t.Error("an in-budget concurrent consumption failed")
+		}
+	}
+
+	consumeBatch(50)
+	midpoint := counter.Snapshot()
+	if got := midpoint.Used(Bytes); got != 500 {
+		t.Fatalf("midpoint bytes used = %d, want 500", got)
+	}
+	if got := midpoint.Remaining(Items); got != 50 {
+		t.Fatalf("midpoint items remaining = %d, want 50", got)
+	}
+
+	consumeBatch(50)
+	if got := counter.Remaining(Bytes); got != 0 {
+		t.Fatalf("final bytes remaining = %d, want 0", got)
+	}
+	if got := counter.Snapshot().Used(Items); got != 100 {
+		t.Fatalf("final items used = %d, want 100", got)
+	}
+	if got := midpoint.Used(Bytes); got != 500 {
+		t.Fatalf("immutable midpoint snapshot changed to %d bytes", got)
+	}
+
+	err = counter.Consume(Bytes, 1)
+	var limitErr *LimitError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("over-budget error type = %T, want *LimitError", err)
+	}
+	if limitErr.Dimension != Bytes || limitErr.Limit != 1_000 || limitErr.Observed != 1_001 {
+		t.Fatal("over-budget error returned incorrect safe numeric metadata")
+	}
+	if got := counter.Snapshot().Used(Bytes); got != 1_000 {
+		t.Fatalf("failed consumption changed used bytes to %d", got)
+	}
+	if err := counter.Consume(Bytes, -1); err == nil {
+		t.Fatal("negative consumption was accepted")
+	}
+	if err := counter.Consume(Lines, 1); err == nil {
+		t.Fatal("consumption for an unconfigured dimension was accepted")
 	}
 }
