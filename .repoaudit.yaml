@@ -1,0 +1,71 @@
+version: 1
+max_binary_bytes: 1048576
+binary_allowlist: []
+gitlinks: []
+fixture_exemptions:
+  - path: cmd/xagent/hook_startup_test.go
+    rule_id: secret
+    content_sha256: eba9f144eaa766f3b08289b547c6a183e15145a00e31fd16f30a80683fbf22a1
+  - path: docs/usability-reliability-roadmap/checklist.md
+    rule_id: secret
+    content_sha256: f32a8b446450a04a6fc83a1cbd53962b9f2210c81c29f01d75740a405eb0018a
+  - path: docs/usability-reliability-roadmap/task.md
+    rule_id: secret
+    content_sha256: 2086132461e604257d1bcb2b9b4717c20d91f20d1105cc687860a1ce2f03cbd7
+  - path: internal/app/commands_test.go
+    rule_id: secret
+    content_sha256: dd2e2b3a5b29a15b3b76ae28175a3da2684ceb850e86fd7ad345e79b538d8003
+  - path: internal/app/hook_test.go
+    rule_id: secret
+    content_sha256: cc1852cc00651fe14b9ca08e2e0730ac0cc2f534f7365dba1642ababf88a0932
+  - path: internal/app/update_test.go
+    rule_id: secret
+    content_sha256: 30b373f735f7e297c313912967145d27681045c8bf96e954776e8527a2b990e7
+  - path: internal/conversation/conversation_test.go
+    rule_id: secret
+    content_sha256: 05bc315e86bc68a6845bcc9edb4b6b762e0964748b14f1dfbea0ae9c5021c137
+  - path: internal/conversation/jsonl_store_test.go
+    rule_id: secret
+    content_sha256: 27bfe9970a69df3b4611732d2847d5ee715da95c1fa4a1b78f46f3d984c91ed9
+  - path: internal/diagnostics/diagnostic_test.go
+    rule_id: secret
+    content_sha256: 57690307dad71e7535c12557b9f118b8e30e03a0c377aae7ceb89cc581e3d6c6
+  - path: internal/hook/command_test.go
+    rule_id: secret
+    content_sha256: 4d0567f0a1380397de1c64095e0ace7986dfcb22408abbc6eeb2a71c494f2b02
+  - path: internal/hook/http_test.go
+    rule_id: secret
+    content_sha256: 9624e1361fb33f7e5c5eea10a4c3b38ee88a41d3bc6803f9de68d83c587adfb3
+  - path: internal/hook/loader_test.go
+    rule_id: secret
+    content_sha256: b68bad17e2c2f1c92983bad1edfb9417f5213c8ed5cb27be4c620725f6a1e0e3
+  - path: internal/mcpclient/names_test.go
+    rule_id: secret
+    content_sha256: d04f8fea8ffd34676d92d8c27fcfc16c20aba656d27f634cfbf1f749d0865327
+  - path: internal/memory/manager_test.go
+    rule_id: secret
+    content_sha256: 6fa6fadfa2aaa1119c938738a9552161038415fbe85b55fe09243cdb22aad78d
+  - path: internal/orchestrator/chat_test.go
+    rule_id: secret
+    content_sha256: 344056f18a2ae5826c0486e1f6bb85517071c79ce59ea8710c3c61c97e3f8d46
+  - path: internal/orchestrator/hook_test.go
+    rule_id: secret
+    content_sha256: 06e7b05b12d1f1a927aa5c4ff3c39767a51ddf2346ac80b24dd5a523a0bb4a94
+  - path: internal/provider/factory_test.go
+    rule_id: secret
+    content_sha256: 25438cf86ed31e52fa87a38ce52eeb78969311479f3494c130097ed8f4338856
+  - path: internal/repoaudit/secrets_test.go
+    rule_id: secret
+    content_sha256: 7ce422d7cbfe832bc73b36bddfdecdd2e51dad11e0a6a544755d897aefbeb26b
+  - path: internal/redact/redact_test.go
+    rule_id: secret
+    content_sha256: 05317112a74a3879e8dd4307d40144176e5b75dea78ab5f81366508fe61e7456
+  - path: internal/skill/activity_test.go
+    rule_id: secret
+    content_sha256: b8951a16672b116199be4d027c2739925f02ede5a6078e2be8b079993f27d8f3
+  - path: internal/skill/parser_test.go
+    rule_id: secret
+    content_sha256: 55cc4c462a23dbdb5f134bd7bc03f116bafa3c84a33135e3bb52eb3cb5e65c29
+  - path: internal/testutil/fake_provider_test.go
+    rule_id: secret
+    content_sha256: 9a3f15fbe63ab40c3863cf7eeba75f54bb8efc7978c452d768de2a9000a17c12

@@ -7,4 +7,12 @@ config.yaml
 .xagent/tmp-*
 /xagent
 .claude/settings.local.json
+/.claude/worktrees/
+/.mewcode/memory/
+/.mewcode/sessions/
+/fakeprovider
+/*.webarchive
+/photo_*.jpg
+/photo_*.jpeg
+/photo_*.png
 .DS_Store
