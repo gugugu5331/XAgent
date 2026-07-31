@@ -19,7 +19,7 @@ func TestDiagnosticSafeRedactsMessagePathAndSource(t *testing.T) {
 	})
 	combined := redacted.Message + redacted.Path + redacted.Source
 	if strings.Contains(combined, "secret-token") {
-		t.Fatalf("diagnostic leaked secret: %#v", redacted)
+		t.Fatal("diagnostic retained a protected value")
 	}
 	if redacted.Severity != SeverityWarning {
 		t.Fatalf("expected default warning severity, got %q", redacted.Severity)
@@ -115,14 +115,14 @@ func TestCollectorRedactsSensitiveDiagnostics(t *testing.T) {
 	combined := items[0].Message + items[0].Path + items[0].Source + items[0].Text()
 	for _, secret := range []string{"secret-token", "runtime-secret", "abc123"} {
 		if strings.Contains(combined, secret) {
-			t.Fatalf("collector leaked %q: %#v text=%q", secret, items[0], items[0].Text())
+			t.Fatal("collector retained a protected value")
 		}
 	}
 	if !strings.Contains(items[0].Message, "token=") || !strings.Contains(items[0].Message, "[redacted]") {
-		t.Fatalf("message did not preserve field name with redacted value: %q", items[0].Message)
+		t.Fatal("diagnostic message did not preserve its safe field name")
 	}
 	if !strings.Contains(strings.ToLower(items[0].Source), "authorization:") || !strings.Contains(items[0].Source, "[redacted]") {
-		t.Fatalf("source did not preserve field name with redacted value: %q", items[0].Source)
+		t.Fatal("diagnostic source did not preserve its safe field name")
 	}
 	if items[0].Severity != SeverityWarning {
 		t.Fatalf("default severity = %q", items[0].Severity)
@@ -148,14 +148,14 @@ func TestCollectorAttributesAreBoundedSanitizedAndCopied(t *testing.T) {
 		t.Fatalf("stage was not sanitized/copied: %q", got)
 	}
 	if got := items[0].Attributes["detail"]; strings.Contains(got, "attribute-secret") || !utf8.ValidString(got) {
-		t.Fatalf("detail was not redacted/sanitized: %q", got)
+		t.Fatal("diagnostic attribute was not safely redacted")
 	}
 	items[0].Attributes["stage"] = "list-mutated"
 	if got := collector.List()[0].Attributes["stage"]; got != "execute" {
 		t.Fatalf("List returned mutable attributes: %q", got)
 	}
 	if !strings.Contains(collector.List()[0].Text(), "detail=[redacted]") {
-		t.Fatalf("Text did not include safe attributes: %q", collector.List()[0].Text())
+		t.Fatal("diagnostic text did not include its safe attributes")
 	}
 }
 

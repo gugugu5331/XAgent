@@ -84,7 +84,7 @@ func TestMapRedactsSensitiveKeysAndNestedStrings(t *testing.T) {
 	}
 	assertNoLeak(t, string(data), []string{"secret-key", "secret-token", "Bearer secret", "secret-password"})
 	if redacted["api_key"] != "[redacted]" {
-		t.Fatalf("sensitive key not replaced: %#v", redacted)
+		t.Fatal("sensitive key was not replaced")
 	}
 }
 
@@ -109,7 +109,7 @@ func TestRuntimeRedactorRegistersSecretsPerInstance(t *testing.T) {
 
 	secondText := second.Text("value short runtime-secret")
 	if !strings.Contains(secondText, "runtime-secret") || !strings.Contains(secondText, "short") {
-		t.Fatalf("second redactor unexpectedly used first instance secrets: %q", secondText)
+		t.Fatal("second redactor unexpectedly used another instance's secrets")
 	}
 
 	redacted := first.Map(map[string]any{
@@ -131,7 +131,7 @@ func TestRuntimeRedactorReplacesOverlappingSecretsLongestFirst(t *testing.T) {
 	got := redactor.Text("value=abcdef")
 	assertNoLeak(t, got, []string{"abc", "def", "abcdef"})
 	if !strings.Contains(got, "[redacted]") {
-		t.Fatalf("overlapping secret was not replaced: %q", got)
+		t.Fatal("overlapping secret was not replaced")
 	}
 }
 
@@ -145,23 +145,23 @@ func TestRuntimeRedactorShortSecretsMatchWholeTokensAndFieldValues(t *testing.T)
 	got := redactor.Text("x ab abc xagent alphabet abcdef suffix-x punctuation(ab)")
 	for _, leaked := range []string{" x ", " ab ", " abc "} {
 		if strings.Contains(" "+got+" ", leaked) {
-			t.Fatalf("whole short token %q leaked: %q", leaked, got)
+			t.Fatal("whole short token was not redacted")
 		}
 	}
 	for _, ordinary := range []string{"xagent", "alphabet", "abcdef"} {
 		if !strings.Contains(got, ordinary) {
-			t.Fatalf("short secret damaged ordinary text %q: %q", ordinary, got)
+			t.Fatal("short-secret redaction damaged ordinary text")
 		}
 	}
 	if strings.Contains(got, "suffix-x") || strings.Contains(got, "(ab)") {
-		t.Fatalf("punctuation-delimited token was not redacted: %q", got)
+		t.Fatal("punctuation-delimited token was not redacted")
 	}
 	if got := redactor.Text("x"); got != marker {
-		t.Fatalf("complete field value = %q, want marker", got)
+		t.Fatal("complete short field value was not redacted")
 	}
 	redactedMap := redactor.Map(map[string]any{"ordinary": "x", "api_key": "not-registered"})
 	if redactedMap["ordinary"] != marker || redactedMap["api_key"] != marker {
-		t.Fatalf("field values were not safely redacted: %#v", redactedMap)
+		t.Fatal("field values were not safely redacted")
 	}
 	if got := redactor.MaxSecretBytes(); got != len("abc") {
 		t.Fatalf("MaxSecretBytes() = %d, want %d", got, len("abc"))
@@ -189,7 +189,7 @@ func TestRuntimeRedactorSecretsConcurrentRegistrationAndUse(t *testing.T) {
 	got := redactor.Text("a bb long-secret ordinary")
 	assertNoLeak(t, got, []string{" a ", " bb ", "long-secret"})
 	if !strings.Contains(got, "ordinary") {
-		t.Fatalf("ordinary text was damaged: %q", got)
+		t.Fatal("runtime redaction damaged ordinary text")
 	}
 }
 
@@ -233,7 +233,7 @@ func assertNoLeak(t *testing.T, value string, secrets []string) {
 	t.Helper()
 	for _, secret := range secrets {
 		if strings.Contains(value, secret) {
-			t.Fatalf("redacted text leaked %q: %q", secret, value)
+			t.Fatal("redacted text retained a protected value")
 		}
 	}
 }

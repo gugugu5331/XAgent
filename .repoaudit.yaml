@@ -29,7 +29,7 @@ fixture_exemptions:
     content_sha256: 27bfe9970a69df3b4611732d2847d5ee715da95c1fa4a1b78f46f3d984c91ed9
   - path: internal/diagnostics/diagnostic_test.go
     rule_id: secret
-    content_sha256: d5a3a810b529efed7f24b17c7ae5057c33f37a58e9e85c15e50f8534de206a28
+    content_sha256: 034c79f9461f278898e09d48f4e26cb73870259dd012fa56f884a8872c5fcbc7
   - path: internal/hook/command_test.go
     rule_id: secret
     content_sha256: 4d0567f0a1380397de1c64095e0ace7986dfcb22408abbc6eeb2a71c494f2b02
@@ -59,7 +59,7 @@ fixture_exemptions:
     content_sha256: 7ce422d7cbfe832bc73b36bddfdecdd2e51dad11e0a6a544755d897aefbeb26b
   - path: internal/redact/redact_test.go
     rule_id: secret
-    content_sha256: 382f9be4512e84fcafe50cf8ab8d98463977bff6d55e18821d21e6660e161ff1
+    content_sha256: 8778a4ff19ac1f1f1798cb91fae7452249c2230a0608b7ac1ca453e1fabb243d
   - path: internal/skill/activity_test.go
     rule_id: secret
     content_sha256: b8951a16672b116199be4d027c2739925f02ede5a6078e2be8b079993f27d8f3
