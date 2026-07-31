@@ -218,6 +218,9 @@ func (r *Root) Identity() Identity {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if r.closed {
+		return Identity{}
+	}
 	return r.identity
 }
 
