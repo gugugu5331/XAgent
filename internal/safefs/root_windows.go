@@ -4,6 +4,7 @@ package safefs
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"unsafe"
 
@@ -96,6 +97,47 @@ func (r *windowsRoot) bind(relative string) (bindingResolution, error) {
 		parent: parent,
 		leaf:   canonicalLeaf,
 	}, nil
+}
+
+func (r *windowsRoot) openRead(relative string) (platformOpenedFile, error) {
+	if r == nil || r.handle == 0 || r.handle == windows.InvalidHandle {
+		return platformOpenedFile{}, errors.New("safefs platform root is closed")
+	}
+	components := strings.Split(relative, "/")
+	leaf := components[len(components)-1]
+	current := r.handle
+	owned := false
+	defer func() {
+		if owned {
+			_ = windows.CloseHandle(current)
+		}
+	}()
+	for _, component := range components[:len(components)-1] {
+		next, err := windowsOpenRelative(current, component, true)
+		if err != nil {
+			return platformOpenedFile{}, errors.New("safefs platform parent open failed")
+		}
+		if owned {
+			_ = windows.CloseHandle(current)
+		}
+		current = next
+		owned = true
+	}
+	target, err := windowsOpenRelative(current, leaf, false)
+	if err != nil {
+		return platformOpenedFile{}, errors.New("safefs platform target open failed")
+	}
+	identity, directory, err := windowsHandleIdentity(target)
+	if err != nil || directory {
+		_ = windows.CloseHandle(target)
+		return platformOpenedFile{}, errors.New("safefs platform target type rejected")
+	}
+	file := os.NewFile(uintptr(target), "")
+	if file == nil {
+		_ = windows.CloseHandle(target)
+		return platformOpenedFile{}, errors.New("safefs platform file conversion failed")
+	}
+	return platformOpenedFile{file: file, identity: identity}, nil
 }
 
 func (r *windowsRoot) leafRelation(first, second string) leafRelation {

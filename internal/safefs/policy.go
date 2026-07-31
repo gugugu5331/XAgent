@@ -2,13 +2,9 @@ package safefs
 
 import (
 	"errors"
-	"path"
 	"sort"
 	"strings"
-	"unicode/utf8"
 )
-
-var errInvalidRelativePath = errors.New("safefs relative path is invalid")
 
 // Policy declares root-relative slots that only the dedicated protected
 // capability may write. Bootstrap compiles and copies this input.
@@ -123,26 +119,4 @@ func pathAncestors(relative string) []string {
 		ancestors = append(ancestors, strings.Join(components[:index], "/"))
 	}
 	return ancestors
-}
-
-func canonicalRelative(value string) (string, error) {
-	if value == "" || value == "." || !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
-		return "", errInvalidRelativePath
-	}
-	if strings.Contains(value, "\\") || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") {
-		return "", errInvalidRelativePath
-	}
-	if len(value) >= 2 && value[1] == ':' && ((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z')) {
-		return "", errInvalidRelativePath
-	}
-	canonical := path.Clean(value)
-	if canonical != value || path.IsAbs(canonical) {
-		return "", errInvalidRelativePath
-	}
-	for _, component := range strings.Split(canonical, "/") {
-		if component == "" || component == "." || component == ".." {
-			return "", errInvalidRelativePath
-		}
-	}
-	return canonical, nil
 }

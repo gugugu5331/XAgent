@@ -1,6 +1,7 @@
 package safefs
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -146,6 +147,7 @@ const (
 type rootBackend interface {
 	identity() objectIdentity
 	bind(relative string) (bindingResolution, error)
+	openRead(relative string) (platformOpenedFile, error)
 	leafRelation(first, second string) leafRelation
 	close() error
 }
@@ -249,6 +251,46 @@ func (r *Root) Bind(relative string) (Binding, error) {
 		return Binding{}, errors.New("safefs target identity is unavailable")
 	}
 	return r.binding(canonical, resolution), nil
+}
+
+// OpenRead opens a regular file through the same no-follow platform handle
+// chain used for identity validation.
+func (r *Root) OpenRead(ctx context.Context, relative string) (*File, error) {
+	if ctx == nil {
+		return nil, errors.New("safefs read context is invalid")
+	}
+	select {
+	case <-ctx.Done():
+		return nil, errors.New("safefs read canceled")
+	default:
+	}
+	canonical, err := canonicalRelative(relative)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		return nil, errors.New("safefs root is unavailable")
+	}
+	r.mu.Lock()
+	if r.closed || r.backend == nil {
+		r.mu.Unlock()
+		return nil, errors.New("safefs root is closed")
+	}
+	opened, err := r.backend.openRead(canonical)
+	r.mu.Unlock()
+	if err != nil || opened.file == nil || !opened.identity.valid() {
+		if opened.file != nil {
+			_ = opened.file.Close()
+		}
+		return nil, errors.New("safefs read open failed")
+	}
+	select {
+	case <-ctx.Done():
+		_ = opened.file.Close()
+		return nil, errors.New("safefs read canceled")
+	default:
+	}
+	return newFile(opened), nil
 }
 
 func (r *Root) binding(relative string, resolution bindingResolution) Binding {
