@@ -29,7 +29,7 @@ fixture_exemptions:
     content_sha256: 27bfe9970a69df3b4611732d2847d5ee715da95c1fa4a1b78f46f3d984c91ed9
   - path: internal/diagnostics/diagnostic_test.go
     rule_id: secret
-    content_sha256: 57690307dad71e7535c12557b9f118b8e30e03a0c377aae7ceb89cc581e3d6c6
+    content_sha256: d5a3a810b529efed7f24b17c7ae5057c33f37a58e9e85c15e50f8534de206a28
   - path: internal/hook/command_test.go
     rule_id: secret
     content_sha256: 4d0567f0a1380397de1c64095e0ace7986dfcb22408abbc6eeb2a71c494f2b02

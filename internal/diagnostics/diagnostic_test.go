@@ -241,7 +241,7 @@ func TestSafeHTTPErrorSummaryRedactsAndLimitsBody(t *testing.T) {
 		}},
 	}
 
-	summary := SafeHTTPErrorSummary(resp, HTTPErrorSummaryOptions{MaxBodyBytes: 48, Redactor: runtimeRedactor.Text})
+	summary := SafeHTTPErrorSummary(resp, HTTPErrorSummaryOptions{MaxBodyBytes: 48, Redactor: runtimeRedactor})
 	if summary.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("StatusCode = %d", summary.StatusCode)
 	}
@@ -249,8 +249,8 @@ func TestSafeHTTPErrorSummaryRedactsAndLimitsBody(t *testing.T) {
 		t.Fatalf("Truncated = false, want true")
 	}
 	for _, secret := range []string{"abc123", "runtime-secret", "request-secret"} {
-		if strings.Contains(summary.BodyPreview, secret) {
-			t.Fatalf("summary leaked %q: %#v", secret, summary)
+		if strings.Contains(summary.BodyPreview.Text(), secret) {
+			t.Fatal("HTTP summary leaked a protected value")
 		}
 	}
 }
@@ -262,11 +262,11 @@ func TestSafeHTTPErrorSummarySuppressesBinaryBody(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader("\x00secret\x01")),
 	}
 
-	summary := SafeHTTPErrorSummary(resp, HTTPErrorSummaryOptions{Redactor: redact.Text})
-	if strings.Contains(summary.BodyPreview, "secret") {
-		t.Fatalf("binary preview leaked body: %#v", summary)
+	summary := SafeHTTPErrorSummary(resp, HTTPErrorSummaryOptions{MaxBodyBytes: DefaultHTTPBodyPreviewBytes, Redactor: redact.NewRuntimeRedactor()})
+	if strings.Contains(summary.BodyPreview.Text(), "secret") {
+		t.Fatal("binary HTTP summary leaked response content")
 	}
-	if !strings.Contains(summary.BodyPreview, "binary") {
-		t.Fatalf("binary body preview = %q, want binary hint", summary.BodyPreview)
+	if !strings.Contains(summary.BodyPreview.Text(), "binary") {
+		t.Fatal("binary HTTP summary did not retain its safe hint")
 	}
 }
