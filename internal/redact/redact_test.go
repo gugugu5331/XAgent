@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 var sensitiveSamples = []string{
@@ -189,6 +190,42 @@ func TestRuntimeRedactorSecretsConcurrentRegistrationAndUse(t *testing.T) {
 	assertNoLeak(t, got, []string{" a ", " bb ", "long-secret"})
 	if !strings.Contains(got, "ordinary") {
 		t.Fatalf("ordinary text was damaged: %q", got)
+	}
+}
+
+func TestRuntimeSecretCanaryMatrix(t *testing.T) {
+	redactor := NewRuntimeRedactor()
+	canary := "runtime-canary-4d2f8a"
+	redactor.RegisterSecret(canary)
+
+	structured := redactor.Any(map[string]any{
+		"headers": map[string]any{"Authorization": "Bearer " + canary},
+		"env":     map[string]any{"SERVICE_CREDENTIAL": canary},
+		"nested":  []any{map[string]any{"message": "provider returned " + canary}},
+	})
+	structuredJSON, err := json.Marshal(structured)
+	if err != nil {
+		t.Fatal("marshal redacted structured value failed")
+	}
+
+	invalidUTF8 := string([]byte{'p', 'r', 'e', 'f', 'i', 'x', '-', 0xff, '-'}) + canary
+	samples := []string{
+		"Authorization: Bearer " + canary,
+		"https://user:" + canary + "@example.test/path?token=" + canary + "&plain=ok",
+		"SERVICE_CREDENTIAL=" + canary,
+		string(structuredJSON),
+		"-----BEGIN PRIVATE KEY-----\n" + canary + "\n-----END PRIVATE KEY-----",
+		invalidUTF8,
+	}
+
+	for index, sample := range samples {
+		safe := redactor.Redact(sample)
+		if strings.Contains(safe.Text(), canary) {
+			t.Fatalf("sample %d leaked the registered runtime value", index)
+		}
+		if !utf8.ValidString(safe.Text()) {
+			t.Fatalf("sample %d produced invalid UTF-8", index)
+		}
 	}
 }
 

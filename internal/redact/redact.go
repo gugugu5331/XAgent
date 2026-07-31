@@ -38,6 +38,7 @@ var secretPatterns = []*regexp.Regexp{
 }
 
 func Text(value string) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	redacted := redactURLSecrets(value)
 	for _, pattern := range secretPatterns {
 		redacted = pattern.ReplaceAllString(redacted, `${1}`+marker)
@@ -83,6 +84,7 @@ func (r *RuntimeRedactor) RegisterSecret(value string) {
 	if r == nil {
 		return
 	}
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return

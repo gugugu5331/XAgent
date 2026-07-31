@@ -59,7 +59,7 @@ fixture_exemptions:
     content_sha256: 7ce422d7cbfe832bc73b36bddfdecdd2e51dad11e0a6a544755d897aefbeb26b
   - path: internal/redact/redact_test.go
     rule_id: secret
-    content_sha256: 05317112a74a3879e8dd4307d40144176e5b75dea78ab5f81366508fe61e7456
+    content_sha256: 382f9be4512e84fcafe50cf8ab8d98463977bff6d55e18821d21e6660e161ff1
   - path: internal/skill/activity_test.go
     rule_id: secret
     content_sha256: b8951a16672b116199be4d027c2739925f02ede5a6078e2be8b079993f27d8f3
