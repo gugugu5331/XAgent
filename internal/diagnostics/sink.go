@@ -12,6 +12,11 @@ import (
 // BoundedSink is the process-wide diagnostics boundary injected into owners.
 type BoundedSink interface {
 	Add(SanitizeInput)
+}
+
+// SnapshotSource is retained by the diagnostics owner, not injected into
+// ordinary leaf modules.
+type SnapshotSource interface {
 	Snapshot() Snapshot
 }
 
@@ -22,7 +27,7 @@ type BoundedSinkOptions struct {
 	MaxTotalBytes int64
 }
 
-type boundedSink struct {
+type Sink struct {
 	mu           sync.Mutex
 	redactor     *redact.RuntimeRedactor
 	maxItemBytes int64
@@ -32,7 +37,12 @@ type boundedSink struct {
 	dropped      uint64
 }
 
-func NewBoundedSink(options BoundedSinkOptions) (BoundedSink, error) {
+var (
+	_ BoundedSink    = (*Sink)(nil)
+	_ SnapshotSource = (*Sink)(nil)
+)
+
+func NewBoundedSink(options BoundedSinkOptions) (*Sink, error) {
 	if options.Redactor == nil {
 		return nil, errors.New("diagnostics bounded sink requires a runtime redactor")
 	}
@@ -70,7 +80,7 @@ func NewBoundedSink(options BoundedSinkOptions) (BoundedSink, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &boundedSink{
+	return &Sink{
 		redactor:     options.Redactor,
 		maxItemBytes: maxItemBytes,
 		counter:      counter,
@@ -89,7 +99,7 @@ func resolveDiagnosticLimit(scope budget.Scope, candidate int64) (int64, int64, 
 	return 0, 0, errors.New("diagnostics budget specification is missing")
 }
 
-func (s *boundedSink) Add(input SanitizeInput) {
+func (s *Sink) Add(input SanitizeInput) {
 	if s == nil {
 		return
 	}
@@ -125,7 +135,7 @@ func (s *boundedSink) Add(input SanitizeInput) {
 	s.items = append(s.items, SnapshotItem{Diagnostic: safe, Count: 1})
 }
 
-func (s *boundedSink) Snapshot() Snapshot {
+func (s *Sink) Snapshot() Snapshot {
 	if s == nil {
 		return Snapshot{}
 	}
@@ -140,7 +150,7 @@ func (s *boundedSink) Snapshot() Snapshot {
 	}
 }
 
-func (s *boundedSink) incrementDropped() {
+func (s *Sink) incrementDropped() {
 	if s.dropped < math.MaxUint64 {
 		s.dropped++
 	}
