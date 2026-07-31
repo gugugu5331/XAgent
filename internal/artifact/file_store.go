@@ -2,16 +2,29 @@ package artifact
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
+
+	"xagent/internal/budget"
 )
 
 var errStoreUnavailable = errors.New("artifact store operation is unavailable")
+
+const artifactIDBytes = 32
+
+type artifactRecord struct {
+	ref      Ref
+	metadata Metadata
+}
 
 type fileStore struct {
 	mu sync.RWMutex
@@ -19,6 +32,10 @@ type fileStore struct {
 	root          string
 	workspaceRoot string
 	options       FileStoreOptions
+	now           func() time.Time
+	totalBytes    int64
+	active        map[string]*fileWriter
+	records       map[string]artifactRecord
 	closed        bool
 	closeErr      error
 }
@@ -28,13 +45,50 @@ func NewFileStore(options FileStoreOptions) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateStoreLimits(options); err != nil {
+		return nil, err
+	}
 	options.Root = ""
 	options.WorkspaceRoot = ""
 	return &fileStore{
 		root:          root,
 		workspaceRoot: workspace,
 		options:       options,
+		now:           time.Now,
+		active:        make(map[string]*fileWriter),
+		records:       make(map[string]artifactRecord),
 	}, nil
+}
+
+func validateStoreLimits(options FileStoreOptions) error {
+	fileSpec, totalSpec, ok := artifactBudgetSpecs()
+	if !ok {
+		return errors.New("artifact budget specification is unavailable")
+	}
+	if _, err := fileSpec.Resolve(&options.MaxFileBytes); err != nil {
+		return errors.New("artifact file budget is invalid")
+	}
+	if _, err := totalSpec.Resolve(&options.MaxTotalBytes); err != nil {
+		return errors.New("artifact total budget is invalid")
+	}
+	if options.MaxFileBytes > options.MaxTotalBytes {
+		return errors.New("artifact file budget exceeds total budget")
+	}
+	return nil
+}
+
+func artifactBudgetSpecs() (budget.Spec, budget.Spec, bool) {
+	var fileSpec, totalSpec budget.Spec
+	var fileFound, totalFound bool
+	for _, spec := range budget.AllSpecs() {
+		switch spec.Scope {
+		case budget.ArtifactMaxFileBytes:
+			fileSpec, fileFound = spec, true
+		case budget.ArtifactMaxTotalBytes:
+			totalSpec, totalFound = spec, true
+		}
+	}
+	return fileSpec, totalSpec, fileFound && totalFound
 }
 
 func validateStoreRoots(root, workspace string) (string, string, error) {
@@ -113,14 +167,56 @@ func (s *fileStore) Begin(ctx context.Context, metadata Metadata) (Writer, error
 	if err := s.available(ctx); err != nil {
 		return nil, err
 	}
-	return nil, errStoreUnavailable
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errors.New("artifact store is closed")
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return nil, errors.New("artifact store initialization failed")
+	}
+	id, err := newArtifactID()
+	if err != nil {
+		return nil, errors.New("artifact identity creation failed")
+	}
+	staging := filepath.Join(s.root, "."+id+".staging")
+	file, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, errors.New("artifact staging creation failed")
+	}
+	writer := &fileWriter{
+		store:       s,
+		file:        file,
+		id:          id,
+		stagingPath: staging,
+		finalPath:   filepath.Join(s.root, id+".artifact"),
+		metadata:    metadata,
+		createdAt:   s.now().UTC(),
+		state:       writerActive,
+	}
+	s.active[id] = writer
+	return writer, nil
 }
 
 func (s *fileStore) OpenForUser(ctx context.Context, id string) (io.ReadCloser, Ref, error) {
 	if err := s.available(ctx); err != nil {
 		return nil, Ref{}, err
 	}
-	return nil, Ref{}, errStoreUnavailable
+	if !validArtifactID(id) {
+		return nil, Ref{}, errors.New("artifact identity is invalid")
+	}
+	s.mu.RLock()
+	record, ok := s.records[id]
+	root := s.root
+	s.mu.RUnlock()
+	if !ok || !record.ref.Available {
+		return nil, Ref{}, errors.New("artifact is unavailable")
+	}
+	file, err := os.Open(filepath.Join(root, id+".artifact"))
+	if err != nil {
+		return nil, Ref{}, errors.New("artifact is unavailable")
+	}
+	return file, record.ref, nil
 }
 
 func (s *fileStore) Cleanup(ctx context.Context) (CleanupResult, error) {
@@ -157,7 +253,104 @@ func (s *fileStore) Close() error {
 		return s.closeErr
 	}
 	s.closed = true
-	s.root = ""
 	s.workspaceRoot = ""
 	return s.closeErr
+}
+
+func newArtifactID() (string, error) {
+	var raw [artifactIDBytes]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func validArtifactID(id string) bool {
+	if len(id) != artifactIDBytes*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != artifactIDBytes {
+		return false
+	}
+	return id == strings.ToLower(id)
+}
+
+func (s *fileStore) reserve(writer *fileWriter, requested int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errors.New("artifact store is closed")
+	}
+	fileRemaining := s.options.MaxFileBytes - writer.bytes
+	totalRemaining := s.options.MaxTotalBytes - s.totalBytes
+	allowed := requested
+	scope := budget.ArtifactMaxFileBytes
+	limit := s.options.MaxFileBytes
+	observed := saturatingAdd(writer.bytes, requested)
+	if allowed > fileRemaining {
+		allowed = fileRemaining
+	}
+	if allowed > totalRemaining {
+		allowed = totalRemaining
+		scope = budget.ArtifactMaxTotalBytes
+		limit = s.options.MaxTotalBytes
+		observed = saturatingAdd(s.totalBytes, requested)
+	}
+	if allowed < 0 {
+		allowed = 0
+	}
+	s.totalBytes += allowed
+	if allowed < requested {
+		return allowed, &budget.LimitError{
+			Scope:     string(scope),
+			Dimension: budget.Bytes,
+			Limit:     limit,
+			Observed:  observed,
+		}
+	}
+	return allowed, nil
+}
+
+func (s *fileStore) releaseReserved(amount int64) {
+	if amount <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.totalBytes -= amount
+	if s.totalBytes < 0 {
+		s.totalBytes = 0
+	}
+	s.mu.Unlock()
+}
+
+func (s *fileStore) abortWriter(id string, bytes int64) {
+	s.mu.Lock()
+	delete(s.active, id)
+	s.totalBytes -= bytes
+	if s.totalBytes < 0 {
+		s.totalBytes = 0
+	}
+	s.mu.Unlock()
+}
+
+func (s *fileStore) commitWriter(writer *fileWriter, ref Ref) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("artifact store is closed")
+	}
+	if s.active[writer.id] != writer {
+		return errors.New("artifact writer is not active")
+	}
+	delete(s.active, writer.id)
+	s.records[writer.id] = artifactRecord{ref: ref, metadata: writer.metadata}
+	return nil
+}
+
+func saturatingAdd(first, second int64) int64 {
+	if second > math.MaxInt64-first {
+		return math.MaxInt64
+	}
+	return first + second
 }
