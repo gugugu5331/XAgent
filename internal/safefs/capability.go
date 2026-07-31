@@ -40,8 +40,8 @@ func (r *Root) authorizeWrite(capability Capability, binding Binding) error {
 	if r == nil {
 		return errors.New("safefs write authorization failed")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.closed || capability.seal == nil || capability.seal != r.capabilitySeal {
 		return errors.New("safefs write authorization failed")
 	}
@@ -52,7 +52,14 @@ func (r *Root) authorizeWrite(capability Capability, binding Binding) error {
 	if err != nil || !live.valid() || live.kind != binding.kind || bindingDigest(r.identity, live) != binding.digest {
 		return errors.New("safefs write authorization failed")
 	}
-	class, err := r.policy.classify(r.backend, binding.relative, live)
+	return r.authorizeResolution(capability, binding.relative, live)
+}
+
+func (r *Root) authorizeResolution(capability Capability, relative string, live bindingResolution) error {
+	if capability.seal == nil || capability.seal != r.capabilitySeal {
+		return errors.New("safefs write authorization failed")
+	}
+	class, err := r.policy.classify(r.backend, relative, live)
 	if err != nil {
 		return errors.New("safefs write authorization failed")
 	}

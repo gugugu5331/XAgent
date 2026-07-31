@@ -226,8 +226,8 @@ func TestCapabilityCannotWriteProtectedSlot(t *testing.T) {
 	if err := result.Root.authorizeWrite(ordinaryCapability, protectedAlias); err == nil {
 		t.Fatal("ordinary capability authorized a hard-link alias of a protected object")
 	}
-	if err := result.Root.authorizeWrite(protectedCapability, protectedAlias); err != nil {
-		t.Fatal("protected capability rejected an identity alias of its protected object")
+	if err := result.Root.authorizeWrite(protectedCapability, protectedAlias); err == nil {
+		t.Fatal("protected capability authorized an unlisted hard-link location")
 	}
 	caseAliasPath := filepath.Join(rootPath, "PERMISSIONS", "RULES.JSON")
 	if aliasInfo, err := os.Stat(caseAliasPath); err == nil {

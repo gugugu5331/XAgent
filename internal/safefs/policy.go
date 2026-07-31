@@ -71,7 +71,7 @@ func (p compiledPolicy) classify(backend rootBackend, relative string, candidate
 		if err != nil || !resolution.valid() {
 			return reservedAncestorSlot, errors.New("safefs protected slot identity is unavailable")
 		}
-		if relative == protected || sameExistingObject(candidate, resolution) {
+		if relative == protected {
 			return protectedSlot, nil
 		}
 		if candidate.parent == resolution.parent {
@@ -79,8 +79,14 @@ func (p compiledPolicy) classify(backend rootBackend, relative string, candidate
 			case leafEquivalent:
 				return protectedSlot, nil
 			case leafAmbiguous:
+				if sameExistingObject(candidate, resolution) {
+					return protectedSlot, nil
+				}
 				return reservedAncestorSlot, nil
 			}
+		}
+		if sameExistingObject(candidate, resolution) {
+			return reservedAncestorSlot, nil
 		}
 		for _, ancestor := range pathAncestors(protected) {
 			ancestorResolution, ancestorErr := backend.bind(ancestor)

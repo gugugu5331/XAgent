@@ -5,6 +5,7 @@ package safefs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -115,5 +116,124 @@ func TestBindMissingUsesParentHandle(t *testing.T) {
 	after := mustBind(t, result.Root, "parent/future.txt")
 	if bytes.Equal(mustBindingBytes(t, before), mustBindingBytes(t, after)) {
 		t.Fatal("missing binding ignored replacement of its opened parent")
+	}
+}
+
+func TestAtomicWritePreservesPreviousVersionOnFailure(t *testing.T) {
+	rootPath := t.TempDir()
+	targetPath := filepath.Join(rootPath, "target.txt")
+	if err := os.WriteFile(targetPath, []byte("previous"), 0o600); err != nil {
+		t.Fatal("create prior version failed")
+	}
+	if err := os.Mkdir(filepath.Join(rootPath, "permissions"), 0o700); err != nil {
+		t.Fatal("create protected parent failed")
+	}
+	protectedPath := filepath.Join(rootPath, "permissions", "rules.json")
+	if err := os.WriteFile(protectedPath, []byte("protected-old"), 0o600); err != nil {
+		t.Fatal("create protected version failed")
+	}
+	if err := os.Link(protectedPath, filepath.Join(rootPath, "protected-alias.json")); err != nil {
+		t.Fatal("create protected hard-link alias failed")
+	}
+	nested := filepath.Join(rootPath, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal("create nested parent failed")
+	}
+	if err := os.WriteFile(filepath.Join(nested, "target.txt"), []byte("nested-old"), 0o600); err != nil {
+		t.Fatal("create nested target failed")
+	}
+	result := mustBootstrap(t, rootPath, Policy{ProtectedSlots: []string{"permissions/rules.json"}})
+	defer mustClose(t, result.Root)
+	ordinary := result.Capabilities.Ordinary()
+	protected := result.Capabilities.Protected()
+
+	callbackFailure := errors.New("fixture write failure")
+	err := result.Root.AtomicWrite(context.Background(), ordinary, "target.txt", 0o600, func(writer io.Writer) error {
+		if _, writeErr := writer.Write([]byte("partial-new")); writeErr != nil {
+			return writeErr
+		}
+		return callbackFailure
+	})
+	if err == nil {
+		t.Fatal("writer callback failure was reported as success")
+	}
+	assertFileContent(t, targetPath, "previous")
+	assertNoStagingFiles(t, rootPath)
+
+	if err := result.Root.AtomicWrite(context.Background(), ordinary, "permissions/rules.json", 0o600, func(writer io.Writer) error {
+		_, writeErr := writer.Write([]byte("unauthorized"))
+		return writeErr
+	}); err == nil {
+		t.Fatal("ordinary capability wrote protected target")
+	}
+	if err := result.Root.AtomicWrite(context.Background(), protected, "protected-alias.json", 0o600, func(writer io.Writer) error {
+		_, writeErr := writer.Write([]byte("alias publish"))
+		return writeErr
+	}); err == nil {
+		t.Fatal("protected capability published through unlisted hard-link location")
+	}
+	assertFileContent(t, protectedPath, "protected-old")
+
+	if err := result.Root.AtomicWrite(context.Background(), protected, "permissions/rules.json", 0o600, func(writer io.Writer) error {
+		_, writeErr := writer.Write([]byte("protected-new"))
+		return writeErr
+	}); err != nil {
+		t.Fatal("protected atomic write failed")
+	}
+	assertFileContent(t, protectedPath, "protected-new")
+
+	if err := result.Root.AtomicWrite(context.Background(), ordinary, "target.txt", 0o600, func(writer io.Writer) error {
+		if _, writeErr := writer.Write([]byte("candidate")); writeErr != nil {
+			return writeErr
+		}
+		external := filepath.Join(rootPath, "external-replacement.txt")
+		if writeErr := os.WriteFile(external, []byte("external"), 0o600); writeErr != nil {
+			return writeErr
+		}
+		return os.Rename(external, targetPath)
+	}); err == nil {
+		t.Fatal("atomic write ignored a target identity replacement")
+	}
+	assertFileContent(t, targetPath, "external")
+	assertNoStagingFiles(t, rootPath)
+
+	nestedOld := filepath.Join(rootPath, "nested-old")
+	if err := result.Root.AtomicWrite(context.Background(), ordinary, "nested/target.txt", 0o600, func(writer io.Writer) error {
+		if _, writeErr := writer.Write([]byte("candidate")); writeErr != nil {
+			return writeErr
+		}
+		if renameErr := os.Rename(nested, nestedOld); renameErr != nil {
+			return renameErr
+		}
+		if mkdirErr := os.Mkdir(nested, 0o700); mkdirErr != nil {
+			return mkdirErr
+		}
+		return os.WriteFile(filepath.Join(nested, "target.txt"), []byte("replacement-parent"), 0o600)
+	}); err == nil {
+		t.Fatal("atomic write ignored replacement of its opened parent")
+	}
+	assertFileContent(t, filepath.Join(nestedOld, "target.txt"), "nested-old")
+	assertFileContent(t, filepath.Join(nested, "target.txt"), "replacement-parent")
+	assertNoStagingFiles(t, nestedOld)
+}
+
+func assertFileContent(t *testing.T, filePath, expected string) {
+	t.Helper()
+	data, err := os.ReadFile(filePath)
+	if err != nil || string(data) != expected {
+		t.Fatal("file content did not preserve the expected version")
+	}
+}
+
+func assertNoStagingFiles(t *testing.T, rootPath string) {
+	t.Helper()
+	entries, err := os.ReadDir(rootPath)
+	if err != nil {
+		t.Fatal("read root after atomic write failed")
+	}
+	for _, entry := range entries {
+		if len(entry.Name()) >= len(".xagent-stage-") && entry.Name()[:len(".xagent-stage-")] == ".xagent-stage-" {
+			t.Fatal("atomic write left a staging file behind")
+		}
 	}
 }

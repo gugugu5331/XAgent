@@ -126,16 +126,6 @@ func (r bindingResolution) valid() bool {
 	}
 }
 
-func sameResource(first, second bindingResolution) bool {
-	if first.kind != second.kind {
-		return false
-	}
-	if first.kind == existingBinding {
-		return first.object == second.object
-	}
-	return first.parent == second.parent && first.leaf == second.leaf
-}
-
 type leafRelation uint8
 
 const (
@@ -162,7 +152,7 @@ type OpenResult struct {
 // Root owns an already-open platform directory handle and the validation
 // seals for Bindings and Capabilities. It has no capability issuance method.
 type Root struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	backend        rootBackend
 	identity       Identity
@@ -226,8 +216,8 @@ func (r *Root) Identity() Identity {
 	if r == nil {
 		return Identity{}
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.identity
 }
 
@@ -241,8 +231,8 @@ func (r *Root) Bind(relative string) (Binding, error) {
 	if r == nil {
 		return Binding{}, errors.New("safefs root is unavailable")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.closed || r.backend == nil {
 		return Binding{}, errors.New("safefs root is closed")
 	}
@@ -271,13 +261,13 @@ func (r *Root) OpenRead(ctx context.Context, relative string) (*File, error) {
 	if r == nil {
 		return nil, errors.New("safefs root is unavailable")
 	}
-	r.mu.Lock()
+	r.mu.RLock()
 	if r.closed || r.backend == nil {
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		return nil, errors.New("safefs root is closed")
 	}
 	opened, err := r.backend.openRead(canonical)
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	if err != nil || opened.file == nil || !opened.identity.valid() {
 		if opened.file != nil {
 			_ = opened.file.Close()
