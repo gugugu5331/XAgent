@@ -3,6 +3,8 @@ package diagnostics
 import (
 	"sort"
 	"strings"
+
+	"xagent/internal/redact"
 )
 
 type Severity string
@@ -23,6 +25,24 @@ type Diagnostic struct {
 }
 
 type Redactor func(string) string
+
+// SafeDiagnostic contains only stable metadata and text that has crossed the
+// runtime redaction boundary.
+type SafeDiagnostic struct {
+	Code     string
+	Source   string
+	Hint     string
+	Severity Severity
+	Message  redact.SafeText
+}
+
+func (d SafeDiagnostic) stableIdentity() string {
+	return strings.Join([]string{d.Code, d.Source, d.Hint, string(d.Severity)}, "\x00")
+}
+
+func (d SafeDiagnostic) retainedBytes(identity string) int64 {
+	return int64(len(identity) + len(d.Code) + len(d.Source) + len(d.Hint) + len(d.Severity) + len(d.Message.Text()))
+}
 
 func New(code string, severity Severity, message string) Diagnostic {
 	return Diagnostic{Code: strings.TrimSpace(code), Severity: severityOrDefault(severity), Message: strings.TrimSpace(message)}

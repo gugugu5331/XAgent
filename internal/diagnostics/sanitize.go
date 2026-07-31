@@ -23,16 +23,6 @@ type SanitizeOptions struct {
 	MaxBytes int
 }
 
-// SafeDiagnostic is safe to retain or publish. It deliberately has no raw
-// error field.
-type SafeDiagnostic struct {
-	Code     string
-	Source   string
-	Hint     string
-	Severity Severity
-	Message  redact.SafeText
-}
-
 // Sanitize applies runtime redaction before terminal cleaning and UTF-8-safe
 // truncation. The final Redact call only reconstructs the unforgeable SafeText
 // boundary after cleaning; it cannot reintroduce raw data.
