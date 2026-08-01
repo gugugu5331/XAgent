@@ -123,6 +123,19 @@ var mcpServerTimeoutSpec = numericSpec{
 	path: "mcp.servers.<name>.timeout_ms", minimum: 1, hardCap: 86_400_000,
 }
 
+var llmAgentStreamNumericSpecs = [...]numericSpec{
+	{path: "llm.request_timeout_ms", defaultVal: 120_000, minimum: 1, hardCap: 86_400_000},
+	{path: "llm.thinking.budget_tokens", defaultVal: 4_096, minimum: 1, hardCap: 1_000_000},
+	{path: "agent.max_iterations", defaultVal: 10, minimum: 1, hardCap: 1_000},
+	{path: "agent.max_unknown_tool_calls", defaultVal: 2, minimum: 1, hardCap: 100},
+	{path: "llm.stream.max_response_bytes", defaultVal: 16 * mebibyte, minimum: 1, hardCap: 64 * mebibyte},
+	{path: "llm.stream.max_event_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 4 * mebibyte},
+	{path: "llm.stream.max_events", defaultVal: 100_000, minimum: 1, hardCap: 1_000_000},
+	{path: "llm.stream.max_text_bytes", defaultVal: 8 * mebibyte, minimum: 1, hardCap: 32 * mebibyte},
+	{path: "llm.stream.max_thinking_bytes", defaultVal: 8 * mebibyte, minimum: 1, hardCap: 32 * mebibyte},
+	{path: "llm.stream.max_tool_arguments_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 8 * mebibyte},
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -142,11 +155,58 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 	if err := resolveInstructionsMCP(&config, result); err != nil {
 		return LoadedConfig{}, err
 	}
+	if err := resolveLLMAgentStream(&config, result.Value); err != nil {
+		return LoadedConfig{}, err
+	}
 	provenance := make(map[string]ConfigSource, len(result.Provenance))
 	for path, source := range result.Provenance {
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveLLMAgentStream(config *AppConfig, partial PartialAppConfig) error {
+	candidates := [...]Optional[int64]{
+		partial.LLM.RequestTimeoutMS,
+		partial.LLM.Thinking.BudgetTokens,
+		partial.Agent.MaxIterations,
+		partial.Agent.MaxUnknownToolCalls,
+		partial.LLM.Stream.MaxResponseBytes,
+		partial.LLM.Stream.MaxEventBytes,
+		partial.LLM.Stream.MaxEvents,
+		partial.LLM.Stream.MaxTextBytes,
+		partial.LLM.Stream.MaxThinkingBytes,
+		partial.LLM.Stream.MaxToolArgumentsBytes,
+	}
+	values := make([]int64, len(candidates))
+	for index, spec := range llmAgentStreamNumericSpecs {
+		value, err := spec.resolve(candidates[index])
+		if err != nil {
+			return err
+		}
+		values[index] = value
+	}
+
+	responseLimit := values[4]
+	for _, index := range []int{5, 7, 8, 9} {
+		if values[index] > responseLimit {
+			return fmt.Errorf("config field %q must not exceed %q", llmAgentStreamNumericSpecs[index].path, llmAgentStreamNumericSpecs[4].path)
+		}
+	}
+
+	config.LLM.RequestTimeoutMS = int(values[0])
+	config.LLM.Thinking.BudgetTokens = int(values[1])
+	config.Agent.MaxIterations = int(values[2])
+	config.Agent.MaxUnknownToolCalls = int(values[3])
+	config.LLM.Stream = StreamConfig{
+		MaxResponseBytes:      values[4],
+		MaxEventBytes:         values[5],
+		MaxEvents:             values[6],
+		MaxTextBytes:          values[7],
+		MaxThinkingBytes:      values[8],
+		MaxToolArgumentsBytes: values[9],
+	}
+	return nil
 }
 
 func resolveInstructionsMCP(config *AppConfig, result MergeResult) error {

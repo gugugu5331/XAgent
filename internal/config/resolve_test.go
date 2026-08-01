@@ -241,6 +241,83 @@ func TestMCPServerTimeoutInheritsResolvedDefault(t *testing.T) {
 	}
 }
 
+func TestResolveLLMAgentAndStreamNumericMatrix(t *testing.T) {
+	for _, spec := range llmAgentStreamNumericSpecs {
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			if testCase.encoded != "" {
+				continue
+			}
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				var partial PartialAppConfig
+				prepareLLMAgentStreamBoundary(&partial, spec.path)
+				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid LLM, Agent, or stream boundary did not resolve")
+					}
+				} else if err == nil {
+					t.Fatal("invalid LLM, Agent, or stream boundary was accepted")
+				}
+			})
+		}
+	}
+
+	partial := PartialAppConfig{LLM: PartialLLMConfig{Thinking: PartialThinkingConfig{
+		Enabled:      Optional[bool]{Set: true, Value: false},
+		BudgetTokens: Optional[int64]{Set: true, Value: 0},
+	}}}
+	if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
+		t.Fatal("disabled thinking bypassed budget validation")
+	}
+
+	_, err := decodePartial("overflow.yaml", []byte("llm:\n  stream:\n    max_events: 9223372036854775808\n"))
+	if err == nil {
+		t.Fatal("overflowing LLM stream numeric configuration was accepted")
+	}
+}
+
+func prepareLLMAgentStreamBoundary(partial *PartialAppConfig, path string) {
+	if path == "llm.stream.max_response_bytes" {
+		partial.LLM.Stream.MaxEventBytes = Optional[int64]{Set: true, Value: 1}
+		partial.LLM.Stream.MaxTextBytes = Optional[int64]{Set: true, Value: 1}
+		partial.LLM.Stream.MaxThinkingBytes = Optional[int64]{Set: true, Value: 1}
+		partial.LLM.Stream.MaxToolArgumentsBytes = Optional[int64]{Set: true, Value: 1}
+		return
+	}
+	if strings.HasPrefix(path, "llm.stream.max_") && path != "llm.stream.max_events" {
+		partial.LLM.Stream.MaxResponseBytes = Optional[int64]{Set: true, Value: 64 * mebibyte}
+	}
+}
+
+func TestStreamSubLimitsCannotExceedResponseLimit(t *testing.T) {
+	valid := PartialStreamConfig{
+		MaxResponseBytes:      Optional[int64]{Set: true, Value: 1},
+		MaxEventBytes:         Optional[int64]{Set: true, Value: 1},
+		MaxTextBytes:          Optional[int64]{Set: true, Value: 1},
+		MaxThinkingBytes:      Optional[int64]{Set: true, Value: 1},
+		MaxToolArgumentsBytes: Optional[int64]{Set: true, Value: 1},
+	}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{LLM: PartialLLMConfig{Stream: valid}}}, LoadOptions{}); err != nil {
+		t.Fatal("stream sub-limits equal to the response limit were rejected")
+	}
+
+	for _, path := range []string{
+		"llm.stream.max_event_bytes",
+		"llm.stream.max_text_bytes",
+		"llm.stream.max_thinking_bytes",
+		"llm.stream.max_tool_arguments_bytes",
+	} {
+		t.Run(path, func(t *testing.T) {
+			partial := PartialAppConfig{LLM: PartialLLMConfig{Stream: valid}}
+			setPartialNumericValue(t, &partial, path, Optional[int64]{Set: true, Value: 2})
+			if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
+				t.Fatal("stream sub-limit above the response limit was accepted")
+			}
+		})
+	}
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -329,6 +406,26 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return config.MCP.MaxProtocolErrors
 	case "mcp.default_timeout_ms":
 		return config.MCP.DefaultTimeoutMS
+	case "llm.request_timeout_ms":
+		return int64(config.LLM.RequestTimeoutMS)
+	case "llm.thinking.budget_tokens":
+		return int64(config.LLM.Thinking.BudgetTokens)
+	case "llm.stream.max_response_bytes":
+		return config.LLM.Stream.MaxResponseBytes
+	case "llm.stream.max_event_bytes":
+		return config.LLM.Stream.MaxEventBytes
+	case "llm.stream.max_events":
+		return config.LLM.Stream.MaxEvents
+	case "llm.stream.max_text_bytes":
+		return config.LLM.Stream.MaxTextBytes
+	case "llm.stream.max_thinking_bytes":
+		return config.LLM.Stream.MaxThinkingBytes
+	case "llm.stream.max_tool_arguments_bytes":
+		return config.LLM.Stream.MaxToolArgumentsBytes
+	case "agent.max_iterations":
+		return int64(config.Agent.MaxIterations)
+	case "agent.max_unknown_tool_calls":
+		return int64(config.Agent.MaxUnknownToolCalls)
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0

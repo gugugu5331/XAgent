@@ -25,6 +25,16 @@ type LLMConfig struct {
 	APIKey           string         `yaml:"api_key"`
 	RequestTimeoutMS int            `yaml:"request_timeout_ms"`
 	Thinking         ThinkingConfig `yaml:"thinking"`
+	Stream           StreamConfig   `yaml:"-"`
+}
+
+type StreamConfig struct {
+	MaxResponseBytes      int64
+	MaxEventBytes         int64
+	MaxEvents             int64
+	MaxTextBytes          int64
+	MaxThinkingBytes      int64
+	MaxToolArgumentsBytes int64
 }
 
 type AgentConfig struct {
