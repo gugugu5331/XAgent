@@ -182,27 +182,42 @@ func normalizePathForParam(toolName string, arguments map[string]any, projectRoo
 }
 
 func FindRule(rules []Rule, normalized NormalizedCall) (*Rule, bool, error) {
-	var best *Rule
+	match, ok, err := FindRuleMatch(rules, normalized)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	rule := match.Rule()
+	if rule.Effect == string(EffectAllow) && !match.AllowsWithoutPrompt() {
+		return nil, false, nil
+	}
+	return &rule, true, nil
+}
+
+// FindRuleMatch selects the most specific matching rule but grants no
+// execution authority. In particular, legacy_untrusted allows remain visible
+// to the confirmation flow without suppressing that confirmation.
+func FindRuleMatch(rules []Rule, normalized NormalizedCall) (RuleMatch, bool, error) {
+	bestIndex := -1
 	bestScore := ruleScore{}
 	for index := range rules {
 		rule := rules[index]
 		matched, err := MatchRule(rule, normalized)
 		if err != nil {
-			return nil, false, err
+			return RuleMatch{}, false, err
 		}
 		if !matched {
 			continue
 		}
 		score := scoreRule(rule, index)
-		if best == nil || score.betterThan(bestScore) {
-			best = &rules[index]
+		if bestIndex < 0 || score.betterThan(bestScore) {
+			bestIndex = index
 			bestScore = score
 		}
 	}
-	if best == nil {
-		return nil, false, nil
+	if bestIndex < 0 {
+		return RuleMatch{}, false, nil
 	}
-	return best, true, nil
+	return RuleMatch{rule: rules[bestIndex], callID: normalized.Call.ID}, true, nil
 }
 
 type ruleScore struct {

@@ -550,6 +550,125 @@ func TestDecideStagedCompatibility(t *testing.T) {
 	}
 }
 
+func TestRulesNeverSubstituteForTicket(t *testing.T) {
+	root := t.TempDir()
+	normalized, err := NormalizeCall(
+		Call{ID: "rule-call", Name: "Bash", ArgumentsJSON: `{"command":"git status"}`},
+		root,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := Rule{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)}
+	match, ok, err := FindRuleMatch([]Rule{rule}, normalized)
+	if err != nil || !ok || !match.AllowsWithoutPrompt() {
+		t.Fatalf("FindRuleMatch() = (%#v, %v, %v), want prompt-suppressing match", match, ok, err)
+	}
+
+	authority := mustTicketAuthority(t)
+	identity := mustTicketIdentity(t, `{"command":"git status"}`)
+	if err := authority.VerifyAndConsume(ExecutionTicket{}, normalized.Call.ID, identity); err == nil {
+		t.Fatal("rule match substituted for a signed execution ticket")
+	}
+	first, err := match.IssueTicket(authority, identity)
+	if err != nil {
+		t.Fatalf("issue first ticket from rule match: %v", err)
+	}
+	second, err := match.IssueTicket(authority, identity)
+	if err != nil {
+		t.Fatalf("issue second ticket from rule match: %v", err)
+	}
+	if first == second || first.nonce == second.nonce {
+		t.Fatal("repeated rule match reused an execution ticket")
+	}
+	if err := authority.VerifyAndConsume(first, normalized.Call.ID, identity); err != nil {
+		t.Fatalf("consume first freshly issued ticket: %v", err)
+	}
+	if err := authority.VerifyAndConsume(second, normalized.Call.ID, identity); err != nil {
+		t.Fatalf("consume second freshly issued ticket: %v", err)
+	}
+
+	legacy := rule
+	legacy.Trust = RuleTrustLegacyUntrusted
+	legacyMatch, ok, err := FindRuleMatch([]Rule{legacy}, normalized)
+	if err != nil || !ok {
+		t.Fatalf("legacy rule was not observable for confirmation: ok=%v err=%v", ok, err)
+	}
+	if legacyMatch.AllowsWithoutPrompt() {
+		t.Fatal("legacy_untrusted rule suppressed confirmation")
+	}
+	if _, err := legacyMatch.IssueTicket(authority, identity); err == nil {
+		t.Fatal("legacy_untrusted rule issued an execution ticket")
+	}
+
+	if err := rule.ValidatePermanent(); err != nil {
+		t.Fatalf("minimal exact permanent rule rejected: %v", err)
+	}
+	for name, unsafe := range map[string]Rule{
+		"glob":   {Tool: "Bash", Pattern: "git *", MatchType: string(MatchGlob), Effect: string(EffectAllow)},
+		"secret": {Tool: "Bash", Pattern: "api_key=secret-key", MatchType: string(MatchExact), Effect: string(EffectAllow)},
+		"mcp":    {Tool: "mcp__server__tool", Pattern: `{}`, MatchType: string(MatchExact), Effect: string(EffectAllow)},
+	} {
+		if err := unsafe.ValidatePermanent(); err == nil {
+			t.Errorf("unsafe permanent %s rule was accepted", name)
+		}
+	}
+}
+
+func TestMCPRuleDoesNotCrossServer(t *testing.T) {
+	call := Call{ID: "mcp-call", Name: "mcp__alpha__lookup", ArgumentsJSON: `{"query":"safe"}`}
+	normalized, err := NormalizeCall(call, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := Rule{Tool: call.Name, Pattern: call.ArgumentsJSON, MatchType: string(MatchExact), Effect: string(EffectAllow)}
+	match, ok, err := FindRuleMatch([]Rule{rule}, normalized)
+	if err != nil || !ok || !match.AllowsWithoutPrompt() {
+		t.Fatalf("matching MCP rule = (%#v, %v, %v)", match, ok, err)
+	}
+
+	otherServer, err := NormalizeCall(
+		Call{ID: call.ID, Name: "mcp__beta__lookup", ArgumentsJSON: call.ArgumentsJSON},
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := FindRuleMatch([]Rule{rule}, otherServer); err != nil || ok {
+		t.Fatalf("MCP rule crossed registered servers: ok=%v err=%v", ok, err)
+	}
+
+	targetA := [32]byte{1}
+	targetB := [32]byte{2}
+	identityA, err := NewCallIdentity(CallIdentityInput{
+		ToolName:           call.Name,
+		CanonicalArguments: []byte(call.ArgumentsJSON),
+		TargetDigest:       &targetA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityB, err := NewCallIdentity(CallIdentityInput{
+		ToolName:           call.Name,
+		CanonicalArguments: []byte(call.ArgumentsJSON),
+		TargetDigest:       &targetB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := mustTicketAuthority(t)
+	ticket, err := match.IssueTicket(authority, identityA)
+	if err != nil {
+		t.Fatalf("issue MCP ticket: %v", err)
+	}
+	if err := authority.VerifyAndConsume(ticket, call.ID, identityB); err == nil {
+		t.Fatal("MCP ticket crossed final server configuration digests")
+	}
+	if err := authority.VerifyAndConsume(ticket, call.ID, identityA); err != nil {
+		t.Fatalf("wrong target attempt consumed matching MCP ticket: %v", err)
+	}
+}
+
 func quote(value string) string {
 	data, _ := json.Marshal(value)
 	return string(data)

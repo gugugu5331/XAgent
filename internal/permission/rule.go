@@ -19,6 +19,29 @@ type RuleTrust string
 
 const RuleTrustLegacyUntrusted RuleTrust = "legacy_untrusted"
 
+// RuleMatch records only that one normalized call matched a configured rule.
+// It is not an execution capability; a TicketIssuer must still sign a fresh
+// ticket for the call's final identity.
+type RuleMatch struct {
+	rule   Rule
+	callID string
+}
+
+func (m RuleMatch) Rule() Rule {
+	return m.rule
+}
+
+func (m RuleMatch) AllowsWithoutPrompt() bool {
+	return m.callID != "" && m.rule.Effect == string(EffectAllow) && m.rule.Trust == ""
+}
+
+func (m RuleMatch) IssueTicket(issuer TicketIssuer, identity CallIdentity) (ExecutionTicket, error) {
+	if !m.AllowsWithoutPrompt() || issuer == nil {
+		return ExecutionTicket{}, fmt.Errorf("rule match cannot issue an execution ticket")
+	}
+	return issuer.Issue(m.callID, identity)
+}
+
 type RuleFile struct {
 	Version int    `yaml:"version"`
 	Rules   []Rule `yaml:"rules"`
@@ -72,6 +95,25 @@ func (r Rule) Validate() error {
 	}
 	if r.Effect != string(EffectAllow) && r.Effect != string(EffectDeny) {
 		return fmt.Errorf("unsupported effect %q", r.Effect)
+	}
+	return nil
+}
+
+// ValidatePermanent applies the narrower policy for a persisted automatic
+// allow. Legacy, remote, broad, complex, and secret-bearing scopes require a
+// fresh confirmation instead of becoming permanent rules.
+func (r Rule) ValidatePermanent() error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if r.Trust != "" || r.Effect != string(EffectAllow) || r.MatchType != string(MatchExact) {
+		return fmt.Errorf("permanent permission scope is not minimal")
+	}
+	if strings.HasPrefix(r.Tool, "mcp__") || (r.Tool == "Bash" && IsComplexShell(r.Pattern)) {
+		return fmt.Errorf("permanent permission scope is not available")
+	}
+	if ruleContainsSecret(r) {
+		return fmt.Errorf("permanent permission scope contains sensitive data")
 	}
 	return nil
 }
