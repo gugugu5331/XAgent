@@ -490,10 +490,6 @@ func writeLinuxHandshake(handshake *os.File, signal byte) error {
 	return nil
 }
 
-func installLinuxProtection(linuxLaunchPlan) error {
-	return errLinuxProtectionUnavailable
-}
-
 func replaceLinuxEnvironment(environment []string, key, value string) []string {
 	prefix := key + "="
 	replaced := make([]string, 0, len(environment)+1)
