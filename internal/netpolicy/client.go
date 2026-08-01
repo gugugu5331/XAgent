@@ -1,7 +1,6 @@
 package netpolicy
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"net"
@@ -52,6 +51,7 @@ type guardedTransport struct {
 	endpoint         Endpoint
 	sensitiveHeaders map[string]struct{}
 	base             *http.Transport
+	dialer           *boundDialer
 }
 
 func NewClientFactory(policy *Policy) ClientFactory {
@@ -73,17 +73,25 @@ func (f *clientFactory) New(endpoint Endpoint, options ClientOptions) (Client, e
 
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.Proxy = nil
-	base.DialContext = blockedDialContext
-	base.DialTLSContext = blockedDialContext
 	base.TLSClientConfig = &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		RootCAs:    cloneCertPool(options.TrustedRoots),
 	}
+	dialer := &boundDialer{
+		policy:              f.policy,
+		endpoint:            endpoint,
+		dialer:              &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second},
+		tlsConfig:           base.TLSClientConfig,
+		tlsHandshakeTimeout: base.TLSHandshakeTimeout,
+	}
+	base.DialContext = dialer.DialContext
+	base.DialTLSContext = dialer.DialTLSContext
 	transport := &guardedTransport{
 		policy:           f.policy,
 		endpoint:         endpoint,
 		sensitiveHeaders: headers,
 		base:             base,
+		dialer:           dialer,
 	}
 	httpClient := &http.Client{
 		Transport:     transport,
@@ -239,8 +247,4 @@ func cloneCertPool(pool *x509.CertPool) *x509.CertPool {
 		return nil
 	}
 	return pool.Clone()
-}
-
-func blockedDialContext(context.Context, string, string) (net.Conn, error) {
-	return nil, policyError(CodePolicyUnavailable)
 }

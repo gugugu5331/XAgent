@@ -13,6 +13,7 @@ const (
 	CodeAddressForbidden     ErrorCode = "address_forbidden"
 	CodeAddressClassMixed    ErrorCode = "address_class_mixed"
 	CodeAddressClassChanged  ErrorCode = "address_class_changed"
+	CodeDialFailed           ErrorCode = "dial_failed"
 	CodePolicyUnavailable    ErrorCode = "policy_unavailable"
 )
 
