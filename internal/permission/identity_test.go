@@ -151,3 +151,114 @@ func TestCallIdentityBindsFileAndMCPResources(t *testing.T) {
 		t.Fatal("invalid resource binding was accepted")
 	}
 }
+
+func TestBashIdentityDistinguishesRawSemanticBytes(t *testing.T) {
+	opened, err := safefs.Bootstrap(t.TempDir(), safefs.Policy{})
+	if err != nil {
+		t.Fatalf("bootstrap working directory: %v", err)
+	}
+	defer func() {
+		if err := opened.Root.Close(); err != nil {
+			t.Errorf("close working directory: %v", err)
+		}
+	}()
+	other, err := safefs.Bootstrap(t.TempDir(), safefs.Policy{})
+	if err != nil {
+		t.Fatalf("bootstrap other working directory: %v", err)
+	}
+	defer func() {
+		if err := other.Root.Close(); err != nil {
+			t.Errorf("close other working directory: %v", err)
+		}
+	}()
+
+	baseCommand := []byte(`printf 'safe value'`)
+	environmentDigest := sha256.Sum256([]byte("PATH=/usr/bin"))
+	base := BashIdentityInput{
+		Shell:             "/bin/sh",
+		WorkingDirectory:  opened.Root.Identity(),
+		RawCommand:        baseCommand,
+		EnvironmentDigest: environmentDigest,
+	}
+	want, err := NewBashIdentity(base)
+	if err != nil {
+		t.Fatalf("create base Bash identity: %v", err)
+	}
+	repeated, err := NewBashIdentity(base)
+	if err != nil || repeated != want {
+		t.Fatalf("identical Bash input was unstable: identity=%#v err=%v", repeated, err)
+	}
+
+	semanticVariants := []struct {
+		name    string
+		command []byte
+	}{
+		{name: "leading space", command: []byte(` printf 'safe value'`)},
+		{name: "repeated space display collision", command: []byte(`printf  'safe value'`)},
+		{name: "trailing newline display collision", command: []byte("printf 'safe value'\n")},
+		{name: "embedded newline", command: []byte("printf 'safe value'\nprintf extra")},
+		{name: "different quotes", command: []byte(`printf "safe value"`)},
+		{name: "NUL control byte", command: []byte("printf 'safe value'\x00")},
+		{name: "escape control byte", command: []byte("printf 'safe value'\x1b")},
+	}
+	for _, variant := range semanticVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			input := base
+			input.RawCommand = variant.command
+			identity, err := NewBashIdentity(input)
+			if err != nil {
+				t.Fatalf("create semantic variant identity: %v", err)
+			}
+			if identity == want {
+				t.Fatal("different raw command bytes reused the base identity")
+			}
+		})
+	}
+	for _, collision := range []string{`printf  'safe value'`, "printf 'safe value'\n"} {
+		if NormalizeCommand(collision) != NormalizeCommand(string(baseCommand)) {
+			t.Fatalf("test fixture is not a normalized-display collision: %q", collision)
+		}
+	}
+
+	contextVariants := []struct {
+		name   string
+		mutate func(*BashIdentityInput)
+	}{
+		{name: "shell", mutate: func(input *BashIdentityInput) { input.Shell = "/bin/zsh" }},
+		{name: "working directory", mutate: func(input *BashIdentityInput) { input.WorkingDirectory = other.Root.Identity() }},
+		{name: "environment", mutate: func(input *BashIdentityInput) { input.EnvironmentDigest = sha256.Sum256([]byte("PATH=/opt/bin")) }},
+	}
+	for _, variant := range contextVariants {
+		t.Run(variant.name, func(t *testing.T) {
+			input := base
+			variant.mutate(&input)
+			identity, err := NewBashIdentity(input)
+			if err != nil {
+				t.Fatalf("create context variant identity: %v", err)
+			}
+			if identity == want {
+				t.Fatal("changed Bash execution context reused the base identity")
+			}
+		})
+	}
+
+	for _, invalid := range []BashIdentityInput{
+		{Shell: "", WorkingDirectory: opened.Root.Identity(), RawCommand: baseCommand, EnvironmentDigest: environmentDigest},
+		{Shell: " \t\n", WorkingDirectory: opened.Root.Identity(), RawCommand: baseCommand, EnvironmentDigest: environmentDigest},
+		{Shell: "/bin/sh", WorkingDirectory: safefs.Identity{}, RawCommand: baseCommand, EnvironmentDigest: environmentDigest},
+	} {
+		if _, err := NewBashIdentity(invalid); err == nil {
+			t.Fatalf("invalid Bash identity input was accepted: %#v", invalid)
+		}
+	}
+
+	baseCommand[0] = 'x'
+	if repeated, err := NewBashIdentity(BashIdentityInput{
+		Shell:             "/bin/sh",
+		WorkingDirectory:  opened.Root.Identity(),
+		RawCommand:        []byte(`printf 'safe value'`),
+		EnvironmentDigest: environmentDigest,
+	}); err != nil || repeated != want {
+		t.Fatal("mutating caller-owned command bytes changed an existing identity")
+	}
+}
