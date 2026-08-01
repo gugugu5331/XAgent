@@ -2,6 +2,8 @@ package permission
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -84,5 +86,74 @@ func TestCorruptLayerFailsClosedForAllDangerousTools(t *testing.T) {
 	}
 	if err := authority.VerifyAndConsume(stale, "issued-before-corruption", identity); err == nil {
 		t.Fatal("recovery revived a ticket invalidated by corruption")
+	}
+}
+
+func TestLegacyRulesMigrateNonDestructively(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	root := t.TempDir()
+	permissionDir := filepath.Join(root, ".xagent")
+	if err := os.MkdirAll(permissionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyPath := ProjectRulePath(root)
+	legacyBytes := []byte("rules:\n" +
+		"  - tool: Bash\n    pattern: git status\n    match_type: exact\n    effect: allow\n" +
+		"  - tool: Bash\n    pattern: rm -rf .\n    match_type: exact\n    effect: deny\n" +
+		"  - tool: Read\n    pattern: README.md\n    match_type: exact\n    effect: allow\n")
+	if err := os.WriteFile(legacyPath, legacyBytes, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentBytes := []byte("version: 1\nrules:\n  - tool: Bash\n    pattern: git status\n    match_type: exact\n    effect: allow\n")
+	if err := os.WriteFile(LocalRulePath(root), currentBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := LoadRules(root)
+	if len(loaded.Errors) != 0 {
+		t.Fatalf("missing user layer was treated as corrupt: %#v", loaded.Errors)
+	}
+	if len(loaded.Project.Rules) != 3 {
+		t.Fatalf("legacy project rule count=%d, want 3", len(loaded.Project.Rules))
+	}
+	if got := loaded.Project.Rules[0].Trust; got != RuleTrustLegacyUntrusted {
+		t.Fatalf("legacy Bash allow trust=%q, want %q", got, RuleTrustLegacyUntrusted)
+	}
+	for index := 1; index < len(loaded.Project.Rules); index++ {
+		if got := loaded.Project.Rules[index].Trust; got == RuleTrustLegacyUntrusted {
+			t.Fatalf("safe legacy rule %d was marked untrusted", index)
+		}
+	}
+	if got := loaded.Local.Rules[0].Trust; got == RuleTrustLegacyUntrusted {
+		t.Fatal("current-version Bash allow was treated as a legacy rule")
+	}
+	afterBytes, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterBytes) != string(legacyBytes) || after.Mode() != before.Mode() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("loading legacy rules rewrote the original permission file")
+	}
+
+	userDir := filepath.Dir(UserRulePath(""))
+	if err := os.MkdirAll(userDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(UserRulePath(""), []byte("rules: [not-valid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := LoadRules(root)
+	if len(corrupt.Errors) != 1 || corrupt.Errors[0].Source.Kind != SourceUserRule {
+		t.Fatalf("corrupt user layer was not distinguished from missing: %#v", corrupt.Errors)
 	}
 }

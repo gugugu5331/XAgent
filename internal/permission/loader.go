@@ -2,9 +2,14 @@ package permission
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+
+	"xagent/internal/safefs"
 
 	"gopkg.in/yaml.v3"
 )
@@ -70,15 +75,47 @@ func LoadRules(projectRoot string) LoadedRules {
 }
 
 func LoadRuleFile(path string) (RuleFile, error) {
-	data, err := os.ReadFile(path)
+	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return RuleFile{}, err
+		return RuleFile{}, errors.New("resolve permission rule file failed")
 	}
-	file, err := DecodeRuleFile(data)
+	absolute = filepath.Clean(absolute)
+	parent := filepath.Dir(absolute)
+	if _, err := os.Lstat(parent); err != nil {
+		if os.IsNotExist(err) {
+			return RuleFile{}, os.ErrNotExist
+		}
+		return RuleFile{}, errors.New("inspect permission rule directory failed")
+	}
+	opened, err := safefs.Bootstrap(parent, safefs.Policy{})
 	if err != nil {
-		return RuleFile{}, err
+		return RuleFile{}, errors.New("open permission rule directory failed")
 	}
-	return file, nil
+	data, readErr := readRuleFile(opened.Root, filepath.Base(absolute))
+	closeErr := opened.Root.Close()
+	if readErr != nil {
+		if _, statErr := os.Lstat(absolute); os.IsNotExist(statErr) {
+			return RuleFile{}, os.ErrNotExist
+		}
+		return RuleFile{}, readErr
+	}
+	if closeErr != nil {
+		return RuleFile{}, errors.New("close permission rule directory failed")
+	}
+	return DecodeRuleFile(data)
+}
+
+func readRuleFile(root *safefs.Root, relative string) ([]byte, error) {
+	file, err := root.OpenRead(context.Background(), relative)
+	if err != nil {
+		return nil, errors.New("open permission rule file failed")
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.New("read permission rule file failed")
+	}
+	return data, nil
 }
 
 func DecodeRuleFile(data []byte) (RuleFile, error) {
@@ -88,13 +125,25 @@ func DecodeRuleFile(data []byte) (RuleFile, error) {
 	if err := decoder.Decode(&file); err != nil {
 		return RuleFile{}, err
 	}
-	if file.Version == 0 {
+	legacy := file.Version == 0
+	if legacy {
 		file.Version = 1
 	}
 	if err := ValidateRuleFile(file); err != nil {
 		return RuleFile{}, err
 	}
+	if legacy {
+		markLegacyUntrustedRules(file.Rules)
+	}
 	return file, nil
+}
+
+func markLegacyUntrustedRules(rules []Rule) {
+	for index := range rules {
+		if rules[index].Tool == "Bash" && rules[index].Effect == string(EffectAllow) {
+			rules[index].Trust = RuleTrustLegacyUntrusted
+		}
+	}
 }
 
 func ConfigErrorDecision(call Call, message string) Decision {

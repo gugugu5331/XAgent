@@ -6,13 +6,18 @@ import (
 )
 
 type Rule struct {
-	Tool        string `yaml:"tool"`
-	Pattern     string `yaml:"pattern"`
-	MatchType   string `yaml:"match_type"`
-	Effect      string `yaml:"effect"`
-	PathParam   string `yaml:"path_param,omitempty"`
-	Description string `yaml:"description,omitempty"`
+	Tool        string    `yaml:"tool"`
+	Pattern     string    `yaml:"pattern"`
+	MatchType   string    `yaml:"match_type"`
+	Effect      string    `yaml:"effect"`
+	PathParam   string    `yaml:"path_param,omitempty"`
+	Description string    `yaml:"description,omitempty"`
+	Trust       RuleTrust `yaml:"-"`
 }
+
+type RuleTrust string
+
+const RuleTrustLegacyUntrusted RuleTrust = "legacy_untrusted"
 
 type RuleFile struct {
 	Version int    `yaml:"version"`
