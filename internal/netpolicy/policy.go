@@ -109,20 +109,6 @@ func (p *Policy) ValidateInitial(ctx context.Context, rawURL string, purpose Pur
 	}, nil
 }
 
-func (*Policy) ValidateRequest(ctx context.Context, endpoint Endpoint, target *url.URL) error {
-	if ctx == nil || !endpoint.valid() || target == nil {
-		return policyError(CodeInvalidRequest)
-	}
-	return policyError(CodePolicyUnavailable)
-}
-
-func (*Policy) ValidateRedirect(ctx context.Context, endpoint Endpoint, next *url.URL) error {
-	if ctx == nil || !endpoint.valid() || next == nil {
-		return policyError(CodeInvalidRequest)
-	}
-	return policyError(CodePolicyUnavailable)
-}
-
 func validHostname(hostname string) bool {
 	if hostname == "" || strings.ContainsAny(hostname, "\x00\r\n\t /\\%") {
 		return false

@@ -86,14 +86,9 @@ func (f *clientFactory) New(endpoint Endpoint, options ClientOptions) (Client, e
 		base:             base,
 	}
 	httpClient := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
-			if request == nil || request.URL == nil {
-				return policyError(CodeInvalidRequest)
-			}
-			return f.policy.ValidateRedirect(request.Context(), endpoint, request.URL)
-		},
-		Timeout: options.Timeout,
+		Transport:     transport,
+		CheckRedirect: transport.checkRedirect,
+		Timeout:       options.Timeout,
 	}
 	return &controlledClient{
 		httpClient: httpClient,
