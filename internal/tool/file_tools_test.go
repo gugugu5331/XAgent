@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"xagent/internal/budget"
+	"xagent/internal/safefs"
 )
 
 func TestReadCancellationLongLineAndBudget(t *testing.T) {
@@ -142,6 +143,8 @@ func (r *faultingRead) Read(destination []byte) (int, error) {
 	return count, nil
 }
 
+func (r *faultingRead) Close() error { return nil }
+
 func boundedReadExecutor(t *testing.T, root string, fileBytes, lines int64, outputBytes int) *Executor {
 	t.Helper()
 	registry, err := NewRegistry(root)
@@ -152,4 +155,149 @@ func boundedReadExecutor(t *testing.T, root string, fileBytes, lines int64, outp
 	executor.ReadMaxBytes = fileBytes
 	executor.ReadMaxLines = lines
 	return executor
+}
+
+func TestGrepUsesSharedBudgetAndReportsScanErrors(t *testing.T) {
+	t.Run("byte budget is shared across files", func(t *testing.T) {
+		root := t.TempDir()
+		for _, name := range []string{"one.txt", "two.txt"} {
+			if err := os.WriteFile(filepath.Join(root, name), []byte("hit\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		executor := boundedGrepExecutor(t, root, grepLimits{bytes: 6, files: 10, directories: 10, lines: 10, outputBytes: 4096})
+		result := executor.Execute(context.Background(), Call{ID: "shared-bytes", Name: "Grep", ArgumentsJSON: `{"pattern":"hit","path":"."}`})
+		if result.Status != StatusSuccess || !result.Truncated || result.Data["bytes"] != int64(6) || result.Data["files"] != int64(2) || result.Data["count"] != 1 {
+			t.Fatalf("Grep did not share the byte budget across files: %#v", result)
+		}
+		if result.Data["truncation_reason"] != string(budget.FilesScanMaxBytes) {
+			t.Fatalf("wrong shared-byte truncation reason: %#v", result.Data)
+		}
+	})
+
+	t.Run("file and directory budgets", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, "child"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "root.txt"), []byte("hit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "child", "child.txt"), []byte("hit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		executor := boundedGrepExecutor(t, root, grepLimits{bytes: 64, files: 10, directories: 1, lines: 10, outputBytes: 4096})
+		result := executor.Execute(context.Background(), Call{ID: "directory-budget", Name: "Grep", ArgumentsJSON: `{"pattern":"hit","path":"."}`})
+		if !result.Truncated || result.Data["directories"] != int64(1) || result.Data["truncation_reason"] != string(budget.FilesScanMaxDirectories) {
+			t.Fatalf("Grep did not enforce the shared directory budget: %#v", result)
+		}
+
+		flat := t.TempDir()
+		for _, name := range []string{"a.txt", "b.txt"} {
+			if err := os.WriteFile(filepath.Join(flat, name), []byte("hit\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		executor = boundedGrepExecutor(t, flat, grepLimits{bytes: 64, files: 1, directories: 10, lines: 10, outputBytes: 4096})
+		result = executor.Execute(context.Background(), Call{ID: "file-budget", Name: "Grep", ArgumentsJSON: `{"pattern":"hit","path":"."}`})
+		if !result.Truncated || result.Data["files"] != int64(1) || result.Data["truncation_reason"] != string(budget.FilesScanMaxFiles) {
+			t.Fatalf("Grep did not enforce the shared file budget: %#v", result)
+		}
+	})
+
+	t.Run("line budget and long line", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "lines.txt"), []byte("hit\nhit\nhit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		executor := boundedGrepExecutor(t, root, grepLimits{bytes: 64, files: 10, directories: 10, lines: 2, outputBytes: 4096})
+		result := executor.Execute(context.Background(), Call{ID: "line-budget", Name: "Grep", ArgumentsJSON: `{"pattern":"hit","path":"lines.txt"}`})
+		if result.Status != StatusSuccess || !result.Truncated || result.Data["lines"] != int64(2) || result.Data["count"] != 2 || result.Data["truncation_reason"] != string(budget.FilesScanMaxLines) {
+			t.Fatalf("Grep did not enforce the shared line budget: %#v", result)
+		}
+
+		longRoot := t.TempDir()
+		content := strings.Repeat("x", 8192) + "\nhit\n"
+		if err := os.WriteFile(filepath.Join(longRoot, "long.txt"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		executor = boundedGrepExecutor(t, longRoot, grepLimits{bytes: int64(len(content)), files: 10, directories: 10, lines: 10, outputBytes: 128})
+		result = executor.Execute(context.Background(), Call{ID: "long-line", Name: "Grep", ArgumentsJSON: `{"pattern":"hit","path":"long.txt"}`})
+		errorsValue, _ := result.Data["scan_errors"].([]string)
+		if result.Status != StatusSuccess || result.Data["count"] != 1 || !containsString(errorsValue, "long.txt:1:line_too_long") || len(result.Content) > 128 {
+			t.Fatalf("Grep did not safely report and continue after a long line: %#v", result)
+		}
+	})
+
+	t.Run("partial read error is safe", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "fault.txt"), []byte("fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tool := &GrepTool{
+			projectRoot: root,
+			limits:      grepLimits{bytes: 64, files: 10, directories: 10, lines: 10, outputBytes: 4096},
+			openFile: func(context.Context, *safefs.Root, string) (io.ReadCloser, error) {
+				return &faultingRead{data: []byte("hit\n"), err: errors.New("/sensitive/raw/device/path")}, nil
+			},
+		}
+		result := tool.Execute(context.Background(), Input{CallID: "fault", Name: "Grep", Arguments: map[string]any{"pattern": "hit", "path": "fault.txt"}})
+		errorsValue, _ := result.Data["scan_errors"].([]string)
+		visible := result.Summary + result.Content + strings.Join(errorsValue, " ")
+		if result.Status != StatusSuccess || result.Data["count"] != 1 || !containsString(errorsValue, "fault.txt:read_failed") || strings.Contains(visible, "/sensitive/") {
+			t.Fatalf("Grep did not return a safe bounded partial result: %#v", result)
+		}
+	})
+
+	t.Run("canceled before traversal", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result := NewGrepTool(t.TempDir()).Execute(ctx, Input{CallID: "canceled", Name: "Grep", Arguments: map[string]any{"pattern": "hit"}})
+		if result.Status != StatusError || result.Error == nil || result.Error.Code != ErrTimeout || result.Content != "" {
+			t.Fatalf("canceled Grep returned an unsafe result: %#v", result)
+		}
+	})
+
+	t.Run("canceled while opening a file", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "cancel.txt"), []byte("hit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		tool := &GrepTool{
+			projectRoot: root,
+			limits:      grepLimits{bytes: 64, files: 10, directories: 10, lines: 10, outputBytes: 4096},
+			openFile: func(context.Context, *safefs.Root, string) (io.ReadCloser, error) {
+				cancel()
+				return nil, errors.New("open interrupted")
+			},
+		}
+		result := tool.Execute(ctx, Input{CallID: "open-canceled", Name: "Grep", Arguments: map[string]any{"pattern": "hit", "path": "cancel.txt"}})
+		if result.Status != StatusError || result.Error == nil || result.Error.Code != ErrTimeout || result.Content != "" {
+			t.Fatalf("Grep did not propagate cancellation from file open: %#v", result)
+		}
+	})
+}
+
+func boundedGrepExecutor(t *testing.T, root string, limits grepLimits) *Executor {
+	t.Helper()
+	registry, err := NewRegistry(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(registry, root, time.Second, int(limits.outputBytes))
+	executor.ScanMaxBytes = limits.bytes
+	executor.ScanMaxFiles = limits.files
+	executor.ScanMaxDirs = limits.directories
+	executor.ScanMaxLines = limits.lines
+	return executor
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

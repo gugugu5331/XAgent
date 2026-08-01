@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -28,6 +27,10 @@ type Executor struct {
 	MaxOutputBytes int
 	ReadMaxBytes   int64
 	ReadMaxLines   int64
+	ScanMaxBytes   int64
+	ScanMaxFiles   int64
+	ScanMaxDirs    int64
+	ScanMaxLines   int64
 	TicketVerifier permission.TicketVerifier
 
 	rootOnce sync.Once
@@ -52,6 +55,10 @@ func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 		MaxOutputBytes: maxOutputBytes,
 		ReadMaxBytes:   defaultBudgetValue(budget.FilesReadMaxBytes),
 		ReadMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
+		ScanMaxBytes:   defaultBudgetValue(budget.FilesScanMaxBytes),
+		ScanMaxFiles:   defaultBudgetValue(budget.FilesScanMaxFiles),
+		ScanMaxDirs:    defaultBudgetValue(budget.FilesScanMaxDirectories),
+		ScanMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
 	}
 }
 
@@ -119,7 +126,7 @@ func (e *Executor) PrepareCall(ctx context.Context, call Call) (ValidatedCall, e
 	if err != nil {
 		return ValidatedCall{}, err
 	}
-	if call.Name == "Read" {
+	if call.Name == "Read" || call.Name == "Grep" {
 		rootPath, err = canonicalReadRoot(rootPath)
 		if err != nil {
 			return ValidatedCall{}, errors.New("executor read root is unavailable")
@@ -193,7 +200,7 @@ func (e *Executor) openRootAt(rootPath string) (*safefs.Root, error) {
 }
 
 func (e *Executor) bindingRootPath(ctx context.Context, call Call) (string, error) {
-	if call.Name != "Read" {
+	if call.Name != "Read" && call.Name != "Grep" {
 		return e.ProjectRoot, nil
 	}
 	var arguments map[string]any
@@ -201,25 +208,18 @@ func (e *Executor) bindingRootPath(ctx context.Context, call Call) (string, erro
 		return e.ProjectRoot, nil
 	}
 	path, _ := arguments["path"].(string)
-	resolvedPath := path
-	if filepath.IsAbs(path) {
-		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
-			resolvedPath = filepath.Clean(resolved)
-		}
-	}
-	if !filepath.IsAbs(path) || isPathInsideRoot(e.ProjectRoot, resolvedPath) {
-		return e.ProjectRoot, nil
+	if call.Name == "Grep" && path == "" {
+		path = "."
 	}
 	scope, err := effectiveReadScope(ctx, e.ProjectRoot)
 	if err != nil {
 		return "", errors.New("executor read scope is unavailable")
 	}
-	for _, root := range scope.ExtraRoots {
-		if isPathInsideRoot(root, resolvedPath) {
-			return root, nil
-		}
+	target, err := resolveReadPath(scope, path)
+	if err != nil {
+		return "", errors.New("file tool path is outside the opened roots")
 	}
-	return "", errors.New("file tool path is outside the opened roots")
+	return target.root, nil
 }
 
 func executionShell() string {
@@ -263,6 +263,16 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 			fileBytes:   e.ReadMaxBytes,
 			lines:       e.ReadMaxLines,
 			outputBytes: int64(e.MaxOutputBytes),
+		})
+	} else if call.Name == "Grep" {
+		execCtx = withReadExecution(execCtx, readExecution{
+			root:            validated.executionRoot,
+			rootPath:        validated.executionRootPath,
+			outputBytes:     int64(e.MaxOutputBytes),
+			scanBytes:       e.ScanMaxBytes,
+			scanFiles:       e.ScanMaxFiles,
+			scanDirectories: e.ScanMaxDirs,
+			scanLines:       e.ScanMaxLines,
 		})
 	}
 

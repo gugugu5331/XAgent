@@ -23,11 +23,15 @@ type readScopeContextKey struct{}
 type readExecutionContextKey struct{}
 
 type readExecution struct {
-	root        *safefs.Root
-	rootPath    string
-	fileBytes   int64
-	lines       int64
-	outputBytes int64
+	root            *safefs.Root
+	rootPath        string
+	fileBytes       int64
+	lines           int64
+	outputBytes     int64
+	scanBytes       int64
+	scanFiles       int64
+	scanDirectories int64
+	scanLines       int64
 }
 
 func withReadExecution(ctx context.Context, execution readExecution) context.Context {
@@ -170,16 +174,30 @@ func canonicalReadRoot(root string) (string, error) {
 }
 
 func openReadInScope(ctx context.Context, scope ReadScope, requestedPath string) (resolvedReadPath, *safefs.File, func(), error) {
+	target, root, closeRoot, err := readRootInScope(ctx, scope, requestedPath)
+	if err != nil {
+		return resolvedReadPath{}, nil, func() {}, err
+	}
+	relative, err := relativeReadTarget(target, false)
+	if err != nil {
+		closeRoot()
+		return resolvedReadPath{}, nil, func() {}, err
+	}
+	file, err := root.OpenRead(ctx, relative)
+	if err != nil {
+		closeRoot()
+		return resolvedReadPath{}, nil, func() {}, errors.New(ErrNotFound)
+	}
+	return target, file, closeRoot, nil
+}
+
+func readRootInScope(ctx context.Context, scope ReadScope, requestedPath string) (resolvedReadPath, *safefs.Root, func(), error) {
 	if ctx == nil || ctx.Err() != nil {
 		return resolvedReadPath{}, nil, func() {}, context.Canceled
 	}
 	target, err := resolveReadPath(scope, requestedPath)
 	if err != nil {
 		return resolvedReadPath{}, nil, func() {}, err
-	}
-	relative, err := filepath.Rel(target.root, target.absolute)
-	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return resolvedReadPath{}, nil, func() {}, errors.New(ErrPathOutsideProject)
 	}
 
 	execution := readExecutionFromContext(ctx)
@@ -196,10 +214,16 @@ func openReadInScope(ctx context.Context, scope ReadScope, requestedPath string)
 		root = opened.Root
 		closeRoot = func() { _ = root.Close() }
 	}
-	file, err := root.OpenRead(ctx, filepath.ToSlash(relative))
-	if err != nil {
-		closeRoot()
-		return resolvedReadPath{}, nil, func() {}, errors.New(ErrNotFound)
+	return target, root, closeRoot, nil
+}
+
+func relativeReadTarget(target resolvedReadPath, allowRoot bool) (string, error) {
+	relative, err := filepath.Rel(target.root, target.absolute)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New(ErrPathOutsideProject)
 	}
-	return target, file, closeRoot, nil
+	if relative == "." && !allowRoot {
+		return "", errors.New(ErrPathOutsideProject)
+	}
+	return filepath.ToSlash(relative), nil
 }
