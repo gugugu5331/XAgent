@@ -108,6 +108,23 @@ func (p ProtectionPlan) allowsWrite(root *safefs.Root) bool {
 	return root.Identity() == p.scratch.Identity()
 }
 
+func (p ProtectionPlan) containsReadRoot(root *safefs.Root) bool {
+	if !p.valid() || root == nil {
+		return false
+	}
+	identity := root.Identity()
+	for _, allowed := range p.roots {
+		if allowed.Identity() == identity {
+			return true
+		}
+	}
+	return false
+}
+
+func (p ProtectionPlan) validForStart() bool {
+	return p.valid() && p.scratchOwner != nil && p.scratchOwner.root == p.scratch
+}
+
 func (p ProtectionPlan) cleanupScratch() error {
 	if p.scratchOwner == nil || p.scratchOwner.root != p.scratch {
 		return errors.New("proctree scratch ownership is unavailable")

@@ -113,6 +113,11 @@ func (p *managedProcess) Terminate(ctx context.Context) error {
 	if p == nil || ctx == nil {
 		return errors.New("proctree terminate request is invalid")
 	}
+	select {
+	case <-p.waitDone:
+		return p.wait.err
+	default:
+	}
 	if err := p.controller.TerminateTree(); err != nil {
 		return errors.New("proctree terminate failed")
 	}
@@ -139,9 +144,15 @@ func (p *managedProcess) cleanup() {
 	defer close(p.closeDone)
 	p.pipeState.stopWrites()
 	p.controller.StopWrites()
-	_ = p.controller.TerminateTree()
 	deadline := time.NewTimer(p.timeout)
 	defer deadline.Stop()
+	select {
+	case <-p.waitDone:
+		p.closeAfterReap(deadline.C)
+		return
+	default:
+	}
+	_ = p.controller.TerminateTree()
 	softWait := time.NewTimer(p.timeout / 2)
 	defer softWait.Stop()
 
