@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"xagent/internal/budget"
 	"xagent/internal/safefs"
 )
 
@@ -32,6 +33,13 @@ type readExecution struct {
 	scanFiles       int64
 	scanDirectories int64
 	scanLines       int64
+}
+
+type fileScanLimits struct {
+	bytes       int64
+	files       int64
+	directories int64
+	lines       int64
 }
 
 func withReadExecution(ctx context.Context, execution readExecution) context.Context {
@@ -226,4 +234,72 @@ func relativeReadTarget(target resolvedReadPath, allowRoot bool) (string, error)
 		return "", errors.New(ErrPathOutsideProject)
 	}
 	return filepath.ToSlash(relative), nil
+}
+
+func newFileScanCounter(limits fileScanLimits) (*budget.Counter, error) {
+	scopes := []struct {
+		scope     budget.Scope
+		dimension budget.Dimension
+		value     int64
+	}{
+		{budget.FilesScanMaxBytes, budget.Bytes, limits.bytes},
+		{budget.FilesScanMaxFiles, budget.Files, limits.files},
+		{budget.FilesScanMaxDirectories, budget.Directories, limits.directories},
+		{budget.FilesScanMaxLines, budget.Lines, limits.lines},
+	}
+	effectiveEntries := make([]budget.Limit, 0, len(scopes))
+	hardEntries := make([]budget.Limit, 0, len(scopes))
+	for _, item := range scopes {
+		spec, ok := fileBudgetSpec(item.scope)
+		if !ok || spec.Dimension != item.dimension {
+			return nil, errors.New("file scan budget specification is unavailable")
+		}
+		resolved, err := spec.Resolve(&item.value)
+		if err != nil {
+			return nil, errors.New("file scan budget is invalid")
+		}
+		effectiveEntries = append(effectiveEntries, budget.Limit{Dimension: item.dimension, Value: resolved})
+		hardEntries = append(hardEntries, budget.Limit{Dimension: item.dimension, Value: spec.HardCap})
+	}
+	effective, err := budget.NewLimits(effectiveEntries...)
+	if err != nil {
+		return nil, err
+	}
+	hard, err := budget.NewLimits(hardEntries...)
+	if err != nil {
+		return nil, err
+	}
+	return budget.NewCounter(effective, hard)
+}
+
+func fileBudgetSpec(scope budget.Scope) (budget.Spec, bool) {
+	for _, spec := range budget.AllSpecs() {
+		if spec.Scope == scope {
+			return spec, true
+		}
+	}
+	return budget.Spec{}, false
+}
+
+func mapFileScanLimit(err error, scope budget.Scope) error {
+	var limitErr *budget.LimitError
+	if !errors.As(err, &limitErr) {
+		return err
+	}
+	return &budget.LimitError{Scope: string(scope), Dimension: limitErr.Dimension, Limit: limitErr.Limit, Observed: limitErr.Observed}
+}
+
+func fileScanBudgetReason(dimension budget.Dimension) string {
+	switch dimension {
+	case budget.Bytes:
+		return string(budget.FilesScanMaxBytes)
+	case budget.Files:
+		return string(budget.FilesScanMaxFiles)
+	case budget.Directories:
+		return string(budget.FilesScanMaxDirectories)
+	case budget.Lines:
+		return string(budget.FilesScanMaxLines)
+	default:
+		return "files.scan_limit"
+	}
 }

@@ -9,15 +9,45 @@ import (
 	"sort"
 	"strings"
 
-	"golang.org/x/sys/unix"
+	"xagent/internal/budget"
+	"xagent/internal/safefs"
+)
+
+const (
+	maxGlobResults    = 200
+	maxGlobScanErrors = 32
+)
+
+var (
+	errGlobResultLimit = errors.New("glob result limit reached")
+	errGlobOutputLimit = errors.New("glob output limit reached")
 )
 
 type GlobTool struct {
 	projectRoot string
+	limits      globLimits
+}
+
+type globLimits struct {
+	bytes       int64
+	files       int64
+	directories int64
+	results     int64
+	outputBytes int64
+}
+
+type globState struct {
+	counter       *budget.Counter
+	outputCounter *budget.Counter
+	results       []string
+	seen          map[string]struct{}
+	scanErrors    []string
+	truncated     bool
+	reason        string
 }
 
 func NewGlobTool(projectRoot string) Tool {
-	return &GlobTool{projectRoot: projectRoot}
+	return &GlobTool{projectRoot: projectRoot, limits: defaultGlobLimits()}
 }
 
 func (t *GlobTool) Name() string { return "Glob" }
@@ -35,104 +65,157 @@ func (t *GlobTool) Schema() Schema {
 }
 
 func (t *GlobTool) Execute(ctx context.Context, input Input) Result {
+	if ctx == nil || ctx.Err() != nil {
+		return globFailure(input, ErrTimeout, "文件匹配已取消")
+	}
 	pattern, ok := stringArg(input.Arguments, "pattern")
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "pattern 参数不能为空", true)
 	}
 	scope, err := effectiveReadScope(ctx, t.projectRoot)
 	if err != nil {
-		return Failure(input, errorCode(err), fmt.Sprintf("读取范围无效: %v", err), true)
+		return globFailure(input, errorCode(err), "文件匹配范围无效")
 	}
-	files, err := globReadScope(ctx, scope, pattern)
+	patterns, err := scopedGlobPatterns(scope, pattern)
 	if err != nil {
 		code := errorCode(err)
 		if errors.Is(err, filepath.ErrBadPattern) {
 			code = ErrInvalidArguments
 		}
-		return Failure(input, code, fmt.Sprintf("glob pattern 无效: %v", err), true)
+		return globFailure(input, code, "glob pattern 无效")
 	}
-	return Success(input, fmt.Sprintf("Found %d files", len(files)), joinLines(files), map[string]any{
-		"pattern": pattern,
-		"count":   len(files),
-		"files":   files,
+
+	limits := t.limits
+	execution := readExecutionFromContext(ctx)
+	if execution.scanBytes != 0 || execution.scanFiles != 0 || execution.scanDirectories != 0 || execution.scanLines != 0 || execution.outputBytes != 0 {
+		limits = globLimits{
+			bytes:       execution.scanBytes,
+			files:       execution.scanFiles,
+			directories: execution.scanDirectories,
+			results:     execution.scanLines,
+			outputBytes: execution.outputBytes,
+		}
+	}
+	counter, err := newFileScanCounter(fileScanLimits{
+		bytes:       limits.bytes,
+		files:       limits.files,
+		directories: limits.directories,
+		lines:       limits.results,
 	})
+	if err != nil {
+		return globFailure(input, ErrNotFound, "文件匹配预算无效")
+	}
+	outputCounter, err := newReadCounter(budget.ToolInlineOutputBytes, budget.Bytes, limits.outputBytes)
+	if err != nil {
+		return globFailure(input, ErrNotFound, "文件匹配输出预算无效")
+	}
+	state := &globState{
+		counter:       counter,
+		outputCounter: outputCounter,
+		results:       make([]string, 0, 16),
+		seen:          make(map[string]struct{}),
+	}
+
+	for _, candidate := range patterns {
+		if err := ctx.Err(); err != nil {
+			return state.result(input, pattern, StatusError, &Error{Code: ErrTimeout, Message: "文件匹配已取消", Recoverable: true})
+		}
+		root, closeRoot, err := openGlobRoot(ctx, candidate.root)
+		if err != nil {
+			if ctx.Err() != nil {
+				return state.result(input, pattern, StatusError, &Error{Code: ErrTimeout, Message: "文件匹配已取消", Recoverable: true})
+			}
+			state.addScanError(candidate.label, "root_open_failed")
+			continue
+		}
+		walkBase := globWalkBase(candidate.relative)
+		baseInfo, statErr := os.Lstat(filepath.Join(candidate.root, filepath.FromSlash(walkBase)))
+		if os.IsNotExist(statErr) {
+			closeRoot()
+			continue
+		}
+		if statErr != nil || !baseInfo.IsDir() {
+			closeRoot()
+			state.addScanError(candidate.label, "walk_root_failed")
+			continue
+		}
+		scanErr := root.Walk(ctx, walkBase, counter, func(entry safefs.Entry) error {
+			return state.visit(scope, candidate, entry)
+		})
+		closeRoot()
+		if scanErr == nil {
+			continue
+		}
+		switch {
+		case errors.Is(scanErr, context.Canceled), errors.Is(scanErr, context.DeadlineExceeded), ctx.Err() != nil:
+			return state.result(input, pattern, StatusError, &Error{Code: ErrTimeout, Message: "文件匹配已取消", Recoverable: true})
+		case errors.Is(scanErr, errGlobResultLimit), errors.Is(scanErr, errGlobOutputLimit):
+			return state.result(input, pattern, StatusSuccess, nil)
+		default:
+			var limitErr *budget.LimitError
+			if errors.As(scanErr, &limitErr) {
+				state.truncated = true
+				state.reason = fileScanBudgetReason(limitErr.Dimension)
+				return state.result(input, pattern, StatusSuccess, nil)
+			}
+			state.addScanError(candidate.label, "walk_failed")
+		}
+	}
+	return state.result(input, pattern, StatusSuccess, nil)
 }
 
 type scopedGlobPattern struct {
 	root     string
 	relative string
-}
-
-func globReadScope(ctx context.Context, scope ReadScope, pattern string) ([]string, error) {
-	patterns, err := scopedGlobPatterns(scope, pattern)
-	if err != nil {
-		return nil, err
-	}
-	seen := make(map[string]struct{})
-	files := make([]string, 0)
-	for _, candidate := range patterns {
-		matches, err := safeGlob(ctx, candidate.root, candidate.relative, 200)
-		if err != nil {
-			return nil, err
-		}
-		for _, match := range matches {
-			target, err := resolveReadPath(scope, match)
-			if err != nil {
-				continue
-			}
-			if _, exists := seen[target.absolute]; exists {
-				continue
-			}
-			file, err := openFileNoFollow(target.root, target.absolute, unix.O_RDONLY|unix.O_NONBLOCK, 0)
-			if err != nil {
-				continue
-			}
-			info, statErr := file.Stat()
-			_ = file.Close()
-			if statErr != nil || info.IsDir() || !info.Mode().IsRegular() {
-				continue
-			}
-			seen[target.absolute] = struct{}{}
-			files = append(files, target.display)
-		}
-	}
-	sort.Strings(files)
-	if len(files) > 200 {
-		files = files[:200]
-	}
-	return files, nil
+	project  bool
+	label    string
 }
 
 func scopedGlobPatterns(scope ReadScope, pattern string) ([]scopedGlobPattern, error) {
 	cleaned := filepath.Clean(pattern)
-	patterns := make([]scopedGlobPattern, 0, len(scope.ExtraRoots)+1)
+	if _, err := filepath.Match(cleaned, cleaned); err != nil {
+		return nil, err
+	}
 	if filepath.IsAbs(cleaned) {
 		canonical, err := canonicalGlobPattern(cleaned)
 		if err != nil {
 			return nil, err
 		}
-		cleaned = canonical
-		for _, root := range readRoots(scope) {
-			if !isPathInsideRoot(root.path, cleaned) {
-				continue
-			}
-			relative, err := filepath.Rel(root.path, cleaned)
-			if err != nil {
-				return nil, err
-			}
-			patterns = append(patterns, scopedGlobPattern{root: root.path, relative: relative})
-		}
-		if len(patterns) == 0 {
+		root, project, ok := readRootForPath(scope, canonical)
+		if !ok {
 			return nil, fmt.Errorf("%s: glob pattern 位于允许的只读根外", ErrPathOutsideProject)
 		}
-		return patterns, nil
+		relative, err := filepath.Rel(root, canonical)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return nil, errors.New(ErrPathOutsideProject)
+		}
+		return []scopedGlobPattern{{
+			root:     root,
+			relative: filepath.ToSlash(relative),
+			project:  project,
+			label:    displayReadPath(scope, root, root, project),
+		}}, nil
 	}
-	for _, root := range readRoots(scope) {
-		joined := filepath.Join(root.path, cleaned)
-		if !isPathInsideRoot(root.path, joined) {
+
+	patterns := make([]scopedGlobPattern, 0, len(scope.ExtraRoots)+1)
+	for _, candidateRoot := range readRoots(scope) {
+		canonical, err := canonicalGlobPattern(filepath.Join(candidateRoot.path, cleaned))
+		if err != nil {
+			return nil, err
+		}
+		if !isPathInsideRoot(candidateRoot.path, canonical) {
 			return nil, fmt.Errorf("%s: glob pattern 位于允许的只读根外", ErrPathOutsideProject)
 		}
-		patterns = append(patterns, scopedGlobPattern{root: root.path, relative: cleaned})
+		relative, err := filepath.Rel(candidateRoot.path, canonical)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return nil, errors.New(ErrPathOutsideProject)
+		}
+		patterns = append(patterns, scopedGlobPattern{
+			root:     candidateRoot.path,
+			relative: filepath.ToSlash(relative),
+			project:  candidateRoot.project,
+			label:    displayReadPath(scope, candidateRoot.path, candidateRoot.path, candidateRoot.project),
+		})
 	}
 	return patterns, nil
 }
@@ -155,141 +238,163 @@ func canonicalGlobPattern(pattern string) (string, error) {
 	return filepath.Join(resolvedDir, remainder), nil
 }
 
-func safeGlob(ctx context.Context, root string, relativePattern string, limit int) ([]string, error) {
-	if _, err := filepath.Match(relativePattern, relativePattern); err != nil {
-		return nil, err
+func globWalkBase(relativePattern string) string {
+	native := filepath.FromSlash(relativePattern)
+	meta := strings.IndexAny(native, "*?[")
+	if meta < 0 {
+		base := filepath.Dir(native)
+		if base == "" {
+			return "."
+		}
+		return filepath.ToSlash(base)
 	}
-	parts := splitPathParts(relativePattern)
-	if len(parts) == 0 {
-		return nil, nil
+	separator := strings.LastIndex(native[:meta], string(filepath.Separator))
+	if separator < 0 {
+		return "."
 	}
-	matches := make([]string, 0)
-	if err := walkGlobParts(ctx, root, root, parts, 0, limit, &matches); err != nil {
-		return nil, err
+	base := native[:separator]
+	if base == "" {
+		return "."
 	}
-	return matches, nil
+	return filepath.ToSlash(base)
 }
 
-func walkGlobParts(ctx context.Context, root string, current string, parts []string, index int, limit int, matches *[]string) error {
-	if err := ctx.Err(); err != nil {
+func openGlobRoot(ctx context.Context, rootPath string) (*safefs.Root, func(), error) {
+	if ctx == nil || ctx.Err() != nil {
+		return nil, func() {}, context.Canceled
+	}
+	execution := readExecutionFromContext(ctx)
+	if execution.root != nil && execution.rootPath == rootPath {
+		return execution.root, func() {}, nil
+	}
+	opened, err := safefs.Bootstrap(rootPath, safefs.Policy{})
+	if err != nil {
+		return nil, func() {}, errors.New("glob root is unavailable")
+	}
+	return opened.Root, func() { _ = opened.Root.Close() }, nil
+}
+
+func (s *globState) visit(scope ReadScope, pattern scopedGlobPattern, entry safefs.Entry) error {
+	// Entry.Path is user-controlled traversal metadata. Reserve its bytes
+	// before matching or copying it into any result state.
+	if err := consumeGlobBytes(s.counter, int64(len(entry.Path))); err != nil {
 		return err
 	}
-	if limit > 0 && len(*matches) >= limit {
+	if entry.IsDir() || !entry.Mode.IsRegular() {
 		return nil
 	}
-	part := parts[index]
-	last := index == len(parts)-1
-	if !strings.ContainsAny(part, "*?[\\") {
-		next := filepath.Join(current, part)
-		info, err := os.Lstat(next)
-		if os.IsNotExist(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if last {
-			*matches = append(*matches, next)
-			return nil
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			resolved, directory, err := resolveGlobDirectory(root, next)
-			if err != nil {
-				return err
-			}
-			if !directory {
-				return nil
-			}
-			return walkGlobParts(ctx, root, resolved, parts, index+1, limit, matches)
-		}
-		if !info.IsDir() {
-			return nil
-		}
-		return walkGlobParts(ctx, root, next, parts, index+1, limit, matches)
-	}
-
-	entries, err := readDirNoFollow(root, current)
+	matched, err := filepath.Match(filepath.FromSlash(pattern.relative), filepath.FromSlash(entry.Path))
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		matched, err := filepath.Match(part, entry.Name())
-		if err != nil {
-			return err
-		}
-		if !matched {
-			continue
-		}
-		next := filepath.Join(current, entry.Name())
-		if last {
-			*matches = append(*matches, next)
-		} else {
-			directory := next
-			isDirectory := false
-			if entry.Type()&os.ModeSymlink != 0 {
-				resolved, ok, resolveErr := resolveGlobDirectory(root, next)
-				if resolveErr == nil && ok {
-					directory = resolved
-					isDirectory = true
-				}
-			} else {
-				info, infoErr := entry.Info()
-				isDirectory = infoErr == nil && info.IsDir()
-			}
-			if isDirectory {
-				if err := walkGlobParts(ctx, root, directory, parts, index+1, limit, matches); err != nil {
-					return err
-				}
-			}
-		}
-		if limit > 0 && len(*matches) >= limit {
-			return nil
-		}
+	if !matched {
+		return nil
 	}
+	absolute := filepath.Join(pattern.root, filepath.FromSlash(entry.Path))
+	if _, exists := s.seen[absolute]; exists {
+		return nil
+	}
+	if len(s.results) >= maxGlobResults {
+		s.truncated = true
+		s.reason = "glob.max_results"
+		return errGlobResultLimit
+	}
+	if err := s.counter.Consume(budget.Lines, 1); err != nil {
+		return mapFileScanLimit(err, budget.FilesScanMaxLines)
+	}
+	display := displayReadPath(scope, pattern.root, absolute, pattern.project)
+	separator := int64(0)
+	if len(s.results) > 0 {
+		separator = 1
+	}
+	needed := int64(len(display)) + separator
+	if needed > s.outputCounter.Remaining(budget.Bytes) {
+		s.truncated = true
+		s.reason = string(budget.ToolInlineOutputBytes)
+		return errGlobOutputLimit
+	}
+	if err := s.outputCounter.Consume(budget.Bytes, needed); err != nil {
+		return err
+	}
+	s.seen[absolute] = struct{}{}
+	s.results = append(s.results, display)
 	return nil
 }
 
-func resolveGlobDirectory(root string, path string) (string, bool, error) {
-	resolved, err := resolveWithExistingAncestor(path)
-	if err != nil {
-		return "", false, err
+func consumeGlobBytes(counter *budget.Counter, amount int64) error {
+	if amount <= 0 {
+		return nil
 	}
-	if !isPathInsideRoot(root, resolved) {
-		return "", false, fmt.Errorf("%s: glob pattern 经符号链接越出只读根", ErrPathOutsideProject)
+	if err := counter.Consume(budget.Bytes, amount); err == nil {
+		return nil
 	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", false, err
+	used := counter.Snapshot().Used(budget.Bytes)
+	remaining := counter.Remaining(budget.Bytes)
+	if remaining > 0 {
+		if err := counter.Consume(budget.Bytes, remaining); err != nil {
+			return errors.New("glob byte budget failed")
+		}
 	}
-	if !info.IsDir() {
-		return resolved, false, nil
+	return &budget.LimitError{
+		Scope:     string(budget.FilesScanMaxBytes),
+		Dimension: budget.Bytes,
+		Limit:     used + remaining,
+		Observed:  used + amount,
 	}
-	return resolved, true, nil
 }
 
-func readDirNoFollow(root string, absoluteDir string) ([]os.DirEntry, error) {
-	var file *os.File
-	var err error
-	if filepath.Clean(root) == filepath.Clean(absoluteDir) {
-		fd, openErr := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if openErr != nil {
-			return nil, openErr
-		}
-		file = os.NewFile(uintptr(fd), root)
-	} else {
-		file, err = openFileNoFollow(root, absoluteDir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
-		if err != nil {
-			return nil, err
-		}
+func (s *globState) addScanError(display, code string) {
+	s.truncated = true
+	if s.reason == "" {
+		s.reason = "files.scan_errors"
 	}
-	defer file.Close()
-	entries, err := file.ReadDir(-1)
-	if err != nil {
-		return nil, err
+	if len(s.scanErrors) >= maxGlobScanErrors {
+		return
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	return entries, nil
+	s.scanErrors = append(s.scanErrors, display+":"+code)
+}
+
+func (s *globState) result(input Input, pattern string, status ResultStatus, resultErr *Error) Result {
+	sort.Strings(s.results)
+	snapshot := s.counter.Snapshot()
+	files := append([]string(nil), s.results...)
+	data := map[string]any{
+		"pattern":       pattern,
+		"count":         len(files),
+		"files":         files,
+		"scanned_files": snapshot.Used(budget.Files),
+		"directories":   snapshot.Used(budget.Directories),
+		"bytes":         snapshot.Used(budget.Bytes),
+		"results":       snapshot.Used(budget.Lines),
+	}
+	if len(s.scanErrors) > 0 {
+		data["scan_errors"] = append([]string(nil), s.scanErrors...)
+	}
+	if s.reason != "" {
+		data["truncation_reason"] = s.reason
+	}
+	return Result{
+		CallID:    input.CallID,
+		Name:      input.Name,
+		Status:    status,
+		Summary:   fmt.Sprintf("Found %d files", len(files)),
+		Content:   joinLines(files),
+		Data:      data,
+		Error:     resultErr,
+		Truncated: s.truncated,
+	}
+}
+
+func defaultGlobLimits() globLimits {
+	return globLimits{
+		bytes:       defaultBudgetValue(budget.FilesScanMaxBytes),
+		files:       defaultBudgetValue(budget.FilesScanMaxFiles),
+		directories: defaultBudgetValue(budget.FilesScanMaxDirectories),
+		results:     defaultBudgetValue(budget.FilesScanMaxLines),
+		outputBytes: defaultBudgetValue(budget.ToolInlineOutputBytes),
+	}
+}
+
+func globFailure(input Input, code, message string) Result {
+	return Failure(input, code, message, true)
 }

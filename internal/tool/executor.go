@@ -264,7 +264,7 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 			lines:       e.ReadMaxLines,
 			outputBytes: int64(e.MaxOutputBytes),
 		})
-	} else if call.Name == "Grep" {
+	} else if call.Name == "Grep" || call.Name == "Glob" {
 		execCtx = withReadExecution(execCtx, readExecution{
 			root:            validated.executionRoot,
 			rootPath:        validated.executionRootPath,

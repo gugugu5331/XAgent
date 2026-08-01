@@ -124,7 +124,12 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 			outputBytes: execution.outputBytes,
 		}
 	}
-	counter, err := newGrepCounter(limits)
+	counter, err := newFileScanCounter(fileScanLimits{
+		bytes:       limits.bytes,
+		files:       limits.files,
+		directories: limits.directories,
+		lines:       limits.lines,
+	})
 	if err != nil {
 		return grepFailure(input, ErrNotFound, "搜索预算无效")
 	}
@@ -175,7 +180,7 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 			var limitErr *budget.LimitError
 			if errors.As(scanErr, &limitErr) {
 				state.truncated = true
-				state.reason = grepBudgetReason(limitErr.Dimension)
+				state.reason = fileScanBudgetReason(limitErr.Dimension)
 			} else {
 				state.addScanError(target.display, "walk_failed")
 			}
@@ -250,7 +255,7 @@ func scanGrepReader(ctx context.Context, input io.Reader, display string, state 
 		if len(accepted) > 0 {
 			if !lineStarted {
 				if err := state.counter.Consume(budget.Lines, 1); err != nil {
-					return mapGrepLimit(err, budget.FilesScanMaxLines)
+					return mapFileScanLimit(err, budget.FilesScanMaxLines)
 				}
 				lineNumber++
 				lineStarted = true
@@ -421,42 +426,6 @@ func (s *grepState) result(input Input, pattern string, status ResultStatus, res
 	}
 }
 
-func newGrepCounter(limits grepLimits) (*budget.Counter, error) {
-	scopes := []struct {
-		scope     budget.Scope
-		dimension budget.Dimension
-		value     int64
-	}{
-		{budget.FilesScanMaxBytes, budget.Bytes, limits.bytes},
-		{budget.FilesScanMaxFiles, budget.Files, limits.files},
-		{budget.FilesScanMaxDirectories, budget.Directories, limits.directories},
-		{budget.FilesScanMaxLines, budget.Lines, limits.lines},
-	}
-	effectiveEntries := make([]budget.Limit, 0, len(scopes))
-	hardEntries := make([]budget.Limit, 0, len(scopes))
-	for _, item := range scopes {
-		spec, ok := budgetSpec(item.scope)
-		if !ok || spec.Dimension != item.dimension {
-			return nil, errors.New("grep budget specification is unavailable")
-		}
-		resolved, err := spec.Resolve(&item.value)
-		if err != nil {
-			return nil, errors.New("grep budget is invalid")
-		}
-		effectiveEntries = append(effectiveEntries, budget.Limit{Dimension: item.dimension, Value: resolved})
-		hardEntries = append(hardEntries, budget.Limit{Dimension: item.dimension, Value: spec.HardCap})
-	}
-	effective, err := budget.NewLimits(effectiveEntries...)
-	if err != nil {
-		return nil, err
-	}
-	hard, err := budget.NewLimits(hardEntries...)
-	if err != nil {
-		return nil, err
-	}
-	return budget.NewCounter(effective, hard)
-}
-
 func defaultGrepLimits() grepLimits {
 	return grepLimits{
 		bytes:       defaultBudgetValue(budget.FilesScanMaxBytes),
@@ -464,38 +433,6 @@ func defaultGrepLimits() grepLimits {
 		directories: defaultBudgetValue(budget.FilesScanMaxDirectories),
 		lines:       defaultBudgetValue(budget.FilesScanMaxLines),
 		outputBytes: defaultBudgetValue(budget.ToolInlineOutputBytes),
-	}
-}
-
-func budgetSpec(scope budget.Scope) (budget.Spec, bool) {
-	for _, spec := range budget.AllSpecs() {
-		if spec.Scope == scope {
-			return spec, true
-		}
-	}
-	return budget.Spec{}, false
-}
-
-func mapGrepLimit(err error, scope budget.Scope) error {
-	var limitErr *budget.LimitError
-	if !errors.As(err, &limitErr) {
-		return err
-	}
-	return &budget.LimitError{Scope: string(scope), Dimension: limitErr.Dimension, Limit: limitErr.Limit, Observed: limitErr.Observed}
-}
-
-func grepBudgetReason(dimension budget.Dimension) string {
-	switch dimension {
-	case budget.Bytes:
-		return string(budget.FilesScanMaxBytes)
-	case budget.Files:
-		return string(budget.FilesScanMaxFiles)
-	case budget.Directories:
-		return string(budget.FilesScanMaxDirectories)
-	case budget.Lines:
-		return string(budget.FilesScanMaxLines)
-	default:
-		return "files.scan_limit"
 	}
 }
 
