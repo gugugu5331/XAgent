@@ -4,6 +4,7 @@ package safefs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"strings"
 	"unsafe"
@@ -140,6 +141,44 @@ func (r *windowsRoot) openRead(relative string) (platformOpenedFile, error) {
 	return platformOpenedFile{file: file, identity: identity}, nil
 }
 
+func (r *windowsRoot) openDirectory(relative string) (*os.File, error) {
+	if r == nil || r.handle == 0 || r.handle == windows.InvalidHandle {
+		return nil, errors.New("safefs platform root is closed")
+	}
+	current := r.handle
+	owned := false
+	if relative == "." {
+		process := windows.CurrentProcess()
+		var duplicate windows.Handle
+		if err := windows.DuplicateHandle(process, current, process, &duplicate, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return nil, errors.New("safefs platform directory open failed")
+		}
+		current = duplicate
+		owned = true
+	} else {
+		for _, component := range strings.Split(relative, "/") {
+			next, err := windowsOpenRelative(current, component, true)
+			if err != nil {
+				if owned {
+					_ = windows.CloseHandle(current)
+				}
+				return nil, errors.New("safefs platform directory open failed")
+			}
+			if owned {
+				_ = windows.CloseHandle(current)
+			}
+			current = next
+			owned = true
+		}
+	}
+	file := os.NewFile(uintptr(current), "")
+	if file == nil {
+		_ = windows.CloseHandle(current)
+		return nil, errors.New("safefs platform directory conversion failed")
+	}
+	return file, nil
+}
+
 func (r *windowsRoot) leafRelation(first, second string) leafRelation {
 	if strings.EqualFold(first, second) {
 		return leafEquivalent
@@ -219,4 +258,25 @@ func windowsTargetMissing(err error) bool {
 		err == windows.STATUS_OBJECT_PATH_NOT_FOUND ||
 		errors.Is(err, windows.ERROR_FILE_NOT_FOUND) ||
 		errors.Is(err, windows.ERROR_PATH_NOT_FOUND)
+}
+
+func platformDirectoryEntryInfo(directory *os.File, name string) (directoryEntryInfo, error) {
+	if directory == nil || name == "" {
+		return directoryEntryInfo{}, errors.New("safefs platform directory entry is invalid")
+	}
+	handle, err := windowsOpenRelative(windows.Handle(directory.Fd()), name, false)
+	if err != nil {
+		return directoryEntryInfo{}, err
+	}
+	defer windows.CloseHandle(handle)
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		return directoryEntryInfo{}, err
+	}
+	mode := fs.FileMode(0)
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		mode |= fs.ModeDir
+	}
+	size := int64(uint64(information.FileSizeHigh)<<32 | uint64(information.FileSizeLow))
+	return directoryEntryInfo{mode: mode, size: size}, nil
 }

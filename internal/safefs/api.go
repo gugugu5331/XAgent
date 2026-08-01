@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sync"
 	"unicode/utf8"
@@ -138,8 +140,22 @@ type rootBackend interface {
 	identity() objectIdentity
 	bind(relative string) (bindingResolution, error)
 	openRead(relative string) (platformOpenedFile, error)
+	openDirectory(relative string) (*os.File, error)
 	leafRelation(first, second string) leafRelation
 	close() error
+}
+
+// Entry is a root-relative directory entry observed through a no-follow
+// directory handle. It never contains an absolute filesystem path.
+type Entry struct {
+	Path string
+	Name string
+	Mode fs.FileMode
+	Size int64
+}
+
+func (e Entry) IsDir() bool {
+	return e.Mode.IsDir()
 }
 
 // OpenResult is the only Bootstrap result. The Capabilities container is

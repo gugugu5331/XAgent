@@ -2,10 +2,14 @@ package safefs
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"xagent/internal/budget"
 )
 
 func TestBootstrapSeparatesCapabilities(t *testing.T) {
@@ -282,6 +286,131 @@ func TestCapabilityCannotWriteProtectedSlot(t *testing.T) {
 	if _, err := (Identity{}).MarshalBinary(); err == nil {
 		t.Fatal("zero identity produced canonical bytes")
 	}
+}
+
+func TestWalkCancellation(t *testing.T) {
+	rootPath := t.TempDir()
+	for _, name := range []string{"first.txt", "second.txt"} {
+		if err := os.WriteFile(filepath.Join(rootPath, name), []byte(name), 0o600); err != nil {
+			t.Fatal("create walk cancellation fixture failed")
+		}
+	}
+	opened := mustBootstrap(t, rootPath, Policy{})
+	defer mustClose(t, opened.Root)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	visits := 0
+	if err := opened.Root.Walk(canceled, ".", newWalkCounter(t, 10, 10), func(Entry) error {
+		visits++
+		return nil
+	}); !errors.Is(err, context.Canceled) || visits != 0 {
+		t.Fatal("walk did not stop before opening after cancellation")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	visits = 0
+	err := opened.Root.Walk(ctx, ".", newWalkCounter(t, 10, 10), func(Entry) error {
+		visits++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || visits != 1 {
+		t.Fatalf("walk did not observe cancellation between entries: err=%v visits=%d", err, visits)
+	}
+}
+
+func TestWalkBudgetAndErrors(t *testing.T) {
+	t.Run("directory budget before descent", func(t *testing.T) {
+		rootPath := t.TempDir()
+		if err := os.Mkdir(filepath.Join(rootPath, "child"), 0o700); err != nil {
+			t.Fatal("create walk directory fixture failed")
+		}
+		opened := mustBootstrap(t, rootPath, Policy{})
+		defer mustClose(t, opened.Root)
+		visits := 0
+		err := opened.Root.Walk(context.Background(), ".", newWalkCounter(t, 10, 1), func(Entry) error {
+			visits++
+			return nil
+		})
+		var limitErr *budget.LimitError
+		if !errors.As(err, &limitErr) || limitErr.Dimension != budget.Directories || visits != 0 {
+			t.Fatalf("walk opened or visited a directory beyond its budget: err=%v visits=%d", err, visits)
+		}
+	})
+
+	t.Run("file budget before visitor", func(t *testing.T) {
+		rootPath := t.TempDir()
+		for _, name := range []string{"first.txt", "second.txt"} {
+			if err := os.WriteFile(filepath.Join(rootPath, name), []byte(name), 0o600); err != nil {
+				t.Fatal("create walk file fixture failed")
+			}
+		}
+		opened := mustBootstrap(t, rootPath, Policy{})
+		defer mustClose(t, opened.Root)
+		visits := 0
+		err := opened.Root.Walk(context.Background(), ".", newWalkCounter(t, 1, 10), func(Entry) error {
+			visits++
+			return nil
+		})
+		var limitErr *budget.LimitError
+		if !errors.As(err, &limitErr) || limitErr.Dimension != budget.Files || visits != 1 {
+			t.Fatalf("walk invoked the visitor beyond its file budget: err=%v visits=%d", err, visits)
+		}
+	})
+
+	t.Run("visitor error", func(t *testing.T) {
+		rootPath := t.TempDir()
+		if err := os.WriteFile(filepath.Join(rootPath, "file.txt"), []byte("fixture"), 0o600); err != nil {
+			t.Fatal("create walk visitor fixture failed")
+		}
+		opened := mustBootstrap(t, rootPath, Policy{})
+		defer mustClose(t, opened.Root)
+		visitorErr := errors.New("visitor stopped")
+		err := opened.Root.Walk(context.Background(), ".", newWalkCounter(t, 10, 10), func(Entry) error {
+			return visitorErr
+		})
+		if !errors.Is(err, visitorErr) {
+			t.Fatalf("walk suppressed a visitor error: %v", err)
+		}
+	})
+
+	t.Run("directory changed after observation", func(t *testing.T) {
+		rootPath := t.TempDir()
+		childPath := filepath.Join(rootPath, "child")
+		if err := os.Mkdir(childPath, 0o700); err != nil {
+			t.Fatal("create changing directory fixture failed")
+		}
+		opened := mustBootstrap(t, rootPath, Policy{})
+		defer mustClose(t, opened.Root)
+		visits := 0
+		err := opened.Root.Walk(context.Background(), ".", newWalkCounter(t, 10, 10), func(entry Entry) error {
+			visits++
+			if entry.IsDir() {
+				return os.Remove(childPath)
+			}
+			return nil
+		})
+		if err == nil || visits != 1 {
+			t.Fatalf("walk silently skipped a directory that changed after observation: err=%v visits=%d", err, visits)
+		}
+	})
+}
+
+func newWalkCounter(t *testing.T, files, directories int64) *budget.Counter {
+	t.Helper()
+	limits, err := budget.NewLimits(
+		budget.Limit{Dimension: budget.Files, Value: files},
+		budget.Limit{Dimension: budget.Directories, Value: directories},
+	)
+	if err != nil {
+		t.Fatal("create walk limits failed")
+	}
+	counter, err := budget.NewCounter(limits, limits)
+	if err != nil {
+		t.Fatal("create walk counter failed")
+	}
+	return counter
 }
 
 func mustBootstrap(t *testing.T, rootPath string, policy Policy) OpenResult {

@@ -4,6 +4,7 @@ package safefs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -96,6 +97,38 @@ func (r *posixRoot) openRead(relative string) (platformOpenedFile, error) {
 	}, nil
 }
 
+func (r *posixRoot) openDirectory(relative string) (*os.File, error) {
+	if r == nil || r.fd < 0 {
+		return nil, errors.New("safefs platform root is closed")
+	}
+	current := r.fd
+	owned := false
+	components := []string{"."}
+	if relative != "." {
+		components = strings.Split(relative, "/")
+	}
+	for _, component := range components {
+		next, err := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+		if err != nil {
+			if owned {
+				_ = unix.Close(current)
+			}
+			return nil, errors.New("safefs platform directory open failed")
+		}
+		if owned {
+			_ = unix.Close(current)
+		}
+		current = next
+		owned = true
+	}
+	file := os.NewFile(uintptr(current), "")
+	if file == nil {
+		_ = unix.Close(current)
+		return nil, errors.New("safefs platform directory conversion failed")
+	}
+	return file, nil
+}
+
 func (r *posixRoot) openParent(relative string) (int, bool, objectIdentity, string, error) {
 	if r == nil || r.fd < 0 {
 		return -1, false, objectIdentity{}, "", errors.New("safefs platform root is closed")
@@ -147,4 +180,43 @@ func posixHandleIdentity(fd int) (objectIdentity, error) {
 		return objectIdentity{}, err
 	}
 	return objectIdentityFromNumbers(uint64(stat.Dev), uint64(stat.Ino)), nil
+}
+
+func platformDirectoryEntryInfo(directory *os.File, name string) (directoryEntryInfo, error) {
+	if directory == nil || name == "" {
+		return directoryEntryInfo{}, errors.New("safefs platform directory entry is invalid")
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return directoryEntryInfo{}, err
+	}
+	return directoryEntryInfo{mode: posixFileMode(uint32(stat.Mode)), size: stat.Size}, nil
+}
+
+func posixFileMode(mode uint32) fs.FileMode {
+	result := fs.FileMode(mode & 0o777)
+	switch mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		result |= fs.ModeDir
+	case unix.S_IFLNK:
+		result |= fs.ModeSymlink
+	case unix.S_IFIFO:
+		result |= fs.ModeNamedPipe
+	case unix.S_IFSOCK:
+		result |= fs.ModeSocket
+	case unix.S_IFBLK:
+		result |= fs.ModeDevice
+	case unix.S_IFCHR:
+		result |= fs.ModeDevice | fs.ModeCharDevice
+	}
+	if mode&unix.S_ISUID != 0 {
+		result |= fs.ModeSetuid
+	}
+	if mode&unix.S_ISGID != 0 {
+		result |= fs.ModeSetgid
+	}
+	if mode&unix.S_ISVTX != 0 {
+		result |= fs.ModeSticky
+	}
+	return result
 }
