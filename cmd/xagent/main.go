@@ -26,6 +26,7 @@ import (
 	"xagent/internal/provider"
 	"xagent/internal/redact"
 	"xagent/internal/resources"
+	"xagent/internal/safefs"
 	"xagent/internal/sessionctx"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
@@ -190,6 +191,19 @@ func runWithFactories(args []string, factories startupFactories) (runErr error) 
 	if err != nil {
 		return fmt.Errorf("工具注册错误: %w", err)
 	}
+	permissionDir := filepath.Join(projectRoot, ".xagent")
+	if err := os.Mkdir(permissionDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("工具文件系统错误: %w", err)
+	}
+	openedProject, err := safefs.Bootstrap(projectRoot, tool.ProjectFilesystemPolicy())
+	if err != nil {
+		return fmt.Errorf("工具文件系统错误: %w", err)
+	}
+	defer func() {
+		if closeErr := openedProject.Root.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, closeErr)
+		}
+	}()
 	mcpManager := factories.newMCP(cfg.MCP, mcpclient.ManagerOptions{})
 	if mcpManager == nil {
 		return fmt.Errorf("MCP 错误: 构造结果为空")
@@ -211,7 +225,14 @@ func runWithFactories(args []string, factories startupFactories) (runErr error) 
 	if err != nil {
 		return fmt.Errorf("Skill 配置错误: %w", err)
 	}
-	executor := tool.NewExecutor(registry, projectRoot, time.Duration(cfg.Tool.TimeoutMS)*time.Millisecond, cfg.Tool.MaxOutputBytes)
+	executor := tool.NewExecutorWithWriteAccess(
+		registry,
+		projectRoot,
+		time.Duration(cfg.Tool.TimeoutMS)*time.Millisecond,
+		cfg.Tool.MaxOutputBytes,
+		openedProject.Root,
+		openedProject.Capabilities.Ordinary(),
+	)
 	contextManager := contextmgr.New(llm, cfg.Storage.DataDir, cfg.Context)
 	instructionLoader := &instructions.CachedLoader{Loader: instructions.Loader{ProjectRoot: projectRoot, Config: cfg.Instructions}}
 	memoryManager := newMemoryManager(projectRoot, cfg.Memory, llm)

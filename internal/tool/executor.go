@@ -33,9 +33,10 @@ type Executor struct {
 	ScanMaxLines   int64
 	TicketVerifier permission.TicketVerifier
 
-	rootOnce sync.Once
-	root     *safefs.Root
-	rootErr  error
+	rootOnce                sync.Once
+	root                    *safefs.Root
+	rootErr                 error
+	ordinaryWriteCapability safefs.Capability
 
 	extraRootsMu sync.Mutex
 	extraRoots   map[string]*safefs.Root
@@ -60,6 +61,26 @@ func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 		ScanMaxDirs:    defaultBudgetValue(budget.FilesScanMaxDirectories),
 		ScanMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
 	}
+}
+
+// NewExecutorWithWriteAccess constructs an Executor whose Write and Edit
+// tools receive only the ordinary capability retained by the assembly root.
+// Root and capability remain independently validated by safefs on every
+// atomic publication.
+func NewExecutorWithWriteAccess(
+	registry *Registry,
+	projectRoot string,
+	timeout time.Duration,
+	maxOutputBytes int,
+	root *safefs.Root,
+	capability safefs.Capability,
+) *Executor {
+	executor := NewExecutor(registry, projectRoot, timeout, maxOutputBytes)
+	executor.rootOnce.Do(func() {
+		executor.root = root
+	})
+	executor.ordinaryWriteCapability = capability
+	return executor
 }
 
 func (e *Executor) NeedsConfirmation(call Call) bool {
@@ -249,6 +270,14 @@ func (e *Executor) Execute(ctx context.Context, call Call) Result {
 	if err != nil {
 		return e.validationFailure(call, err)
 	}
+	if call.Name == "Write" || call.Name == "Edit" {
+		root, rootErr := e.openRoot()
+		if rootErr != nil {
+			return e.validationFailure(call, rootErr)
+		}
+		validated.executionRoot = root
+		validated.executionRootPath = e.ProjectRoot
+	}
 	return e.executeValidated(ctx, validated)
 }
 
@@ -273,6 +302,12 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 			scanFiles:       e.ScanMaxFiles,
 			scanDirectories: e.ScanMaxDirs,
 			scanLines:       e.ScanMaxLines,
+		})
+	} else if call.Name == "Write" || call.Name == "Edit" {
+		execCtx = withWriteExecution(execCtx, writeExecution{
+			root:       validated.executionRoot,
+			rootPath:   validated.executionRootPath,
+			capability: e.ordinaryWriteCapability,
 		})
 	}
 

@@ -3,7 +3,62 @@ package tool
 import (
 	"context"
 	"fmt"
+	"io"
+	"path/filepath"
+
+	"xagent/internal/safefs"
 )
+
+var protectedPermissionSlots = []string{
+	".xagent/permissions.yaml",
+	".xagent/permissions.local.yaml",
+}
+
+// ProjectFilesystemPolicy returns a detached policy for the assembly root.
+// The Capabilities container returned by Bootstrap must remain outside the
+// tool package; Write and Edit receive only its Ordinary capability.
+func ProjectFilesystemPolicy() safefs.Policy {
+	return safefs.Policy{ProtectedSlots: append([]string(nil), protectedPermissionSlots...)}
+}
+
+type writeExecution struct {
+	root       *safefs.Root
+	rootPath   string
+	capability safefs.Capability
+}
+
+type writeExecutionContextKey struct{}
+
+func withWriteExecution(ctx context.Context, execution writeExecution) context.Context {
+	return context.WithValue(ctx, writeExecutionContextKey{}, execution)
+}
+
+func writeExecutionFromContext(ctx context.Context) writeExecution {
+	if ctx == nil {
+		return writeExecution{}
+	}
+	execution, _ := ctx.Value(writeExecutionContextKey{}).(writeExecution)
+	return execution
+}
+
+func writeTarget(ctx context.Context, requestedPath string) (writeExecution, string, error) {
+	execution := writeExecutionFromContext(ctx)
+	if execution.root == nil || execution.rootPath == "" {
+		return writeExecution{}, "", fmt.Errorf("%s: write capability is unavailable", ErrPathOutsideProject)
+	}
+	relative, err := rootRelativeBindingPath(requestedPath, execution.rootPath)
+	if err != nil {
+		return writeExecution{}, "", fmt.Errorf("%s: invalid write target", ErrPathOutsideProject)
+	}
+	return execution, filepath.ToSlash(relative), nil
+}
+
+func atomicWriteText(ctx context.Context, execution writeExecution, relative, content string) error {
+	return execution.root.AtomicWrite(ctx, execution.capability, relative, 0o600, func(destination io.Writer) error {
+		_, err := io.WriteString(destination, content)
+		return err
+	})
+}
 
 type WriteTool struct {
 	projectRoot string
@@ -37,13 +92,15 @@ func (t *WriteTool) Execute(ctx context.Context, input Input) Result {
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "content 参数必须是字符串", true)
 	}
-	resolved, err := WriteProjectFile(t.projectRoot, path, []byte(content))
+	execution, relative, err := writeTarget(ctx, path)
 	if err != nil {
-		return Failure(input, errorCode(err), fmt.Sprintf("写入文件失败: %v", err), true)
+		return Failure(input, errorCode(err), "写入文件失败: 目标不可写", true)
 	}
-	rel := RelativeToRoot(t.projectRoot, resolved)
-	return Success(input, fmt.Sprintf("Wrote %s (%d bytes)", rel, len(content)), fmt.Sprintf("Wrote %d bytes to %s", len(content), rel), map[string]any{
-		"path":  rel,
+	if err := atomicWriteText(ctx, execution, relative, content); err != nil {
+		return Failure(input, ErrPathOutsideProject, "写入文件失败: 目标不可写", true)
+	}
+	return Success(input, fmt.Sprintf("Wrote %s (%d bytes)", relative, len(content)), fmt.Sprintf("Wrote %d bytes to %s", len(content), relative), map[string]any{
+		"path":  relative,
 		"bytes": len(content),
 	})
 }

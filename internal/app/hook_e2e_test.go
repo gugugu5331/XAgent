@@ -31,6 +31,7 @@ import (
 	"xagent/internal/orchestrator"
 	"xagent/internal/provider"
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
@@ -732,7 +733,19 @@ func newHookE2EFixture(t *testing.T, options hookE2EFixtureOptions) *hookE2EFixt
 		Permission: config.PermissionConfig{Mode: permissionMode},
 		Agent:      config.AgentConfig{MaxIterations: 4, MaxUnknownToolCalls: 2},
 	}
-	executor := tool.NewExecutor(registry, projectRoot, time.Second, 64*1024)
+	if err := os.Mkdir(filepath.Join(projectRoot, ".xagent"), 0o700); err != nil && !os.IsExist(err) {
+		t.Fatal(err)
+	}
+	openedProject, err := safefs.Bootstrap(projectRoot, tool.ProjectFilesystemPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := openedProject.Root.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	executor := tool.NewExecutorWithWriteAccess(registry, projectRoot, time.Second, 64*1024, openedProject.Root, openedProject.Capabilities.Ordinary())
 	model := New(Deps{
 		Config: cfg, Provider: providerImpl, Store: store, Resources: hookE2EResources{},
 		Registry: registry, Executor: executor, Diagnostics: collector, SkillManager: skillManager,

@@ -68,7 +68,7 @@ func TestSymlinkEscapesAreRejected(t *testing.T) {
 	}
 
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 1024)
+	executor := newWritableExecutor(t, registry, root, time.Second, 1024)
 
 	read := executor.Execute(context.Background(), Call{ID: "read", Name: "Read", ArgumentsJSON: `{"path":"secret-link.txt"}`})
 	if read.Status != StatusError || read.Error.Code != ErrPathOutsideProject {
@@ -146,7 +146,7 @@ func TestRegistryRejectsDuplicateTool(t *testing.T) {
 func TestReadAndWriteTools(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 1024)
+	executor := newWritableExecutor(t, registry, root, time.Second, 1024)
 
 	write := executor.Execute(context.Background(), Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`})
 	if write.Status != StatusSuccess {
@@ -166,7 +166,7 @@ func TestEditToolMatchCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 1024)
+	executor := newWritableExecutor(t, registry, root, time.Second, 1024)
 
 	missing := executor.Execute(context.Background(), Call{ID: "1", Name: "Edit", ArgumentsJSON: `{"path":"file.txt","old_text":"three","new_text":"x"}`})
 	if missing.Status != StatusError || missing.Error.Code != ErrNotFound {
@@ -230,7 +230,7 @@ func TestGlobAndGrep(t *testing.T) {
 func TestExecutorTruncatesOutput(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 10)
+	executor := newWritableExecutor(t, registry, root, time.Second, 10)
 	result := executor.Execute(context.Background(), Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"long.txt","content":"abcdefghijklmnopqrstuvwxyz"}`})
 	if result.Status != StatusSuccess {
 		t.Fatalf("write failed: %#v", result)
@@ -244,7 +244,7 @@ func TestExecutorTruncatesOutput(t *testing.T) {
 func TestExecutorUsesConfiguredLimits(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, 10*time.Millisecond, 12)
+	executor := newWritableExecutor(t, registry, root, 10*time.Millisecond, 12)
 
 	if got := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"sleep 1"}`}); got.Status != StatusTimeout {
 		t.Fatalf("expected configured timeout, got %#v", got)
@@ -341,7 +341,7 @@ func TestExecutorBoundsEveryModelVisibleResultField(t *testing.T) {
 func TestExecuteAuthorizedRejectsMismatchedTicket(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 1024)
+	executor := newWritableExecutor(t, registry, root, time.Second, 1024)
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
 	other := Call{ID: call.ID, Name: call.Name, ArgumentsJSON: `{"path":"other.txt","content":"hello"}`}
 	ticket := mustExecutorTicket(t, context.Background(), executor, other)
@@ -357,7 +357,7 @@ func TestExecuteAuthorizedRejectsMismatchedTicket(t *testing.T) {
 func TestExecuteAuthorizedAllowsMatchingTicket(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 1024)
+	executor := newWritableExecutor(t, registry, root, time.Second, 1024)
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
 	ticket := mustExecutorTicket(t, context.Background(), executor, call)
 	result := executor.ExecuteAuthorized(context.Background(), call, ticket)
