@@ -269,6 +269,9 @@ func resolveContextSession(config *AppConfig, partial PartialAppConfig) error {
 		values[index] = value
 	}
 
+	if values[0] > values[1] {
+		return fmt.Errorf("config field %q must not exceed %q", contextSessionNumericSpecs[0].path, contextSessionNumericSpecs[1].path)
+	}
 	for _, index := range []int{3, 4, 5} {
 		if values[index] >= values[2] {
 			return fmt.Errorf("config field %q must be less than %q", contextSessionNumericSpecs[index].path, contextSessionNumericSpecs[2].path)
@@ -362,6 +365,12 @@ func resolveInstructionsMCP(config *AppConfig, result MergeResult) error {
 		}
 		values[index] = value
 	}
+	if values[0] > values[1] {
+		return fmt.Errorf("config field %q must not exceed %q", instructionMCPNumericSpecs[0].path, instructionMCPNumericSpecs[1].path)
+	}
+	if values[0] > values[3] {
+		return fmt.Errorf("config field %q must not exceed %q", instructionMCPNumericSpecs[0].path, instructionMCPNumericSpecs[3].path)
+	}
 	config.Instructions.MaxFileBytes = values[0]
 	config.Instructions.MaxTotalBytes = values[1]
 	config.Instructions.MaxFiles = values[2]
@@ -440,6 +449,15 @@ func resolveToolArtifactFiles(config *AppConfig, partial PartialAppConfig) error
 			return err
 		}
 		values[index] = value
+	}
+	for _, relation := range [][2]int{{0, 1}, {1, 3}, {3, 4}} {
+		if values[relation[0]] > values[relation[1]] {
+			return fmt.Errorf(
+				"config field %q must not exceed %q",
+				toolArtifactFilesNumericSpecs[relation[0]].path,
+				toolArtifactFilesNumericSpecs[relation[1]].path,
+			)
+		}
 	}
 	config.Tool.InlineOutputBytes = values[0]
 	config.Tool.MaxOutputBytes = int(values[0])

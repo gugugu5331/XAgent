@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -125,6 +126,7 @@ func TestResolveToolArtifactAndFilesNumericMatrix(t *testing.T) {
 			}
 			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
 				var partial PartialAppConfig
+				prepareToolArtifactFilesBoundary(&partial, spec.path)
 				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
 				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
 				if testCase.wantValid {
@@ -141,6 +143,22 @@ func TestResolveToolArtifactAndFilesNumericMatrix(t *testing.T) {
 	_, err := decodePartial("overflow.yaml", []byte("tool:\n  timeout_ms: 9223372036854775808\n"))
 	if err == nil {
 		t.Fatal("overflowing numeric configuration was accepted")
+	}
+}
+
+func prepareToolArtifactFilesBoundary(partial *PartialAppConfig, path string) {
+	switch path {
+	case "tool.capture_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Artifact.MaxFileBytes = Optional[int64]{Set: true, Value: 512 * mebibyte}
+		partial.Artifact.MaxTotalBytes = Optional[int64]{Set: true, Value: 8 * gibibyte}
+	case "artifact.max_file_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Tool.CaptureBytes = Optional[int64]{Set: true, Value: 1}
+	case "artifact.max_total_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Tool.CaptureBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Artifact.MaxFileBytes = Optional[int64]{Set: true, Value: 1}
 	}
 }
 
@@ -169,6 +187,7 @@ func TestResolveInstructionAndMCPNumericMatrix(t *testing.T) {
 			}
 			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
 				var partial PartialAppConfig
+				prepareInstructionMCPBoundary(&partial, spec.path)
 				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
 				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
 				if testCase.wantValid {
@@ -203,6 +222,12 @@ func TestResolveInstructionAndMCPNumericMatrix(t *testing.T) {
 	_, err := decodePartial("overflow.yaml", []byte("mcp:\n  max_tools: 9223372036854775808\n"))
 	if err == nil {
 		t.Fatal("overflowing MCP numeric configuration was accepted")
+	}
+}
+
+func prepareInstructionMCPBoundary(partial *PartialAppConfig, path string) {
+	if path == "instructions.max_total_bytes" || path == "instructions.max_expanded_bytes" {
+		partial.Instructions.MaxFileBytes = Optional[int64]{Set: true, Value: 1}
 	}
 }
 
@@ -348,6 +373,10 @@ func TestResolveContextAndSessionNumericMatrix(t *testing.T) {
 
 func prepareContextSessionBoundary(partial *PartialAppConfig, path string) {
 	switch path {
+	case "context.tool_result_threshold_chars":
+		partial.Context.ToolResultsThresholdChars = Optional[int64]{Set: true, Value: 4 * mebibyte}
+	case "context.tool_results_threshold_chars":
+		partial.Context.ToolResultThresholdChars = Optional[int64]{Set: true, Value: 1}
 	case "context.model_window_tokens":
 		partial.Context.AutoMarginTokens = Optional[int64]{Set: true, Value: 1}
 		partial.Context.ManualMarginTokens = Optional[int64]{Set: true, Value: 1}
@@ -491,6 +520,183 @@ func TestCleanupTimeoutCannotBeDisabledOrRaised(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsEveryApprovedNumericCombination(t *testing.T) {
+	optional := func(value int64) Optional[int64] { return Optional[int64]{Set: true, Value: value} }
+	streamBase := PartialStreamConfig{
+		MaxResponseBytes:      optional(1),
+		MaxEventBytes:         optional(1),
+		MaxTextBytes:          optional(1),
+		MaxThinkingBytes:      optional(1),
+		MaxToolArgumentsBytes: optional(1),
+	}
+	contextBase := PartialContextConfig{
+		ModelWindowTokens:  optional(2),
+		AutoMarginTokens:   optional(1),
+		ManualMarginTokens: optional(1),
+		RecentKeepTokens:   optional(1),
+	}
+
+	cases := []struct {
+		name    string
+		partial PartialAppConfig
+	}{
+		{name: "inline_above_capture", partial: PartialAppConfig{Tool: PartialToolConfig{InlineOutputBytes: optional(2), CaptureBytes: optional(1)}}},
+		{name: "capture_above_artifact_file", partial: PartialAppConfig{Tool: PartialToolConfig{InlineOutputBytes: optional(1), CaptureBytes: optional(2)}, Artifact: PartialArtifactConfig{MaxFileBytes: optional(1)}}},
+		{name: "artifact_file_above_total", partial: PartialAppConfig{Tool: PartialToolConfig{InlineOutputBytes: optional(1), CaptureBytes: optional(1)}, Artifact: PartialArtifactConfig{MaxFileBytes: optional(2), MaxTotalBytes: optional(1)}}},
+		{name: "instruction_file_above_total", partial: PartialAppConfig{Instructions: PartialInstructionsConfig{MaxFileBytes: optional(2), MaxTotalBytes: optional(1)}}},
+		{name: "instruction_file_above_expanded", partial: PartialAppConfig{Instructions: PartialInstructionsConfig{MaxFileBytes: optional(2), MaxExpandedBytes: optional(1)}}},
+		{name: "stream_event_above_response", partial: PartialAppConfig{LLM: PartialLLMConfig{Stream: func() PartialStreamConfig { value := streamBase; value.MaxEventBytes = optional(2); return value }()}}},
+		{name: "stream_text_above_response", partial: PartialAppConfig{LLM: PartialLLMConfig{Stream: func() PartialStreamConfig { value := streamBase; value.MaxTextBytes = optional(2); return value }()}}},
+		{name: "stream_thinking_above_response", partial: PartialAppConfig{LLM: PartialLLMConfig{Stream: func() PartialStreamConfig { value := streamBase; value.MaxThinkingBytes = optional(2); return value }()}}},
+		{name: "stream_arguments_above_response", partial: PartialAppConfig{LLM: PartialLLMConfig{Stream: func() PartialStreamConfig {
+			value := streamBase
+			value.MaxToolArgumentsBytes = optional(2)
+			return value
+		}()}}},
+		{name: "session_record_above_session", partial: PartialAppConfig{Session: PartialSessionConfig{MaxRecordBytes: optional(2), MaxSessionBytes: optional(1)}}},
+		{name: "diagnostic_item_above_total", partial: PartialAppConfig{Diagnostics: PartialDiagnosticsConfig{MaxItemBytes: optional(2), MaxTotalBytes: optional(1)}}},
+		{name: "single_tool_result_above_multiple", partial: PartialAppConfig{Context: PartialContextConfig{ToolResultThresholdChars: optional(2), ToolResultsThresholdChars: optional(1)}}},
+		{name: "auto_margin_equal_to_window", partial: PartialAppConfig{Context: func() PartialContextConfig { value := contextBase; value.AutoMarginTokens = optional(2); return value }()}},
+		{name: "manual_margin_equal_to_window", partial: PartialAppConfig{Context: func() PartialContextConfig {
+			value := contextBase
+			value.ManualMarginTokens = optional(2)
+			return value
+		}()}},
+		{name: "recent_keep_equal_to_window", partial: PartialAppConfig{Context: func() PartialContextConfig { value := contextBase; value.RecentKeepTokens = optional(2); return value }()}},
+		{name: "memory_concurrency_above_queue", partial: PartialAppConfig{Memory: PartialMemoryConfig{UpdateQueueSize: optional(1), UpdateConcurrency: optional(2)}}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := ResolveConfig(MergeResult{Value: testCase.partial}, LoadOptions{}); err == nil {
+				t.Fatal("invalid approved numeric combination was accepted")
+			}
+		})
+	}
+}
+
+func TestEveryAppConfigNumericKeyHasCompleteBoundaryMatrix(t *testing.T) {
+	specs := allAppConfigNumericSpecs()
+	seen := make(map[string]int, len(specs))
+	for _, spec := range specs {
+		seen[spec.path]++
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				if testCase.encoded != "" {
+					if _, err := decodePartial("overflow.yaml", numericValueYAML(spec.path, testCase.encoded)); err == nil {
+						t.Fatal("overflowing numeric configuration was accepted")
+					}
+					return
+				}
+				var partial PartialAppConfig
+				prepareCompleteNumericBoundary(&partial, spec.path)
+				setCompleteNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid complete-matrix boundary did not resolve")
+					}
+				} else if err == nil {
+					t.Fatal("invalid complete-matrix boundary was accepted")
+				}
+			})
+		}
+	}
+	if len(seen) != len(approvedAppConfigNumericKeys) {
+		t.Fatal("complete boundary matrix does not cover the numeric manifest exactly")
+	}
+	for _, path := range approvedAppConfigNumericKeys {
+		if seen[path] != 1 {
+			t.Fatal("numeric key does not have exactly one complete boundary matrix")
+		}
+	}
+}
+
+func TestResolveErrorsContainOnlyPathAndAllowedRange(t *testing.T) {
+	const rejected = int64(-7_777_777)
+	for _, spec := range allAppConfigNumericSpecs() {
+		t.Run(spec.path, func(t *testing.T) {
+			var partial PartialAppConfig
+			prepareCompleteNumericBoundary(&partial, spec.path)
+			setCompleteNumericValue(t, &partial, spec.path, Optional[int64]{Set: true, Value: rejected})
+			_, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+			if err == nil {
+				t.Fatal("invalid numeric value did not produce an error")
+			}
+			expected := fmt.Sprintf("config field %q must be in range %d..%d", spec.path, spec.minimum, spec.hardCap)
+			if err.Error() != expected || strings.Contains(err.Error(), "7777777") {
+				t.Fatal("numeric error contains content beyond the path and allowed range")
+			}
+		})
+	}
+}
+
+func allAppConfigNumericSpecs() []numericSpec {
+	result := make([]numericSpec, 0, len(appConfigNumericManifest))
+	result = append(result, toolArtifactFilesNumericSpecs[:]...)
+	result = append(result, instructionMCPNumericSpecs[:]...)
+	serverTimeout := mcpServerTimeoutSpec
+	serverTimeout.defaultVal = 30_000
+	result = append(result, serverTimeout)
+	result = append(result, llmAgentStreamNumericSpecs[:]...)
+	result = append(result, contextSessionNumericSpecs[:]...)
+	result = append(result, memoryDiagnosticsLifecycleNumericSpecs[:]...)
+	return result
+}
+
+func prepareCompleteNumericBoundary(partial *PartialAppConfig, path string) {
+	prepareLLMAgentStreamBoundary(partial, path)
+	prepareContextSessionBoundary(partial, path)
+	prepareMemoryDiagnosticsLifecycleBoundary(partial, path)
+	switch path {
+	case "tool.capture_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Artifact.MaxFileBytes = Optional[int64]{Set: true, Value: 512 * mebibyte}
+		partial.Artifact.MaxTotalBytes = Optional[int64]{Set: true, Value: 8 * gibibyte}
+	case "artifact.max_file_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Tool.CaptureBytes = Optional[int64]{Set: true, Value: 1}
+	case "artifact.max_total_bytes":
+		partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Tool.CaptureBytes = Optional[int64]{Set: true, Value: 1}
+		partial.Artifact.MaxFileBytes = Optional[int64]{Set: true, Value: 1}
+	case "instructions.max_total_bytes", "instructions.max_expanded_bytes":
+		partial.Instructions.MaxFileBytes = Optional[int64]{Set: true, Value: 1}
+	case "context.tool_result_threshold_chars":
+		partial.Context.ToolResultsThresholdChars = Optional[int64]{Set: true, Value: 4 * mebibyte}
+	case "context.tool_results_threshold_chars":
+		partial.Context.ToolResultThresholdChars = Optional[int64]{Set: true, Value: 1}
+	case "mcp.servers.<name>.timeout_ms":
+		partial.MCP.Servers = map[string]PartialMCPServerConfig{"local": {}}
+	}
+}
+
+func setCompleteNumericValue(t *testing.T, partial *PartialAppConfig, path string, value Optional[int64]) {
+	t.Helper()
+	if path != "mcp.servers.<name>.timeout_ms" {
+		setPartialNumericValue(t, partial, path, value)
+		return
+	}
+	server := partial.MCP.Servers["local"]
+	server.TimeoutMS = value
+	partial.MCP.Servers["local"] = server
+}
+
+func numericValueYAML(path string, encoded string) []byte {
+	parts := strings.Split(strings.Replace(path, "<name>", "local", 1), ".")
+	var result strings.Builder
+	for index, part := range parts {
+		result.WriteString(strings.Repeat("  ", index))
+		result.WriteString(part)
+		result.WriteByte(':')
+		if index == len(parts)-1 {
+			result.WriteByte(' ')
+			result.WriteString(encoded)
+		}
+		result.WriteByte('\n')
+	}
+	return []byte(result.String())
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -579,6 +785,8 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return config.MCP.MaxProtocolErrors
 	case "mcp.default_timeout_ms":
 		return config.MCP.DefaultTimeoutMS
+	case "mcp.servers.<name>.timeout_ms":
+		return config.MCP.Servers["local"].TimeoutMS
 	case "llm.request_timeout_ms":
 		return int64(config.LLM.RequestTimeoutMS)
 	case "llm.thinking.budget_tokens":
