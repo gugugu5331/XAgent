@@ -407,6 +407,90 @@ func TestSessionRecordCannotExceedSession(t *testing.T) {
 	}
 }
 
+func TestResolveMemoryDiagnosticsAndLifecycleNumericMatrix(t *testing.T) {
+	for _, spec := range memoryDiagnosticsLifecycleNumericSpecs {
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			if testCase.encoded != "" {
+				continue
+			}
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				var partial PartialAppConfig
+				prepareMemoryDiagnosticsLifecycleBoundary(&partial, spec.path)
+				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid Memory, Diagnostics, or Lifecycle boundary did not resolve")
+					}
+				} else if err == nil {
+					t.Fatal("invalid Memory, Diagnostics, or Lifecycle boundary was accepted")
+				}
+			})
+		}
+	}
+
+	_, err := decodePartial("overflow.yaml", []byte("memory:\n  max_index_lines: 9223372036854775808\n"))
+	if err == nil {
+		t.Fatal("overflowing Memory numeric configuration was accepted")
+	}
+}
+
+func prepareMemoryDiagnosticsLifecycleBoundary(partial *PartialAppConfig, path string) {
+	switch path {
+	case "memory.update_queue_size":
+		partial.Memory.UpdateConcurrency = Optional[int64]{Set: true, Value: 1}
+	case "memory.update_concurrency":
+		partial.Memory.UpdateQueueSize = Optional[int64]{Set: true, Value: 1_024}
+	case "diagnostics.max_total_bytes":
+		partial.Diagnostics.MaxItemBytes = Optional[int64]{Set: true, Value: 1}
+	}
+}
+
+func TestMemoryQueueAndDiagnosticTotalRelations(t *testing.T) {
+	memory := PartialMemoryConfig{
+		UpdateQueueSize:   Optional[int64]{Set: true, Value: 1},
+		UpdateConcurrency: Optional[int64]{Set: true, Value: 1},
+	}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Memory: memory}}, LoadOptions{}); err != nil {
+		t.Fatal("Memory concurrency equal to queue size was rejected")
+	}
+	memory.UpdateConcurrency = Optional[int64]{Set: true, Value: 2}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Memory: memory}}, LoadOptions{}); err == nil {
+		t.Fatal("Memory concurrency above queue size was accepted")
+	}
+
+	diagnostics := PartialDiagnosticsConfig{
+		MaxItemBytes:  Optional[int64]{Set: true, Value: 1},
+		MaxTotalBytes: Optional[int64]{Set: true, Value: 1},
+	}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Diagnostics: diagnostics}}, LoadOptions{}); err != nil {
+		t.Fatal("Diagnostics item equal to total limit was rejected")
+	}
+	diagnostics.MaxItemBytes = Optional[int64]{Set: true, Value: 2}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Diagnostics: diagnostics}}, LoadOptions{}); err == nil {
+		t.Fatal("Diagnostics item above total limit was accepted")
+	}
+}
+
+func TestCleanupTimeoutCannotBeDisabledOrRaised(t *testing.T) {
+	for _, value := range []int64{1, 2_000} {
+		partial := PartialAppConfig{Lifecycle: PartialLifecycleConfig{
+			CleanupTimeoutMS: Optional[int64]{Set: true, Value: value},
+		}}
+		if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err != nil {
+			t.Fatal("valid cleanup timeout was rejected")
+		}
+	}
+	for _, value := range []int64{0, -1, 2_001} {
+		partial := PartialAppConfig{Lifecycle: PartialLifecycleConfig{
+			CleanupTimeoutMS: Optional[int64]{Set: true, Value: value},
+		}}
+		if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
+			t.Fatal("cleanup timeout outside the closed range was accepted")
+		}
+	}
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -545,6 +629,26 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return int64(config.Session.RetentionDays)
 	case "session.gap_reminder_days":
 		return int64(config.Session.GapReminderDays)
+	case "memory.max_index_lines":
+		return int64(config.Memory.MaxIndexLines)
+	case "memory.max_index_bytes":
+		return int64(config.Memory.MaxIndexBytes)
+	case "memory.update_queue_size":
+		return int64(config.Memory.UpdateQueueSize)
+	case "memory.update_concurrency":
+		return int64(config.Memory.UpdateConcurrency)
+	case "memory.update_timeout_ms":
+		return int64(config.Memory.UpdateTimeoutMS)
+	case "memory.max_candidate_bytes":
+		return int64(config.Memory.MaxCandidateBytes)
+	case "diagnostics.max_items":
+		return config.Diagnostics.MaxItems
+	case "diagnostics.max_item_bytes":
+		return config.Diagnostics.MaxItemBytes
+	case "diagnostics.max_total_bytes":
+		return config.Diagnostics.MaxTotalBytes
+	case "lifecycle.cleanup_timeout_ms":
+		return config.Lifecycle.CleanupTimeoutMS
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0

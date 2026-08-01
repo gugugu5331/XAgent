@@ -154,6 +154,19 @@ var contextSessionNumericSpecs = [...]numericSpec{
 	{path: "session.gap_reminder_days", defaultVal: 7, minimum: 1, hardCap: 3_650},
 }
 
+var memoryDiagnosticsLifecycleNumericSpecs = [...]numericSpec{
+	{path: "memory.max_index_lines", defaultVal: 200, minimum: 1, hardCap: 100_000},
+	{path: "memory.max_index_bytes", defaultVal: 25 * kibibyte, minimum: 1, hardCap: 16 * mebibyte},
+	{path: "memory.update_queue_size", defaultVal: 8, minimum: 1, hardCap: 1_024},
+	{path: "memory.update_concurrency", defaultVal: 1, minimum: 1, hardCap: 64},
+	{path: "memory.update_timeout_ms", defaultVal: 30_000, minimum: 1, hardCap: 86_400_000},
+	{path: "memory.max_candidate_bytes", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 16 * mebibyte},
+	{path: "diagnostics.max_items", defaultVal: 100, minimum: 1, hardCap: 1_000},
+	{path: "diagnostics.max_item_bytes", defaultVal: 2 * kibibyte, minimum: 1, hardCap: 64 * kibibyte},
+	{path: "diagnostics.max_total_bytes", defaultVal: 2 * mebibyte, minimum: 1, hardCap: 16 * mebibyte},
+	{path: "lifecycle.cleanup_timeout_ms", defaultVal: 2_000, minimum: 1, hardCap: 2_000},
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -179,11 +192,54 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 	if err := resolveContextSession(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
+	if err := resolveMemoryDiagnosticsLifecycle(&config, result.Value); err != nil {
+		return LoadedConfig{}, err
+	}
 	provenance := make(map[string]ConfigSource, len(result.Provenance))
 	for path, source := range result.Provenance {
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveMemoryDiagnosticsLifecycle(config *AppConfig, partial PartialAppConfig) error {
+	candidates := [...]Optional[int64]{
+		partial.Memory.MaxIndexLines,
+		partial.Memory.MaxIndexBytes,
+		partial.Memory.UpdateQueueSize,
+		partial.Memory.UpdateConcurrency,
+		partial.Memory.UpdateTimeoutMS,
+		partial.Memory.MaxCandidateBytes,
+		partial.Diagnostics.MaxItems,
+		partial.Diagnostics.MaxItemBytes,
+		partial.Diagnostics.MaxTotalBytes,
+		partial.Lifecycle.CleanupTimeoutMS,
+	}
+	values := make([]int64, len(candidates))
+	for index, spec := range memoryDiagnosticsLifecycleNumericSpecs {
+		value, err := spec.resolve(candidates[index])
+		if err != nil {
+			return err
+		}
+		values[index] = value
+	}
+
+	if values[3] > values[2] {
+		return fmt.Errorf("config field %q must not exceed %q", memoryDiagnosticsLifecycleNumericSpecs[3].path, memoryDiagnosticsLifecycleNumericSpecs[2].path)
+	}
+	if values[7] > values[8] {
+		return fmt.Errorf("config field %q must not exceed %q", memoryDiagnosticsLifecycleNumericSpecs[7].path, memoryDiagnosticsLifecycleNumericSpecs[8].path)
+	}
+
+	config.Memory.MaxIndexLines = int(values[0])
+	config.Memory.MaxIndexBytes = int(values[1])
+	config.Memory.UpdateQueueSize = int(values[2])
+	config.Memory.UpdateConcurrency = int(values[3])
+	config.Memory.UpdateTimeoutMS = int(values[4])
+	config.Memory.MaxCandidateBytes = int(values[5])
+	config.Diagnostics = DiagnosticsConfig{MaxItems: values[6], MaxItemBytes: values[7], MaxTotalBytes: values[8]}
+	config.Lifecycle = LifecycleConfig{CleanupTimeoutMS: values[9]}
+	return nil
 }
 
 func resolveContextSession(config *AppConfig, partial PartialAppConfig) error {

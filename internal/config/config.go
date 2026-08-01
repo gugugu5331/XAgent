@@ -16,6 +16,8 @@ type AppConfig struct {
 	Instructions InstructionsConfig `yaml:"instructions"`
 	Session      SessionConfig      `yaml:"session"`
 	Memory       MemoryConfig       `yaml:"memory"`
+	Diagnostics  DiagnosticsConfig  `yaml:"-"`
+	Lifecycle    LifecycleConfig    `yaml:"-"`
 }
 
 type LLMConfig struct {
@@ -131,4 +133,14 @@ type MemoryConfig struct {
 	UpdateConcurrency int    `yaml:"update_concurrency"`
 	UpdateTimeoutMS   int    `yaml:"update_timeout_ms"`
 	MaxCandidateBytes int    `yaml:"max_candidate_bytes"`
+}
+
+type DiagnosticsConfig struct {
+	MaxItems      int64
+	MaxItemBytes  int64
+	MaxTotalBytes int64
+}
+
+type LifecycleConfig struct {
+	CleanupTimeoutMS int64
 }
