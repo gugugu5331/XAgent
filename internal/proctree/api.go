@@ -14,9 +14,10 @@ type ProtectionMode uint8
 const ProtectionRequired ProtectionMode = 1
 
 type ProtectionPlan struct {
-	seal    *protectionSeal
-	roots   []*safefs.Root
-	scratch *safefs.Root
+	seal         *protectionSeal
+	roots        []*safefs.Root
+	scratch      *safefs.Root
+	scratchOwner *scratchOwner
 }
 
 type protectionSeal struct{}
