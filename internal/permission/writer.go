@@ -1,18 +1,27 @@
 package permission
 
 import (
-	"bytes"
-	"fmt"
-	"os"
-	"path/filepath"
+	"context"
+	"io"
 
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 
 	"gopkg.in/yaml.v3"
 )
 
+const localRuleSlot = ".xagent/permissions.local.yaml"
+
 type Writer struct {
-	ProjectRoot string
+	root       *safefs.Root
+	capability safefs.Capability
+}
+
+// NewWriter constructs the only permission-file writer. The capability is
+// deliberately kept separate from Root by safefs and is validated again by
+// AtomicWrite for every publication.
+func NewWriter(root *safefs.Root, capability safefs.Capability) Writer {
+	return Writer{root: root, capability: capability}
 }
 
 func (w Writer) PreviewRule(normalized NormalizedCall) Rule {
@@ -26,79 +35,30 @@ func (w Writer) PreviewRule(normalized NormalizedCall) Rule {
 }
 
 func (w Writer) WriteLocal(rule Rule) error {
-	if ruleContainsSecret(rule) {
-		return fmt.Errorf("permission rule contains sensitive value")
-	}
-	if err := rule.Validate(); err != nil {
-		return err
-	}
-	path := LocalRulePath(w.ProjectRoot)
-	if err := validateLocalRulePath(w.ProjectRoot); err != nil {
+	if err := rule.ValidatePermanent(); err != nil {
 		return err
 	}
 	file := RuleFile{Version: SupportedRuleVersion}
-	if existing, err := LoadRuleFile(path); err == nil {
+	if data, err := readRuleFile(w.root, localRuleSlot); err == nil {
+		existing, err := DecodeRuleFile(data)
+		if err != nil {
+			return err
+		}
 		file = existing
-	} else if !os.IsNotExist(err) {
-		return err
 	}
 	file.Rules = appendUniqueRule(file.Rules, rule)
 	if err := ValidateRuleFile(file); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	var buffer bytes.Buffer
-	encoder := yaml.NewEncoder(&buffer)
-	encoder.SetIndent(2)
-	if err := encoder.Encode(file); err != nil {
-		return err
-	}
-	if err := encoder.Close(); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".permissions-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(buffer.Bytes()); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, path)
-}
-
-func validateLocalRulePath(projectRoot string) error {
-	root, err := realProjectRoot(projectRoot)
-	if err != nil {
-		return err
-	}
-	dir := filepath.Join(root, ".xagent")
-	if info, err := os.Lstat(dir); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return os.ErrPermission
-		}
-		resolved, err := filepath.EvalSymlinks(dir)
-		if err != nil {
+	return w.root.AtomicWrite(context.Background(), w.capability, localRuleSlot, 0o600, func(destination io.Writer) error {
+		encoder := yaml.NewEncoder(destination)
+		encoder.SetIndent(2)
+		if err := encoder.Encode(file); err != nil {
+			_ = encoder.Close()
 			return err
 		}
-		if !isPathInsideRoot(root, resolved) {
-			return os.ErrPermission
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+		return encoder.Close()
+	})
 }
 
 func ruleContainsSecret(rule Rule) bool {

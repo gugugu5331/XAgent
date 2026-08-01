@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"xagent/internal/safefs"
 )
 
 func TestBashExactDoesNotMatchCompoundCommand(t *testing.T) {
@@ -228,7 +230,8 @@ func TestPermissionConfigFilesAreHardProtected(t *testing.T) {
 func TestAllowSessionAndPermanentAffectFollowingCalls(t *testing.T) {
 	root := t.TempDir()
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
-	authorizer := Authorizer{Session: NewSession(), Writer: Writer{ProjectRoot: root}}
+	writer := newPermissionWriter(t, root)
+	authorizer := Authorizer{Session: NewSession(), Writer: writer}
 	if decision := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowSession); decision.Kind != DecisionAllow {
 		t.Fatalf("expected session allow, got %#v", decision)
 	}
@@ -237,7 +240,7 @@ func TestAllowSessionAndPermanentAffectFollowingCalls(t *testing.T) {
 		t.Fatalf("expected follow-up session allow, got %#v", followUp)
 	}
 
-	permanent := Authorizer{Writer: Writer{ProjectRoot: root}}
+	permanent := Authorizer{Writer: writer}
 	if decision := permanent.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent); decision.Kind != DecisionAllow {
 		t.Fatalf("expected permanent allow, got %#v", decision)
 	}
@@ -250,7 +253,7 @@ func TestAllowSessionAndPermanentAffectFollowingCalls(t *testing.T) {
 func TestPermanentAllowDisabledForComplexShell(t *testing.T) {
 	root := t.TempDir()
 	call := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"git status && git branch"}`}
-	authorizer := Authorizer{Writer: Writer{ProjectRoot: root}}
+	authorizer := Authorizer{Writer: Writer{}}
 	decision := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent)
 	if decision.Kind != DecisionDeny {
 		t.Fatalf("expected permanent allow to be denied for complex shell, got %#v", decision)
@@ -266,10 +269,10 @@ func TestPermanentWriterRejectsSymlinkXAgentDirectory(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, ".xagent")); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	writer := Writer{ProjectRoot: root}
-	err := writer.WriteLocal(Rule{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)})
+	opened, err := safefs.Bootstrap(root, safefs.Policy{ProtectedSlots: []string{localPermissionSlot}})
 	if err == nil {
-		t.Fatal("expected writer to reject symlink .xagent directory")
+		_ = opened.Root.Close()
+		t.Fatal("expected permission Root bootstrap to reject symlink .xagent directory")
 	}
 	if _, err := os.Stat(filepath.Join(outside, "permissions.local.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("writer created permissions file outside project, stat err: %v", err)
@@ -278,7 +281,7 @@ func TestPermanentWriterRejectsSymlinkXAgentDirectory(t *testing.T) {
 
 func TestPermanentWriterWritesLocalRuleAndDeduplicates(t *testing.T) {
 	root := t.TempDir()
-	writer := Writer{ProjectRoot: root}
+	writer := newPermissionWriter(t, root)
 	rule := Rule{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)}
 	if err := writer.WriteLocal(rule); err != nil {
 		t.Fatal(err)
@@ -305,7 +308,7 @@ func TestPermanentWriterWritesLocalRuleAndDeduplicates(t *testing.T) {
 func TestPermanentPermissionRulesNeverPersistSecrets(t *testing.T) {
 	root := t.TempDir()
 	call := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"curl -H 'Authorization: Bearer abc123' https://example.test/?token=query-secret"}`}
-	authorizer := Authorizer{Writer: Writer{ProjectRoot: root}}
+	authorizer := Authorizer{Writer: Writer{}}
 	promptDecision := authorizer.Decide(call, Context{ProjectRoot: root, Mode: ModeDefault})
 	if promptDecision.Kind != DecisionAsk || promptDecision.Prompt == nil || promptDecision.Prompt.AllowPermanent {
 		t.Fatalf("expected ask without permanent for secret-bearing command, got %#v", promptDecision)
@@ -318,7 +321,7 @@ func TestPermanentPermissionRulesNeverPersistSecrets(t *testing.T) {
 		t.Fatalf("permanent rule file should not be written, stat err: %v", err)
 	}
 
-	writer := Writer{ProjectRoot: root}
+	writer := Writer{}
 	err := writer.WriteLocal(Rule{Tool: "Bash", Pattern: "api_key=secret-key", MatchType: string(MatchExact), Effect: string(EffectAllow)})
 	if err == nil {
 		t.Fatal("expected writer to reject secret-bearing rule")
@@ -351,7 +354,7 @@ func TestMCPToolsAreDynamicDangerousAndCannotPermanentAllow(t *testing.T) {
 	if decision.Kind != DecisionAsk || decision.Prompt == nil || decision.Prompt.AllowPermanent {
 		t.Fatalf("expected mcp tool to ask without permanent allow, got %#v", decision)
 	}
-	permanent := (&Authorizer{Writer: Writer{ProjectRoot: root}}).ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent)
+	permanent := (&Authorizer{Writer: Writer{}}).ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent)
 	if permanent.Kind != DecisionDeny {
 		t.Fatalf("expected mcp permanent allow to be denied, got %#v", permanent)
 	}

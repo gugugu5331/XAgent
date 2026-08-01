@@ -107,7 +107,7 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 			Project:    loaded.Project,
 			Local:      loaded.Local,
 			LoadErrors: loaded.Errors,
-			Writer:     permission.Writer{ProjectRoot: options.Executor.ProjectRoot},
+			Writer:     permission.Writer{},
 		}
 	}
 	runOptions := runOptionsFromConfig(options.Agent)
