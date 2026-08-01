@@ -2,10 +2,13 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"xagent/internal/safefs"
 )
 
 // ReadScope adds request-local read roots without changing the project root
@@ -17,6 +20,27 @@ type ReadScope struct {
 }
 
 type readScopeContextKey struct{}
+type readExecutionContextKey struct{}
+
+type readExecution struct {
+	root        *safefs.Root
+	rootPath    string
+	fileBytes   int64
+	lines       int64
+	outputBytes int64
+}
+
+func withReadExecution(ctx context.Context, execution readExecution) context.Context {
+	return context.WithValue(ctx, readExecutionContextKey{}, execution)
+}
+
+func readExecutionFromContext(ctx context.Context) readExecution {
+	if ctx == nil {
+		return readExecution{}
+	}
+	execution, _ := ctx.Value(readExecutionContextKey{}).(readExecution)
+	return execution
+}
 
 // NewReadScope canonicalizes and de-duplicates all roots. Extra roots must be
 // existing directories; the project root is never repeated in ExtraRoots.
@@ -143,4 +167,39 @@ func canonicalReadRoot(root string) (string, error) {
 		return "", fmt.Errorf("%q 不是目录", root)
 	}
 	return filepath.Clean(resolved), nil
+}
+
+func openReadInScope(ctx context.Context, scope ReadScope, requestedPath string) (resolvedReadPath, *safefs.File, func(), error) {
+	if ctx == nil || ctx.Err() != nil {
+		return resolvedReadPath{}, nil, func() {}, context.Canceled
+	}
+	target, err := resolveReadPath(scope, requestedPath)
+	if err != nil {
+		return resolvedReadPath{}, nil, func() {}, err
+	}
+	relative, err := filepath.Rel(target.root, target.absolute)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return resolvedReadPath{}, nil, func() {}, errors.New(ErrPathOutsideProject)
+	}
+
+	execution := readExecutionFromContext(ctx)
+	root := execution.root
+	closeRoot := func() {}
+	if root != nil && execution.rootPath != target.root {
+		return resolvedReadPath{}, nil, closeRoot, errors.New(ErrPathOutsideProject)
+	}
+	if root == nil {
+		opened, openErr := safefs.Bootstrap(target.root, safefs.Policy{})
+		if openErr != nil {
+			return resolvedReadPath{}, nil, closeRoot, errors.New(ErrPathOutsideProject)
+		}
+		root = opened.Root
+		closeRoot = func() { _ = root.Close() }
+	}
+	file, err := root.OpenRead(ctx, filepath.ToSlash(relative))
+	if err != nil {
+		closeRoot()
+		return resolvedReadPath{}, nil, func() {}, errors.New(ErrNotFound)
+	}
+	return target, file, closeRoot, nil
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"xagent/internal/budget"
 	"xagent/internal/permission"
 	"xagent/internal/safefs"
 )
@@ -25,6 +26,8 @@ type Executor struct {
 	ProjectRoot    string
 	Timeout        time.Duration
 	MaxOutputBytes int
+	ReadMaxBytes   int64
+	ReadMaxLines   int64
 	TicketVerifier permission.TicketVerifier
 
 	rootOnce sync.Once
@@ -42,7 +45,14 @@ func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = 32 * 1024
 	}
-	return &Executor{Registry: registry, ProjectRoot: projectRoot, Timeout: timeout, MaxOutputBytes: maxOutputBytes}
+	return &Executor{
+		Registry:       registry,
+		ProjectRoot:    projectRoot,
+		Timeout:        timeout,
+		MaxOutputBytes: maxOutputBytes,
+		ReadMaxBytes:   defaultBudgetValue(budget.FilesReadMaxBytes),
+		ReadMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
+	}
 }
 
 func (e *Executor) NeedsConfirmation(call Call) bool {
@@ -108,6 +118,12 @@ func (e *Executor) PrepareCall(ctx context.Context, call Call) (ValidatedCall, e
 	rootPath, err := e.bindingRootPath(ctx, call)
 	if err != nil {
 		return ValidatedCall{}, err
+	}
+	if call.Name == "Read" {
+		rootPath, err = canonicalReadRoot(rootPath)
+		if err != nil {
+			return ValidatedCall{}, errors.New("executor read root is unavailable")
+		}
 	}
 	root, err := e.openRootAt(rootPath)
 	if err != nil {
@@ -240,6 +256,15 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 	call := validated.Call
 	execCtx, cancel := context.WithTimeout(ctx, e.Timeout)
 	defer cancel()
+	if call.Name == "Read" {
+		execCtx = withReadExecution(execCtx, readExecution{
+			root:        validated.executionRoot,
+			rootPath:    validated.executionRootPath,
+			fileBytes:   e.ReadMaxBytes,
+			lines:       e.ReadMaxLines,
+			outputBytes: int64(e.MaxOutputBytes),
+		})
+	}
 
 	resultCh := make(chan Result, 1)
 	go func() {

@@ -28,6 +28,8 @@ type ValidatedCall struct {
 	canonicalArguments []byte
 	workingDirectory   *safefs.Identity
 	resourceBindings   []safefs.Binding
+	executionRoot      *safefs.Root
+	executionRootPath  string
 	targetDigest       *[32]byte
 	policy             ExecutionPolicy
 }
@@ -141,6 +143,8 @@ func (v *ValidatedCall) bindResources(validation ValidationContext) error {
 		return errors.New("file tool validation root is unavailable")
 	}
 	v.workingDirectory = &identity
+	v.executionRoot = validation.Root
+	v.executionRootPath = validation.ProjectRoot
 	argumentName, binds := bindingArgument(v.Call.Name)
 	if !binds {
 		return nil
