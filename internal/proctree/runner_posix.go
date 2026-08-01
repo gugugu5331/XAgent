@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-type posixCommandFactory func(Request) (*exec.Cmd, error)
+type posixCommandFactory func(context.Context, Request) (*exec.Cmd, error)
 
 type posixRunner struct {
 	options Options
@@ -42,7 +42,7 @@ func (r *posixRunner) Start(ctx context.Context, request Request) (Process, erro
 		}
 		return nil, newStartError(startCodeProtectedExecUnavailable)
 	}
-	command, err := r.build(request)
+	command, err := r.build(ctx, request)
 	if err != nil || command == nil {
 		_ = request.Protection.cleanupScratch()
 		var startErr *StartError

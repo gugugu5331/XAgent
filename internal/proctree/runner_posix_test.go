@@ -31,7 +31,7 @@ func TestPOSIXRunnerKillsDescendants(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "grandchild-marker")
 	runner, err := newPOSIXRunner(
 		Options{CleanupTimeout: time.Second, Diagnostics: &recordingSink{}},
-		func(request Request) (*exec.Cmd, error) {
+		func(_ context.Context, request Request) (*exec.Cmd, error) {
 			command := exec.Command(request.Executable, request.Args...)
 			command.Env = append([]string(nil), request.Env...)
 			return command, nil
