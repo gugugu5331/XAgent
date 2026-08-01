@@ -101,6 +101,9 @@ func defaultStartupFactories() startupFactories {
 }
 
 func run() error {
+	if handled, err := runInternalMode(); handled {
+		return err
+	}
 	return runWithFactories(os.Args[1:], defaultStartupFactories())
 }
 

@@ -55,7 +55,18 @@ func (r *posixRunner) Start(ctx context.Context, request Request) (Process, erro
 }
 
 func startPOSIXCommand(command *exec.Cmd, protection ProtectionPlan, options Options) (Process, error) {
-	if command == nil {
+	return startPOSIXCommandWithHandshake(context.Background(), command, protection, options, nil, nil)
+}
+
+func startPOSIXCommandWithHandshake(
+	ctx context.Context,
+	command *exec.Cmd,
+	protection ProtectionPlan,
+	options Options,
+	afterStart func(),
+	handshake func(context.Context) error,
+) (Process, error) {
+	if ctx == nil || command == nil {
 		_ = protection.cleanupScratch()
 		return nil, newStartError(startCodeProcessStartFailed)
 	}
@@ -89,7 +100,11 @@ func startPOSIXCommand(command *exec.Cmd, protection ProtectionPlan, options Opt
 		_ = stdout.Close()
 		_ = stderr.Close()
 	}
-	if err := command.Start(); err != nil {
+	startErr := command.Start()
+	if afterStart != nil {
+		afterStart()
+	}
+	if startErr != nil {
 		closePipes()
 		return nil, newStartError(startCodeProcessStartFailed)
 	}
@@ -107,6 +122,19 @@ func startPOSIXCommand(command *exec.Cmd, protection ProtectionPlan, options Opt
 		return nil, newStartError(startCodeProcessStartFailed)
 	}
 	ownershipTransferred = true
+	if handshake != nil {
+		if err := handshake(ctx); err != nil {
+			_ = process.Close(context.Background())
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			var startErr *StartError
+			if errors.As(err, &startErr) {
+				return nil, newStartError(startErr.Code)
+			}
+			return nil, newStartError(startCodeProtectedExecUnavailable)
+		}
+	}
 	return process, nil
 }
 
