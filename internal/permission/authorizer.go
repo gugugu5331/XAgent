@@ -21,6 +21,7 @@ type Authorizer struct {
 	Project    RuleLayer
 	Local      RuleLayer
 	LoadErrors []LoadError
+	Health     *Health
 	Writer     Writer
 }
 
@@ -46,7 +47,11 @@ func (a *Authorizer) Decide(call Call, context Context) Decision {
 // orchestrator/legacy-wrapper stage and is intentionally not handled here.
 func (a *Authorizer) CheckHard(normalized NormalizedCall, _ Context) *Decision {
 	call := normalized.Call
-	if a != nil && len(a.LoadErrors) > 0 && isDangerousForConfigError(call.Name) {
+	if a != nil && a.permissionHealthDegraded() {
+		if isConservativeReadOnlyTool(call.Name) {
+			decision := allow(normalized, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
+			return &decision
+		}
 		decision := deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "permission config error"}, "权限配置文件损坏，无法安全执行该工具", "Permission configuration is invalid, so this action cannot be performed safely.")
 		return &decision
 	}
@@ -221,8 +226,8 @@ func canAllowPermanent(normalized NormalizedCall) bool {
 	return !(normalized.Call.Name == "Bash" && normalized.ComplexShell)
 }
 
-func isDangerousForConfigError(toolName string) bool {
-	return toolName == "Bash" || toolName == "Write" || toolName == "Edit"
+func (a *Authorizer) permissionHealthDegraded() bool {
+	return len(a.LoadErrors) > 0 || (a.Health != nil && a.Health.Degraded())
 }
 
 func isPermissionConfigPath(normalized NormalizedCall) bool {
