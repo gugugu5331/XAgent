@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"xagent/internal/safefs"
 
@@ -121,14 +122,15 @@ func readRuleFile(root *safefs.Root, relative string) ([]byte, error) {
 func DecodeRuleFile(data []byte) (RuleFile, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
-	var file RuleFile
-	if err := decoder.Decode(&file); err != nil {
+	var wire ruleFileWire
+	if err := decoder.Decode(&wire); err != nil {
+		return RuleFile{}, errors.New("decode permission rule file failed")
+	}
+	version, legacy, err := decodeRuleFileVersion(wire.Version)
+	if err != nil {
 		return RuleFile{}, err
 	}
-	legacy := file.Version == 0
-	if legacy {
-		file.Version = 1
-	}
+	file := RuleFile{Version: version, Rules: wire.Rules}
 	if err := ValidateRuleFile(file); err != nil {
 		return RuleFile{}, err
 	}
@@ -136,6 +138,28 @@ func DecodeRuleFile(data []byte) (RuleFile, error) {
 		markLegacyUntrustedRules(file.Rules)
 	}
 	return file, nil
+}
+
+type ruleFileWire struct {
+	Version yaml.Node `yaml:"version"`
+	Rules   []Rule    `yaml:"rules"`
+}
+
+func decodeRuleFileVersion(node yaml.Node) (version int, legacy bool, err error) {
+	if node.Kind == 0 {
+		return SupportedRuleVersion, true, nil
+	}
+	if node.Kind != yaml.ScalarNode || node.ShortTag() != "!!int" {
+		return 0, false, errors.New("permission rule version is invalid")
+	}
+	parsed, parseErr := strconv.ParseInt(node.Value, 0, 64)
+	if parseErr != nil || parsed < 0 || parsed > int64(SupportedRuleVersion) {
+		return 0, false, errors.New("permission rule version is invalid")
+	}
+	if parsed == 0 {
+		return SupportedRuleVersion, true, nil
+	}
+	return int(parsed), false, nil
 }
 
 func markLegacyUntrustedRules(rules []Rule) {

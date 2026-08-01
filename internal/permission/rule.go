@@ -77,7 +77,7 @@ func (r Rule) Validate() error {
 }
 
 func ValidateRuleFile(file RuleFile) error {
-	if file.Version > SupportedRuleVersion {
+	if file.Version != SupportedRuleVersion {
 		return fmt.Errorf("unsupported permission rule version %d", file.Version)
 	}
 	for index, rule := range file.Rules {
