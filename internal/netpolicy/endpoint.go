@@ -1,6 +1,9 @@
 package netpolicy
 
-import "net/url"
+import (
+	"net/netip"
+	"net/url"
+)
 
 type Purpose uint8
 
@@ -32,11 +35,15 @@ type Endpoint struct {
 	AddressClass AddressClass
 	Purpose      Purpose
 
-	seal *endpointSeal
+	seal      *endpointSeal
+	hostname  string
+	port      string
+	addresses []netip.Addr
 }
 
 type endpointSeal struct{}
 
 func (e Endpoint) valid() bool {
-	return e.seal != nil && e.URL != nil && e.Origin != "" && e.Purpose.valid()
+	return e.seal != nil && e.URL != nil && e.Origin != "" && e.Purpose.valid() &&
+		e.hostname != "" && e.port != "" && e.AddressClass != AddressUnresolved && len(e.addresses) != 0
 }

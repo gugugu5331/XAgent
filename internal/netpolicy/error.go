@@ -9,6 +9,10 @@ const (
 	CodeURLUserinfoForbidden ErrorCode = "url_userinfo_forbidden"
 	CodeSchemeForbidden      ErrorCode = "scheme_forbidden"
 	CodePlainHTTPForbidden   ErrorCode = "plain_http_forbidden"
+	CodeResolutionFailed     ErrorCode = "resolution_failed"
+	CodeAddressForbidden     ErrorCode = "address_forbidden"
+	CodeAddressClassMixed    ErrorCode = "address_class_mixed"
+	CodeAddressClassChanged  ErrorCode = "address_class_changed"
 	CodePolicyUnavailable    ErrorCode = "policy_unavailable"
 )
 

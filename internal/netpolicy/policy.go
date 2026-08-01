@@ -3,6 +3,7 @@ package netpolicy
 import (
 	"context"
 	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 	"unicode/utf8"
@@ -16,10 +17,12 @@ type HTTPPolicy interface {
 	ValidateRedirect(ctx context.Context, endpoint Endpoint, next *url.URL) error
 }
 
-type Policy struct{}
+type Policy struct {
+	resolver addressResolver
+}
 
 func NewPolicy() *Policy {
-	return &Policy{}
+	return &Policy{resolver: net.DefaultResolver}
 }
 
 func (p *Policy) ValidateInitial(ctx context.Context, rawURL string, purpose Purpose) (Endpoint, error) {
@@ -64,8 +67,27 @@ func (p *Policy) ValidateInitial(ctx context.Context, rawURL string, purpose Pur
 		return Endpoint{}, policyError(CodeInvalidEndpoint)
 	}
 	addressClass := AddressUnresolved
+	var addresses []netip.Addr
 	if address := net.ParseIP(hostname); address != nil {
-		addressClass = initialAddressClass(address)
+		resolved, ok := netip.AddrFromSlice(address)
+		if !ok {
+			return Endpoint{}, policyError(CodeAddressForbidden)
+		}
+		resolved = resolved.Unmap()
+		addressClass, err = classifyAddress(resolved)
+		if err != nil {
+			return Endpoint{}, err
+		}
+		addresses = []netip.Addr{resolved}
+	}
+	if scheme == "http" && len(addresses) == 0 {
+		return Endpoint{}, policyError(CodePlainHTTPForbidden)
+	}
+	if len(addresses) == 0 {
+		addressClass, addresses, err = p.resolve(ctx, hostname)
+		if err != nil {
+			return Endpoint{}, err
+		}
 	}
 	if scheme == "http" && addressClass != AddressLoopback {
 		return Endpoint{}, policyError(CodePlainHTTPForbidden)
@@ -81,6 +103,9 @@ func (p *Policy) ValidateInitial(ctx context.Context, rawURL string, purpose Pur
 		AddressClass: addressClass,
 		Purpose:      purpose,
 		seal:         &endpointSeal{},
+		hostname:     hostname,
+		port:         port,
+		addresses:    addresses,
 	}, nil
 }
 
@@ -126,17 +151,4 @@ func validPort(port string) bool {
 
 func canonicalAuthority(hostname, port string) string {
 	return net.JoinHostPort(hostname, port)
-}
-
-func initialAddressClass(address net.IP) AddressClass {
-	if address.IsLoopback() {
-		return AddressLoopback
-	}
-	if address.IsPrivate() {
-		return AddressPrivate
-	}
-	if address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() {
-		return AddressLinkLocal
-	}
-	return AddressPublic
 }
