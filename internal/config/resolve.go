@@ -106,6 +106,23 @@ var toolArtifactFilesNumericSpecs = [...]numericSpec{
 	{path: "files.scan_max_lines", defaultVal: 1_000_000, minimum: 1, hardCap: 10_000_000},
 }
 
+var instructionMCPNumericSpecs = [...]numericSpec{
+	{path: "instructions.max_file_bytes", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "instructions.max_total_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 16 * mebibyte},
+	{path: "instructions.max_files", defaultVal: 64, minimum: 1, hardCap: 1_024},
+	{path: "instructions.max_expanded_bytes", defaultVal: 2 * mebibyte, minimum: 1, hardCap: 32 * mebibyte},
+	{path: "instructions.max_include_depth", defaultVal: 5, minimum: 1, hardCap: 32},
+	{path: "mcp.max_response_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 16 * mebibyte},
+	{path: "mcp.max_tools", defaultVal: 128, minimum: 1, hardCap: 1_024},
+	{path: "mcp.max_pages", defaultVal: 32, minimum: 1, hardCap: 128},
+	{path: "mcp.max_protocol_errors", defaultVal: 32, minimum: 1, hardCap: 256},
+	{path: "mcp.default_timeout_ms", defaultVal: 30_000, minimum: 1, hardCap: 86_400_000},
+}
+
+var mcpServerTimeoutSpec = numericSpec{
+	path: "mcp.servers.<name>.timeout_ms", minimum: 1, hardCap: 86_400_000,
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -122,11 +139,83 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 	if err := resolveToolArtifactFiles(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
+	if err := resolveInstructionsMCP(&config, result); err != nil {
+		return LoadedConfig{}, err
+	}
 	provenance := make(map[string]ConfigSource, len(result.Provenance))
 	for path, source := range result.Provenance {
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveInstructionsMCP(config *AppConfig, result MergeResult) error {
+	partial := result.Value
+	candidates := [...]Optional[int64]{
+		partial.Instructions.MaxFileBytes,
+		partial.Instructions.MaxTotalBytes,
+		partial.Instructions.MaxFiles,
+		partial.Instructions.MaxExpandedBytes,
+		partial.Instructions.MaxIncludeDepth,
+		partial.MCP.MaxResponseBytes,
+		partial.MCP.MaxTools,
+		partial.MCP.MaxPages,
+		partial.MCP.MaxProtocolErrors,
+		partial.MCP.DefaultTimeoutMS,
+	}
+	values := make([]int64, len(candidates))
+	for index, spec := range instructionMCPNumericSpecs {
+		value, err := spec.resolve(candidates[index])
+		if err != nil {
+			return err
+		}
+		values[index] = value
+	}
+	config.Instructions.MaxFileBytes = values[0]
+	config.Instructions.MaxTotalBytes = values[1]
+	config.Instructions.MaxFiles = values[2]
+	config.Instructions.MaxExpandedBytes = values[3]
+	config.Instructions.MaxIncludeDepth = int(values[4])
+	config.MCP.DefaultTimeoutMS = values[9]
+	config.MCP.MaxResponseBytes = values[5]
+	config.MCP.MaxTools = values[6]
+	config.MCP.MaxPages = values[7]
+	config.MCP.MaxProtocolErrors = values[8]
+	config.MCP.Servers = make(map[string]MCPServerConfig, len(partial.MCP.Servers))
+	for name, server := range partial.MCP.Servers {
+		timeoutCandidate := server.TimeoutMS
+		if !timeoutCandidate.Set {
+			timeoutCandidate = Optional[int64]{Set: true, Value: config.MCP.DefaultTimeoutMS}
+		}
+		timeout, err := mcpServerTimeoutSpec.resolve(timeoutCandidate)
+		if err != nil {
+			return err
+		}
+		resolved := MCPServerConfig{
+			Disabled:  server.Disabled.Value,
+			Type:      server.Type.Value,
+			Command:   server.Command.Value,
+			Args:      append([]string(nil), server.Args.Value...),
+			Env:       cloneStringMap(server.Env.Value),
+			URL:       server.URL.Value,
+			Headers:   cloneStringMap(server.Headers.Value),
+			TimeoutMS: timeout,
+			Source:    string(result.Provenance[joinConfigPath("mcp.servers", name)]),
+		}
+		config.MCP.Servers[name] = resolved
+	}
+	return nil
+}
+
+func cloneStringMap(value map[string]string) map[string]string {
+	if value == nil {
+		return nil
+	}
+	result := make(map[string]string, len(value))
+	for key, item := range value {
+		result[key] = item
+	}
+	return result
 }
 
 func resolveToolArtifactFiles(config *AppConfig, partial PartialAppConfig) error {

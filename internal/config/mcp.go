@@ -8,9 +8,13 @@ const (
 )
 
 type MCPConfig struct {
-	DefaultTimeoutMS int64                      `yaml:"default_timeout_ms"`
-	Servers          map[string]MCPServerConfig `yaml:"servers"`
-	Diagnostics      []MCPDiagnostic            `yaml:"-"`
+	DefaultTimeoutMS  int64                      `yaml:"default_timeout_ms"`
+	MaxResponseBytes  int64                      `yaml:"-"`
+	MaxTools          int64                      `yaml:"-"`
+	MaxPages          int64                      `yaml:"-"`
+	MaxProtocolErrors int64                      `yaml:"-"`
+	Servers           map[string]MCPServerConfig `yaml:"servers"`
+	Diagnostics       []MCPDiagnostic            `yaml:"-"`
 }
 
 type MCPServerConfig struct {

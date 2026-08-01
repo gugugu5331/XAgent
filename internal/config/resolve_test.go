@@ -161,6 +161,86 @@ func TestLegacyToolOutputMapsOnlyToInlineAndConflictsWithNewKey(t *testing.T) {
 	}
 }
 
+func TestResolveInstructionAndMCPNumericMatrix(t *testing.T) {
+	for _, spec := range instructionMCPNumericSpecs {
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			if testCase.encoded != "" {
+				continue
+			}
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				var partial PartialAppConfig
+				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid Instruction or MCP boundary did not resolve")
+					}
+				} else if err == nil {
+					t.Fatal("invalid Instruction or MCP boundary was accepted")
+				}
+			})
+		}
+	}
+
+	for _, testCase := range numericBoundaryCases(30_000, mcpServerTimeoutSpec.minimum, mcpServerTimeoutSpec.hardCap) {
+		if testCase.encoded != "" || testCase.name == "absent_default" {
+			continue
+		}
+		t.Run(mcpServerTimeoutSpec.path+"/"+testCase.name, func(t *testing.T) {
+			partial := PartialAppConfig{MCP: PartialMCPConfig{Servers: map[string]PartialMCPServerConfig{
+				"local": {TimeoutMS: testCase.candidate},
+			}}}
+			loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+			if testCase.wantValid {
+				if err != nil || loaded.Config.MCP.Servers["local"].TimeoutMS != testCase.want {
+					t.Fatal("valid MCP server timeout boundary did not resolve")
+				}
+			} else if err == nil {
+				t.Fatal("invalid MCP server timeout boundary was accepted")
+			}
+		})
+	}
+	_, err := decodePartial("overflow.yaml", []byte("mcp:\n  max_tools: 9223372036854775808\n"))
+	if err == nil {
+		t.Fatal("overflowing MCP numeric configuration was accepted")
+	}
+}
+
+func TestMCPServerTimeoutInheritsResolvedDefault(t *testing.T) {
+	user := PartialAppConfig{MCP: PartialMCPConfig{
+		DefaultTimeoutMS: Optional[int64]{Set: true, Value: 1_111},
+		Servers: map[string]PartialMCPServerConfig{
+			"inherited": {},
+			"explicit":  {TimeoutMS: Optional[int64]{Set: true, Value: 333}},
+		},
+	}}
+	project := PartialAppConfig{MCP: PartialMCPConfig{DefaultTimeoutMS: Optional[int64]{Set: true, Value: 2_222}}}
+	merged, err := MergeLayers(
+		ConfigLayer{Source: SourceUser, Value: user},
+		ConfigLayer{Source: SourceProject, Value: project},
+	)
+	if err != nil {
+		t.Fatal("merge MCP timeout layers failed")
+	}
+	loaded, err := ResolveConfig(merged, LoadOptions{})
+	if err != nil {
+		t.Fatal("resolve inherited MCP timeout failed")
+	}
+	if loaded.Config.MCP.DefaultTimeoutMS != 2_222 || loaded.Config.MCP.Servers["inherited"].TimeoutMS != 2_222 ||
+		loaded.Config.MCP.Servers["explicit"].TimeoutMS != 333 {
+		t.Fatal("MCP server timeout did not inherit the resolved default")
+	}
+
+	user.MCP.Servers["inherited"] = PartialMCPServerConfig{TimeoutMS: Optional[int64]{Set: true, Value: 0}}
+	merged, err = MergeLayers(ConfigLayer{Source: SourceUser, Value: user}, ConfigLayer{Source: SourceProject, Value: project})
+	if err != nil {
+		t.Fatal("merge explicit zero MCP timeout failed")
+	}
+	if _, err := ResolveConfig(merged, LoadOptions{}); err == nil {
+		t.Fatal("explicit zero MCP timeout inherited the default")
+	}
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -229,6 +309,26 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return config.Files.ScanMaxDirectories
 	case "files.scan_max_lines":
 		return config.Files.ScanMaxLines
+	case "instructions.max_file_bytes":
+		return config.Instructions.MaxFileBytes
+	case "instructions.max_total_bytes":
+		return config.Instructions.MaxTotalBytes
+	case "instructions.max_files":
+		return config.Instructions.MaxFiles
+	case "instructions.max_expanded_bytes":
+		return config.Instructions.MaxExpandedBytes
+	case "instructions.max_include_depth":
+		return int64(config.Instructions.MaxIncludeDepth)
+	case "mcp.max_response_bytes":
+		return config.MCP.MaxResponseBytes
+	case "mcp.max_tools":
+		return config.MCP.MaxTools
+	case "mcp.max_pages":
+		return config.MCP.MaxPages
+	case "mcp.max_protocol_errors":
+		return config.MCP.MaxProtocolErrors
+	case "mcp.default_timeout_ms":
+		return config.MCP.DefaultTimeoutMS
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0

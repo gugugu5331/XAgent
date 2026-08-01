@@ -90,12 +90,15 @@ type ContextConfig struct {
 }
 
 type InstructionsConfig struct {
-	Enabled         *bool  `yaml:"enabled"`
-	ProjectFile     string `yaml:"project_file"`
-	ProjectDir      string `yaml:"project_dir"`
-	UserDir         string `yaml:"user_dir"`
-	MaxIncludeDepth int    `yaml:"max_include_depth"`
-	MaxFileBytes    int64  `yaml:"max_file_bytes"`
+	Enabled          *bool  `yaml:"enabled"`
+	ProjectFile      string `yaml:"project_file"`
+	ProjectDir       string `yaml:"project_dir"`
+	UserDir          string `yaml:"user_dir"`
+	MaxIncludeDepth  int    `yaml:"max_include_depth"`
+	MaxFileBytes     int64  `yaml:"max_file_bytes"`
+	MaxTotalBytes    int64  `yaml:"-"`
+	MaxFiles         int64  `yaml:"-"`
+	MaxExpandedBytes int64  `yaml:"-"`
 }
 
 type SessionConfig struct {
