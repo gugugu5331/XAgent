@@ -3,6 +3,8 @@ package permission
 import (
 	"path/filepath"
 	"strings"
+
+	"xagent/internal/redact"
 )
 
 type UserAction string
@@ -23,6 +25,7 @@ type Authorizer struct {
 	LoadErrors []LoadError
 	Health     *Health
 	Writer     Writer
+	Redact     func(string) string
 }
 
 func (a *Authorizer) Decide(call Call, context Context) Decision {
@@ -93,7 +96,11 @@ func (a *Authorizer) DecideOrdinary(normalized NormalizedCall, context Context) 
 			return decision
 		}
 	}
-	return DecideByMode(context.Mode, normalized)
+	decision := DecideByMode(context.Mode, normalized)
+	if decision.Prompt != nil {
+		decision.Prompt = newConfirmationPrompt(normalized, decision.Prompt.Mode, decision.Prompt.Reason, a.redactText)
+	}
+	return decision
 }
 
 func (a *Authorizer) ResolveUserDecision(call Call, context Context, action UserAction) Decision {
@@ -122,7 +129,7 @@ func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, _ 
 		decision.Rule = &rule
 		return decision
 	case ActionAllowPermanent:
-		if !canAllowPermanent(normalized) {
+		if !a.canAllowPermanent(normalized) {
 			return deny(call, ReasonUserDenied, Source{Kind: SourceUserDecision, Description: "permanent allow disabled"}, "该工具调用不允许永久授权", "Permanent permission is not available for this tool call.")
 		}
 		rule := a.Writer.PreviewRule(normalized)
@@ -181,27 +188,41 @@ func allow(normalized NormalizedCall, scope GrantScope, source Source) Decision 
 }
 
 func ask(normalized NormalizedCall, mode Mode, reason string) Decision {
-	risk := RiskMedium
-	allowPermanent := canAllowPermanent(normalized)
-	if normalized.Call.Name == "Bash" && normalized.ComplexShell {
-		risk = RiskHigh
-	}
-	rule := Rule{Tool: normalized.Call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow)}
+	prompt := newConfirmationPrompt(normalized, mode, reason, redact.Text)
 	return Decision{
 		Kind:        DecisionAsk,
 		Source:      Source{Kind: SourceNone, Description: reason},
 		Recoverable: true,
-		Prompt: &ConfirmationPrompt{
-			Tool:           normalized.Call.Name,
-			Risk:           risk,
-			Summary:        normalized.RuleValue,
-			Target:         normalized.OriginalPath,
-			Reason:         reason,
-			Mode:           mode,
-			RulePreview:    &rule,
-			AllowPermanent: allowPermanent,
-		},
+		Prompt:      prompt,
 	}
+}
+
+func newConfirmationPrompt(normalized NormalizedCall, mode Mode, reason string, redactText func(string) string) *ConfirmationPrompt {
+	risk := RiskMedium
+	if normalized.Call.Name == "Bash" && normalized.ComplexShell {
+		risk = RiskHigh
+	}
+	allowPermanent := canAllowPermanentWith(normalized, redactText)
+	prompt := &ConfirmationPrompt{
+		Tool:           normalized.Call.Name,
+		Risk:           risk,
+		Summary:        safeConfirmationText(redactText, normalized.RuleValue),
+		Target:         safeConfirmationText(redactText, confirmationTarget(normalized)),
+		Reason:         reason,
+		Mode:           mode,
+		AllowPermanent: allowPermanent,
+		Scopes:         confirmationScopes(allowPermanent),
+		RevokeHint:     "One-time permission expires after this call; session permission expires when the session ends.",
+	}
+	if allowPermanent {
+		rule := Rule{Tool: normalized.Call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow)}
+		prompt.RulePreview = &rule
+		prompt.RuleLocation = localRuleSlot
+		prompt.RevokeHint += " Remove the matching rule from " + localRuleSlot + " to revoke permanent permission."
+	} else {
+		prompt.RevokeHint += " Permanent permission is unavailable for this call."
+	}
+	return prompt
 }
 
 func deny(call Call, reason DenyReason, source Source, userMessage string, modelMessage string) Decision {
@@ -217,13 +238,86 @@ func containsPath(value string, path string) bool {
 }
 
 func canAllowPermanent(normalized NormalizedCall) bool {
+	return canAllowPermanentWith(normalized, redact.Text)
+}
+
+func (a *Authorizer) canAllowPermanent(normalized NormalizedCall) bool {
+	if a == nil {
+		return canAllowPermanent(normalized)
+	}
+	return canAllowPermanentWith(normalized, a.redactText)
+}
+
+func canAllowPermanentWith(normalized NormalizedCall, redactText func(string) string) bool {
+	rule := Rule{Tool: normalized.Call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow)}
+	return rule.ValidatePermanent() == nil && !normalizedContainsSecret(normalized, redactText)
+}
+
+func (a *Authorizer) redactText(value string) string {
+	if a == nil || a.Redact == nil {
+		return redact.Text(value)
+	}
+	return a.Redact(value)
+}
+
+func safeConfirmationText(redactText func(string) string, value string) string {
+	if redactText == nil {
+		return redact.Text(value)
+	}
+	return redactText(value)
+}
+
+func confirmationTarget(normalized NormalizedCall) string {
+	if normalized.OriginalPath != "" {
+		return normalized.OriginalPath
+	}
+	if normalized.Call.Name == "Bash" {
+		return normalized.RawCommand
+	}
 	if strings.HasPrefix(normalized.Call.Name, "mcp__") {
-		return false
+		return normalized.Call.Name + " " + normalized.Call.ArgumentsJSON
 	}
-	if ruleContainsSecret(Rule{Tool: normalized.Call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow)}) {
-		return false
+	return normalized.RuleValue
+}
+
+func confirmationScopes(permanent bool) []ConfirmationScope {
+	return []ConfirmationScope{
+		{Scope: GrantOnce, Available: true, Description: "Allow only this call; the permission expires immediately after use."},
+		{Scope: GrantSession, Available: true, Description: "Allow the same minimal rule until the current session ends."},
+		{Scope: GrantPermanent, Available: permanent, Description: "Save the same minimal rule in the local permission file until explicitly removed."},
 	}
-	return !(normalized.Call.Name == "Bash" && normalized.ComplexShell)
+}
+
+func normalizedContainsSecret(normalized NormalizedCall, redactText func(string) string) bool {
+	for _, value := range []string{normalized.Call.ArgumentsJSON, normalized.RawCommand, normalized.OriginalPath, normalized.RuleValue} {
+		if value != "" && safeConfirmationText(redactText, value) != value {
+			return true
+		}
+	}
+	return permissionValueContainsSecret(normalized.Arguments, redactText)
+}
+
+func permissionValueContainsSecret(value any, redactText func(string) string) bool {
+	switch typed := value.(type) {
+	case string:
+		return safeConfirmationText(redactText, typed) != typed
+	case map[string]any:
+		for key, item := range typed {
+			if redact.IsSensitiveKey(key) {
+				return true
+			}
+			if permissionValueContainsSecret(item, redactText) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if permissionValueContainsSecret(item, redactText) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (a *Authorizer) permissionHealthDegraded() bool {

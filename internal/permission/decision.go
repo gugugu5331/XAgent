@@ -81,6 +81,15 @@ type ConfirmationPrompt struct {
 	Source         Source
 	RulePreview    *Rule
 	AllowPermanent bool
+	Scopes         []ConfirmationScope
+	RuleLocation   string
+	RevokeHint     string
+}
+
+type ConfirmationScope struct {
+	Scope       GrantScope `json:"scope"`
+	Available   bool       `json:"available"`
+	Description string     `json:"description"`
 }
 
 type RiskLevel string

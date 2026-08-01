@@ -8,8 +8,80 @@ import (
 	"strings"
 	"testing"
 
+	"xagent/internal/redact"
 	"xagent/internal/safefs"
 )
+
+func TestConfirmationExplainsScopeWithoutLeakingSecret(t *testing.T) {
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	canary := "runtime-redaction-placeholder"
+	runtimeRedactor.RegisterSecret(canary)
+	authorizer := Authorizer{Redact: runtimeRedactor.Text}
+
+	t.Run("safe permanent scope", func(t *testing.T) {
+		root := t.TempDir()
+		call := Call{ID: "safe", Name: "Write", ArgumentsJSON: `{"path":"deploy/config.yaml","content":"enabled: true"}`}
+		decision := authorizer.Decide(call, Context{ProjectRoot: root, Mode: ModeDefault})
+		prompt := decision.Prompt
+		if decision.Kind != DecisionAsk || prompt == nil {
+			t.Fatalf("safe write decision = %#v, want confirmation", decision)
+		}
+		if prompt.Target != "deploy/config.yaml" || prompt.Risk == "" {
+			t.Fatalf("confirmation omitted target or risk: %#v", prompt)
+		}
+		assertConfirmationScopes(t, prompt, true)
+		if prompt.RulePreview == nil || prompt.RuleLocation != localRuleSlot || !strings.Contains(prompt.RevokeHint, localRuleSlot) {
+			t.Fatalf("confirmation omitted rule location or revocation: %#v", prompt)
+		}
+	})
+
+	t.Run("registered secret", func(t *testing.T) {
+		root := t.TempDir()
+		call := Call{ID: "secret", Name: "Bash", ArgumentsJSON: `{"command":"deploy --credential-value ` + canary + ` production"}`}
+		decision := authorizer.Decide(call, Context{ProjectRoot: root, Mode: ModeDefault})
+		prompt := decision.Prompt
+		if decision.Kind != DecisionAsk || prompt == nil {
+			t.Fatalf("secret-bearing command decision = %#v, want confirmation", decision)
+		}
+		assertConfirmationScopes(t, prompt, false)
+		if prompt.AllowPermanent || prompt.RulePreview != nil || prompt.RuleLocation != "" {
+			t.Fatalf("secret-bearing confirmation exposed permanent scope: %#v", prompt)
+		}
+		encoded, err := json.Marshal(ConfirmationResultData(decision))
+		if err != nil {
+			t.Fatal("marshal confirmation result failed")
+		}
+		if strings.Contains(string(encoded), canary) || strings.Contains(prompt.Target, canary) || strings.Contains(prompt.Summary, canary) {
+			t.Fatalf("confirmation leaked registered secret: %s", encoded)
+		}
+		if !strings.Contains(prompt.Target, "[redacted]") {
+			t.Fatalf("confirmation target did not expose safe redaction marker: %q", prompt.Target)
+		}
+		resolved := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent)
+		if resolved.Kind != DecisionDeny {
+			t.Fatalf("registered secret received permanent permission: %#v", resolved)
+		}
+	})
+}
+
+func assertConfirmationScopes(t *testing.T, prompt *ConfirmationPrompt, permanent bool) {
+	t.Helper()
+	if len(prompt.Scopes) != 3 {
+		t.Fatalf("confirmation scopes = %#v, want once/session/permanent", prompt.Scopes)
+	}
+	want := []GrantScope{GrantOnce, GrantSession, GrantPermanent}
+	for index, scope := range prompt.Scopes {
+		if scope.Scope != want[index] || scope.Description == "" {
+			t.Fatalf("confirmation scope %d = %#v", index, scope)
+		}
+		if scope.Scope == GrantPermanent && scope.Available != permanent {
+			t.Fatalf("permanent scope availability = %v, want %v", scope.Available, permanent)
+		}
+	}
+	if prompt.RevokeHint == "" {
+		t.Fatal("confirmation omitted revocation guidance")
+	}
+}
 
 func TestBashExactDoesNotMatchCompoundCommand(t *testing.T) {
 	call := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"git status && rm -rf ."}`}

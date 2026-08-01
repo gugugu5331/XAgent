@@ -96,6 +96,14 @@ func NewWithToolsAndContext(provider provider.Provider, store conversation.Conve
 }
 
 func NewWithOptions(options OrchestratorOptions) *Orchestrator {
+	redactor := options.Redact
+	if redactor == nil {
+		redactor = redact.Text
+	}
+	lookbehind := options.RedactionLookbehind
+	if lookbehind < 64 {
+		lookbehind = 64
+	}
 	var readOnlyRegistry *tool.Registry
 	var authorizer *permission.Authorizer
 	if options.Executor != nil {
@@ -108,17 +116,10 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 			Local:      loaded.Local,
 			LoadErrors: loaded.Errors,
 			Writer:     permission.Writer{},
+			Redact:     redactor,
 		}
 	}
 	runOptions := runOptionsFromConfig(options.Agent)
-	redactor := options.Redact
-	if redactor == nil {
-		redactor = redact.Text
-	}
-	lookbehind := options.RedactionLookbehind
-	if lookbehind < 64 {
-		lookbehind = 64
-	}
 	hooks := options.Hooks
 	if hooks == nil {
 		hooks = hook.Noop()
