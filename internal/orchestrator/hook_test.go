@@ -324,7 +324,7 @@ LINT {{args}}
 		}
 	})
 
-	t.Run("handler validation error has after", func(t *testing.T) {
+	t.Run("schema validation stops before hooks", func(t *testing.T) {
 		script := [][]provider.StreamEvent{
 			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "load-invalid", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":42}`}}},
 			{{Type: provider.StreamEventTextDelta, Delta: "recovered"}, {Type: provider.StreamEventDone}},
@@ -342,11 +342,8 @@ LINT {{args}}
 			}
 		}
 		before, after := hooks.counts()
-		if before != 1 || after != 1 || len(activity.Snapshot().Active) != 0 {
-			t.Fatalf("load_skill handler boundary failed: before=%d after=%d active=%#v", before, after, activity.Snapshot().Active)
-		}
-		if hooks.after[0].Status != hook.ToolErrorStatus {
-			t.Fatalf("unexpected load_skill after status: %#v", hooks.after[0])
+		if before != 0 || after != 0 || len(activity.Snapshot().Active) != 0 {
+			t.Fatalf("load_skill schema boundary failed: before=%d after=%d active=%#v", before, after, activity.Snapshot().Active)
 		}
 		var found bool
 		for _, message := range conv.Messages {

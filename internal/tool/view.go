@@ -28,7 +28,7 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 		}
 	}
 
-	view := &Registry{tools: make(map[string]Tool), immutable: true}
+	view := &Registry{tools: make(map[string]Tool), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), immutable: true}
 	always := make(map[string]struct{}, len(options.AlwaysInclude))
 	for _, name := range options.AlwaysInclude {
 		always[name] = struct{}{}
@@ -38,6 +38,10 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 			return
 		}
 		view.tools[name] = r.tools[name]
+		view.executors[name] = r.executors[name]
+		if descriptor, ok := r.descriptors[name]; ok {
+			view.descriptors[name] = cloneDescriptor(descriptor)
+		}
 		view.order = append(view.order, name)
 	}
 	for _, name := range r.order {
@@ -50,8 +54,11 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 				continue
 			}
 		}
-		if options.ReadOnly && !isReadOnlyToolName(name) {
-			continue
+		if options.ReadOnly {
+			descriptor, ok := r.descriptors[name]
+			if !ok || !descriptor.Policy.ReadOnly {
+				continue
+			}
 		}
 		if registered != nil {
 			add(name)
@@ -61,8 +68,4 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 		add(name)
 	}
 	return view, nil
-}
-
-func isReadOnlyToolName(name string) bool {
-	return name == "Read" || name == "Glob" || name == "Grep"
 }

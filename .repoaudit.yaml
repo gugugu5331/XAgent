@@ -50,7 +50,7 @@ fixture_exemptions:
     content_sha256: 344056f18a2ae5826c0486e1f6bb85517071c79ce59ea8710c3c61c97e3f8d46
   - path: internal/orchestrator/hook_test.go
     rule_id: secret
-    content_sha256: 77ab6c9a9ef1939f6280704fd4815eb8b25f86f28b826b16974470c8d8c4f720
+    content_sha256: 555fc133be4321a2e35a973ed2d2d190c0da150fd54ad6febcb24e7ccf1dc6c0
   - path: internal/provider/factory_test.go
     rule_id: secret
     content_sha256: 25438cf86ed31e52fa87a38ce52eeb78969311479f3494c130097ed8f4338856
