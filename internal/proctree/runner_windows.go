@@ -37,9 +37,7 @@ type windowsOwnedPipes struct {
 }
 
 func newWindowsRunner(options Options) (*windowsRunner, error) {
-	return newWindowsRunnerWithProtection(options, createWindowsSuspendedProcess, func(Request, windows.Handle) error {
-		return errors.New("proctree Windows protection is unavailable")
-	})
+	return newWindowsRunnerWithProtection(options, createWindowsProtectedSuspendedProcess, verifyWindowsProtectedProcess)
 }
 
 func newWindowsRunnerWithProtection(options Options, create windowsProcessCreator, protect windowsProcessProtector) (*windowsRunner, error) {
@@ -189,6 +187,10 @@ func (p windowsOwnedPipes) closeParent() {
 }
 
 func createWindowsSuspendedProcess(request Request, handles windowsChildHandles) (windows.ProcessInformation, error) {
+	return createWindowsSuspendedProcessWithToken(request, handles, 0)
+}
+
+func createWindowsSuspendedProcessWithToken(request Request, handles windowsChildHandles, token windows.Token) (windows.ProcessInformation, error) {
 	executable, err := windows.UTF16PtrFromString(request.Executable)
 	if err != nil {
 		return windows.ProcessInformation{}, errors.New("proctree Windows executable is invalid")
@@ -221,9 +223,14 @@ func createWindowsSuspendedProcess(request Request, handles windowsChildHandles)
 		ProcThreadAttributeList: attributeList.List(),
 	}
 	var info windows.ProcessInformation
-	err = windows.CreateProcess(executable, commandLine, nil, nil, true,
-		windows.CREATE_SUSPENDED|windows.CREATE_UNICODE_ENVIRONMENT|windows.EXTENDED_STARTUPINFO_PRESENT,
-		&environment[0], nil, &startup.StartupInfo, &info)
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
+	if token == 0 {
+		err = windows.CreateProcess(executable, commandLine, nil, nil, true, flags,
+			&environment[0], nil, &startup.StartupInfo, &info)
+	} else {
+		err = windows.CreateProcessAsUser(token, executable, commandLine, nil, nil, true, flags,
+			&environment[0], nil, &startup.StartupInfo, &info)
+	}
 	if err != nil {
 		return windows.ProcessInformation{}, errors.New("proctree Windows suspended process creation failed")
 	}

@@ -117,7 +117,11 @@ func testWindowsRunnerRejectsUnprotectedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal("resolve Windows rejected helper failed")
 	}
-	runner, err := newWindowsRunner(Options{CleanupTimeout: time.Second, Diagnostics: &recordingSink{}})
+	runner, err := newWindowsRunnerWithProtection(
+		Options{CleanupTimeout: time.Second, Diagnostics: &recordingSink{}},
+		createWindowsSuspendedProcess,
+		func(Request, windows.Handle) error { return errors.New("injected Windows protection failure") },
+	)
 	if err != nil {
 		t.Fatal("create default Windows runner failed")
 	}
