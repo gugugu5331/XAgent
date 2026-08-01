@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"go/build/constraint"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"xagent/internal/budget"
@@ -395,6 +397,38 @@ func TestWalkBudgetAndErrors(t *testing.T) {
 			t.Fatalf("walk silently skipped a directory that changed after observation: err=%v visits=%d", err, visits)
 		}
 	})
+}
+
+func TestUnsupportedBuildTagExcludesSupportedPlatformsAndRejects(t *testing.T) {
+	source, err := os.ReadFile("root_unsupported.go")
+	if err != nil {
+		t.Fatal("read unsupported safefs implementation failed")
+	}
+	lines := strings.Split(string(source), "\n")
+	if len(lines) == 0 {
+		t.Fatal("unsupported safefs implementation was empty")
+	}
+	expression, err := constraint.Parse(lines[0])
+	if err != nil {
+		t.Fatal("unsupported safefs build constraint was invalid")
+	}
+	evaluate := func(goos string) bool {
+		return expression.Eval(func(tag string) bool { return tag == goos })
+	}
+	for _, supported := range []string{"darwin", "linux", "windows"} {
+		if evaluate(supported) {
+			t.Fatal("unsupported safefs implementation included a supported platform")
+		}
+	}
+	for _, unsupported := range []string{"freebsd", "openbsd"} {
+		if !evaluate(unsupported) {
+			t.Fatal("unsupported safefs implementation omitted a rejected platform")
+		}
+	}
+	text := string(source)
+	if strings.Contains(text, "return nil, nil") || strings.Count(text, "errors.New") < 2 {
+		t.Fatal("unsupported safefs implementation contains a successful fallback")
+	}
 }
 
 func newWalkCounter(t *testing.T, files, directories int64) *budget.Counter {
