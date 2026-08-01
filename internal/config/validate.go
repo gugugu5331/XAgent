@@ -320,24 +320,36 @@ func expandMapValues(values map[string]string, redactValue bool) error {
 var envPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func expandConfigValue(value string) (string, error) {
+	expanded, _, err := expandConfigValueDetailed(value)
+	return expanded, err
+}
+
+type configEnvironmentExpansion struct {
+	name  string
+	value string
+}
+
+func expandConfigValueDetailed(value string) (string, []configEnvironmentExpansion, error) {
 	placeholder := "\x00XAGENT_LITERAL_ENV\x00"
 	value = strings.ReplaceAll(value, `$${`, placeholder+`{`)
 	var missing string
+	expansions := make([]configEnvironmentExpansion, 0)
 	expanded := envPattern.ReplaceAllStringFunc(value, func(match string) string {
 		parts := envPattern.FindStringSubmatch(match)
 		if len(parts) != 2 {
 			return match
 		}
 		if env, ok := os.LookupEnv(parts[1]); ok {
+			expansions = append(expansions, configEnvironmentExpansion{name: parts[1], value: env})
 			return env
 		}
 		missing = parts[1]
 		return ""
 	})
 	if missing != "" {
-		return "", fmt.Errorf("环境变量 %s 未定义", missing)
+		return "", nil, fmt.Errorf("环境变量 %s 未定义", missing)
 	}
-	return strings.ReplaceAll(expanded, placeholder+`{`, `${`), nil
+	return strings.ReplaceAll(expanded, placeholder+`{`, `${`), expansions, nil
 }
 
 func isSensitiveKey(key string) bool {

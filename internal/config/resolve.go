@@ -3,6 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
+
+	"xagent/internal/redact"
 )
 
 // appConfigNumericManifest is the closed set of numeric values owned by the
@@ -178,7 +181,6 @@ func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 }
 
 func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error) {
-	_ = options
 	var config AppConfig
 	if err := resolveToolArtifactFiles(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
@@ -195,11 +197,102 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 	if err := resolveMemoryDiagnosticsLifecycle(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
+	if err := resolveEffectiveExpandedSecrets(&config, result.Value, options.Redactor); err != nil {
+		return LoadedConfig{}, err
+	}
 	provenance := make(map[string]ConfigSource, len(result.Provenance))
 	for path, source := range result.Provenance {
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveEffectiveExpandedSecrets(config *AppConfig, partial PartialAppConfig, runtimeRedactor *redact.RuntimeRedactor) error {
+	secrets := make([]string, 0)
+	expand := func(path string, key string, value string) (string, error) {
+		expanded, expansions, err := expandConfigValueDetailed(value)
+		if err != nil {
+			return "", fmt.Errorf("config field %q: %w", path, err)
+		}
+		fieldSensitive := redact.IsSensitiveKey(key)
+		if fieldSensitive && expanded != "" {
+			secrets = append(secrets, expanded)
+		}
+		for _, expansion := range expansions {
+			if expansion.value != "" && (fieldSensitive || redact.IsSensitiveKey(expansion.name)) {
+				secrets = append(secrets, expansion.value)
+			}
+		}
+		return expanded, nil
+	}
+
+	apiKey, err := expand("llm.api_key", "api_key", partial.LLM.APIKey.Value)
+	if err != nil {
+		return err
+	}
+	config.LLM.APIKey = apiKey
+
+	serverNames := make([]string, 0, len(config.MCP.Servers))
+	for name := range config.MCP.Servers {
+		serverNames = append(serverNames, name)
+	}
+	sort.Strings(serverNames)
+	for _, name := range serverNames {
+		server := config.MCP.Servers[name]
+		if server.Disabled {
+			continue
+		}
+		prefix := joinConfigPath("mcp.servers", name)
+		server.Command, err = expand(joinConfigPath(prefix, "command"), "command", server.Command)
+		if err != nil {
+			return err
+		}
+		for index, argument := range server.Args {
+			server.Args[index], err = expand(fmt.Sprintf("%s.args[%d]", prefix, index), "args", argument)
+			if err != nil {
+				return err
+			}
+		}
+		if err := expandEffectiveStringMap(prefix, "env", server.Env, expand); err != nil {
+			return err
+		}
+		server.URL, err = expand(joinConfigPath(prefix, "url"), "url", server.URL)
+		if err != nil {
+			return err
+		}
+		if err := expandEffectiveStringMap(prefix, "headers", server.Headers, expand); err != nil {
+			return err
+		}
+		config.MCP.Servers[name] = server
+	}
+
+	if runtimeRedactor != nil {
+		for _, secret := range secrets {
+			runtimeRedactor.RegisterSecret(secret)
+		}
+	}
+	return nil
+}
+
+func expandEffectiveStringMap(
+	prefix string,
+	field string,
+	values map[string]string,
+	expand func(path string, key string, value string) (string, error),
+) error {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		expanded, err := expand(joinConfigPath(joinConfigPath(prefix, field), key), key, values[key])
+		if err != nil {
+			return err
+		}
+		values[key] = expanded
+	}
+	return nil
 }
 
 func resolveMemoryDiagnosticsLifecycle(config *AppConfig, partial PartialAppConfig) error {

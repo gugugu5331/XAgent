@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"xagent/internal/redact"
 )
 
 var approvedAppConfigNumericKeys = []string{
@@ -627,6 +629,105 @@ func TestResolveErrorsContainOnlyPathAndAllowedRange(t *testing.T) {
 				t.Fatal("numeric error contains content beyond the path and allowed range")
 			}
 		})
+	}
+}
+
+func TestResolveRegistersOnlyEffectiveExpandedSecrets(t *testing.T) {
+	for name, value := range map[string]string{
+		"WINNER_API_KEY": "winner-api-canary",
+		"MCP_HOST":       "mcp.example.invalid",
+		"MCP_TOKEN":      "winner-header-canary",
+		"MCP_COMMAND":    "winner-command",
+		"MCP_ARG":        "winner-argument",
+		"SERVICE_SECRET": "winner-env-canary",
+		"LOSER_API_KEY":  "loser-api-canary",
+	} {
+		t.Setenv(name, value)
+	}
+	optionalString := func(value string) Optional[string] { return Optional[string]{Set: true, Value: value} }
+	optionalBool := func(value bool) Optional[bool] { return Optional[bool]{Set: true, Value: value} }
+	optionalStrings := func(value []string) Optional[[]string] { return Optional[[]string]{Set: true, Value: value} }
+	optionalMap := func(value map[string]string) Optional[map[string]string] {
+		return Optional[map[string]string]{Set: true, Value: value}
+	}
+
+	user := PartialAppConfig{
+		LLM: PartialLLMConfig{APIKey: optionalString("${LOSER_API_KEY}")},
+		MCP: PartialMCPConfig{Servers: map[string]PartialMCPServerConfig{
+			"remote": {
+				Type:    optionalString(MCPTransportHTTP),
+				URL:     optionalString("https://loser.invalid/mcp"),
+				Headers: optionalMap(map[string]string{"Authorization": "Bearer ${LOSER_MISSING}"}),
+			},
+		}},
+	}
+	project := PartialAppConfig{
+		LLM: PartialLLMConfig{APIKey: optionalString("${WINNER_API_KEY}")},
+		MCP: PartialMCPConfig{Servers: map[string]PartialMCPServerConfig{
+			"remote": {
+				Type:    optionalString(MCPTransportHTTP),
+				URL:     optionalString("https://${MCP_HOST}/mcp"),
+				Headers: optionalMap(map[string]string{"Authorization": "Bearer ${MCP_TOKEN}"}),
+			},
+			"local": {
+				Type:    optionalString(MCPTransportStdio),
+				Command: optionalString("${MCP_COMMAND}"),
+				Args:    optionalStrings([]string{"--value=${MCP_ARG}"}),
+				Env:     optionalMap(map[string]string{"SERVICE_SECRET": "${SERVICE_SECRET}"}),
+			},
+			"disabled": {
+				Disabled: optionalBool(true),
+				Type:     optionalString(MCPTransportHTTP),
+				URL:      optionalString("https://${DISABLED_MISSING}/mcp"),
+			},
+		}},
+	}
+	merged, err := MergeLayers(
+		ConfigLayer{Source: SourceUser, Value: user},
+		ConfigLayer{Source: SourceProject, Value: project},
+	)
+	if err != nil {
+		t.Fatal("merge effective secret fixtures failed")
+	}
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	loaded, err := ResolveConfig(merged, LoadOptions{Redactor: runtimeRedactor})
+	if err != nil {
+		t.Fatal("resolve effective expanded secrets failed")
+	}
+	if loaded.Config.LLM.APIKey != "winner-api-canary" ||
+		loaded.Config.MCP.Servers["remote"].URL != "https://mcp.example.invalid/mcp" ||
+		loaded.Config.MCP.Servers["remote"].Headers["Authorization"] != "Bearer winner-header-canary" ||
+		loaded.Config.MCP.Servers["local"].Command != "winner-command" ||
+		loaded.Config.MCP.Servers["local"].Args[0] != "--value=winner-argument" ||
+		loaded.Config.MCP.Servers["local"].Env["SERVICE_SECRET"] != "winner-env-canary" {
+		t.Fatal("effective environment references were not fully expanded")
+	}
+	for _, secret := range []string{"winner-api-canary", "winner-header-canary", "winner-env-canary"} {
+		if strings.Contains(runtimeRedactor.Text(secret), secret) {
+			t.Fatal("effective secret was not registered")
+		}
+	}
+	if runtimeRedactor.Text("loser-api-canary") != "loser-api-canary" {
+		t.Fatal("overridden secret was expanded or registered")
+	}
+
+	failing := PartialAppConfig{
+		LLM: PartialLLMConfig{APIKey: optionalString("literal-before-failure-canary")},
+		MCP: PartialMCPConfig{Servers: map[string]PartialMCPServerConfig{
+			"remote": {
+				Type:    optionalString(MCPTransportHTTP),
+				Headers: optionalMap(map[string]string{"Authorization": "Bearer ${EFFECTIVE_MISSING}"}),
+			},
+		}},
+	}
+	failingRedactor := redact.NewRuntimeRedactor()
+	_, err = ResolveConfig(MergeResult{Value: failing}, LoadOptions{Redactor: failingRedactor})
+	if err == nil || !strings.Contains(err.Error(), "mcp.servers.remote.headers.Authorization") ||
+		!strings.Contains(err.Error(), "EFFECTIVE_MISSING") || strings.Contains(err.Error(), "literal-before-failure-canary") {
+		t.Fatal("effective missing environment reference did not return a safe path error")
+	}
+	if failingRedactor.Text("literal-before-failure-canary") != "literal-before-failure-canary" {
+		t.Fatal("failed resolution partially registered a secret")
 	}
 }
 
