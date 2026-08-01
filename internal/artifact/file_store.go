@@ -172,7 +172,7 @@ func (s *fileStore) Begin(ctx context.Context, metadata Metadata) (Writer, error
 	if s.closed {
 		return nil, errors.New("artifact store is closed")
 	}
-	if err := os.MkdirAll(s.root, 0o700); err != nil {
+	if err := ensurePrivateArtifactRoot(s.root); err != nil {
 		return nil, errors.New("artifact store initialization failed")
 	}
 	id, err := newArtifactID()
@@ -180,7 +180,7 @@ func (s *fileStore) Begin(ctx context.Context, metadata Metadata) (Writer, error
 		return nil, errors.New("artifact identity creation failed")
 	}
 	staging := filepath.Join(s.root, "."+id+".staging")
-	file, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := createPrivateArtifactFile(staging)
 	if err != nil {
 		return nil, errors.New("artifact staging creation failed")
 	}
@@ -212,7 +212,7 @@ func (s *fileStore) OpenForUser(ctx context.Context, id string) (io.ReadCloser, 
 	if !ok || !record.ref.Available {
 		return nil, Ref{}, errors.New("artifact is unavailable")
 	}
-	file, err := os.Open(filepath.Join(root, id+".artifact"))
+	file, err := openPrivateArtifactFile(filepath.Join(root, id+".artifact"))
 	if err != nil {
 		return nil, Ref{}, errors.New("artifact is unavailable")
 	}

@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -160,6 +161,28 @@ func TestWriterHardLimitMarksIncomplete(t *testing.T) {
 	}
 	if store.totalBytes != 5 {
 		t.Fatal("store capacity accounting did not match accepted bytes")
+	}
+}
+
+func TestArtifactRefSerializationContainsNoPath(t *testing.T) {
+	store := newArtifactTestStore(t, 64, 128)
+	writer, err := store.Begin(context.Background(), Metadata{})
+	if err != nil {
+		t.Fatal("begin artifact failed")
+	}
+	if _, err := writer.Write([]byte("opaque")); err != nil {
+		t.Fatal("write artifact failed")
+	}
+	ref, err := writer.Commit(context.Background())
+	if err != nil {
+		t.Fatal("commit artifact failed")
+	}
+	encoded, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatal("serialize artifact ref failed")
+	}
+	if strings.Contains(string(encoded), store.root) || strings.Contains(string(encoded), filepath.Base(store.root)) || strings.Contains(string(encoded), ".artifact") || strings.Contains(string(encoded), ".staging") {
+		t.Fatal("artifact ref serialization contained a filesystem path")
 	}
 }
 
