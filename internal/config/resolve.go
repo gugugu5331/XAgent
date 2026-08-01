@@ -1,0 +1,70 @@
+package config
+
+// appConfigNumericManifest is the closed set of numeric values owned by the
+// AppConfig resolve stage. Compatibility inputs and numeric values owned by
+// Hook, Permission, Skill, or other loaders are deliberately absent.
+var appConfigNumericManifest = [...]string{
+	"tool.inline_output_bytes",
+	"tool.capture_bytes",
+	"tool.timeout_ms",
+	"artifact.max_file_bytes",
+	"artifact.max_total_bytes",
+	"artifact.retention_days",
+	"files.read_max_bytes",
+	"files.scan_max_bytes",
+	"files.scan_max_files",
+	"files.scan_max_directories",
+	"files.scan_max_lines",
+	"instructions.max_file_bytes",
+	"instructions.max_total_bytes",
+	"instructions.max_files",
+	"instructions.max_expanded_bytes",
+	"instructions.max_include_depth",
+	"mcp.max_response_bytes",
+	"mcp.max_tools",
+	"mcp.max_pages",
+	"mcp.max_protocol_errors",
+	"mcp.default_timeout_ms",
+	"mcp.servers.<name>.timeout_ms",
+	"llm.request_timeout_ms",
+	"llm.thinking.budget_tokens",
+	"llm.stream.max_response_bytes",
+	"llm.stream.max_event_bytes",
+	"llm.stream.max_events",
+	"llm.stream.max_text_bytes",
+	"llm.stream.max_thinking_bytes",
+	"llm.stream.max_tool_arguments_bytes",
+	"agent.max_iterations",
+	"agent.max_unknown_tool_calls",
+	"context.tool_result_threshold_chars",
+	"context.tool_results_threshold_chars",
+	"context.model_window_tokens",
+	"context.auto_margin_tokens",
+	"context.manual_margin_tokens",
+	"context.recent_keep_tokens",
+	"context.recent_keep_messages",
+	"context.summary_failure_limit",
+	"context.preview_chars",
+	"session.max_record_bytes",
+	"session.max_session_bytes",
+	"session.max_scan_files",
+	"session.max_scan_bytes",
+	"session.retention_days",
+	"session.gap_reminder_days",
+	"memory.max_index_lines",
+	"memory.max_index_bytes",
+	"memory.update_queue_size",
+	"memory.update_concurrency",
+	"memory.update_timeout_ms",
+	"memory.max_candidate_bytes",
+	"diagnostics.max_items",
+	"diagnostics.max_item_bytes",
+	"diagnostics.max_total_bytes",
+	"lifecycle.cleanup_timeout_ms",
+}
+
+func appConfigNumericKeys() []string {
+	result := make([]string, len(appConfigNumericManifest))
+	copy(result, appConfigNumericManifest[:])
+	return result
+}
