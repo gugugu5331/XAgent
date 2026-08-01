@@ -186,6 +186,112 @@ func TestArtifactRefSerializationContainsNoPath(t *testing.T) {
 	}
 }
 
+func TestCleanupHonorsRetentionCapacityAndActiveWriters(t *testing.T) {
+	store := newArtifactTestStore(t, 64, 64)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	now = now.Add(-48 * time.Hour)
+	expired := commitArtifact(t, store, "old")
+	now = now.Add(36 * time.Hour)
+	oldestRetained := commitArtifact(t, store, "12345")
+	now = now.Add(11 * time.Hour)
+	newestRetained := commitArtifact(t, store, "123456")
+	now = now.Add(-71 * time.Hour)
+	active, err := store.Begin(context.Background(), Metadata{})
+	if err != nil {
+		t.Fatal("begin active artifact failed")
+	}
+	if _, err := active.Write([]byte("active")); err != nil {
+		t.Fatal("write active artifact failed")
+	}
+	activeWriter := active.(*fileWriter)
+
+	now = time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	store.options.MaxTotalBytes = 12
+	result, err := store.Cleanup(context.Background())
+	if err != nil {
+		t.Fatal("artifact cleanup failed")
+	}
+	if result.Removed != 2 || result.ReclaimedBytes != 8 || result.Failed != 0 || store.totalBytes != 12 {
+		t.Fatal("cleanup did not deterministically apply retention and capacity")
+	}
+	for _, removed := range []Ref{expired, oldestRetained} {
+		if _, _, err := store.OpenForUser(context.Background(), removed.ID); err == nil {
+			t.Fatal("cleanup retained an expired or over-capacity artifact")
+		}
+	}
+	reader, opened, err := store.OpenForUser(context.Background(), newestRetained.ID)
+	if err != nil || opened != newestRetained {
+		t.Fatal("cleanup removed the newest retained artifact")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal("close retained artifact failed")
+	}
+	if _, err := os.Stat(activeWriter.stagingPath); err != nil {
+		t.Fatal("cleanup removed an active writer")
+	}
+
+	retainedPath := filepath.Join(store.root, newestRetained.ID+".artifact")
+	activePath := activeWriter.stagingPath
+	if err := store.Close(); err != nil {
+		t.Fatal("artifact store close failed")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal("repeated artifact store close changed the result")
+	}
+	if _, err := os.Stat(retainedPath); err != nil {
+		t.Fatal("store close deleted a confirmed artifact")
+	}
+	if _, err := os.Stat(activePath); err != nil {
+		t.Fatal("store close deleted an unconfirmed artifact")
+	}
+	if err := active.Abort(); err != nil {
+		t.Fatal("active writer could not abort after store close")
+	}
+
+	t.Run("bounded deletion failure", func(t *testing.T) {
+		failedStore := newArtifactTestStore(t, 64, 64)
+		failedNow := now.Add(-48 * time.Hour)
+		failedStore.now = func() time.Time { return failedNow }
+		ref := commitArtifact(t, failedStore, "failure")
+		path := filepath.Join(failedStore.root, ref.ID+".artifact")
+		if err := os.Remove(path); err != nil {
+			t.Fatal("remove cleanup failure fixture failed")
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal("create cleanup failure directory failed")
+		}
+		if err := os.WriteFile(filepath.Join(path, "child"), []byte("fixture"), 0o600); err != nil {
+			t.Fatal("create cleanup failure child failed")
+		}
+		failedNow = now
+		result, err := failedStore.Cleanup(context.Background())
+		if err == nil || result.Removed != 0 || result.ReclaimedBytes != 0 || result.Failed != 1 {
+			t.Fatal("cleanup failure did not return a bounded partial result")
+		}
+		if strings.Contains(err.Error(), failedStore.root) || strings.Contains(err.Error(), ref.ID) || len(err.Error()) > 64 {
+			t.Fatal("cleanup failure exposed private or unbounded detail")
+		}
+	})
+}
+
+func commitArtifact(t *testing.T, store *fileStore, payload string) Ref {
+	t.Helper()
+	writer, err := store.Begin(context.Background(), Metadata{})
+	if err != nil {
+		t.Fatal("begin cleanup artifact failed")
+	}
+	if _, err := writer.Write([]byte(payload)); err != nil {
+		t.Fatal("write cleanup artifact failed")
+	}
+	ref, err := writer.Commit(context.Background())
+	if err != nil {
+		t.Fatal("commit cleanup artifact failed")
+	}
+	return ref
+}
+
 func newArtifactTestStore(t *testing.T, maxFileBytes, maxTotalBytes int64) *fileStore {
 	t.Helper()
 	workspace := t.TempDir()

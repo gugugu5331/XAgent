@@ -17,9 +17,12 @@ import (
 	"xagent/internal/budget"
 )
 
-var errStoreUnavailable = errors.New("artifact store operation is unavailable")
-
 const artifactIDBytes = 32
+
+const (
+	defaultArtifactRetention = 7 * 24 * time.Hour
+	maxArtifactRetention     = 365 * 24 * time.Hour
+)
 
 type artifactRecord struct {
 	ref      Ref
@@ -44,6 +47,9 @@ func NewFileStore(options FileStoreOptions) (Store, error) {
 	root, workspace, err := validateStoreRoots(options.Root, options.WorkspaceRoot)
 	if err != nil {
 		return nil, err
+	}
+	if options.Retention == 0 {
+		options.Retention = defaultArtifactRetention
 	}
 	if err := validateStoreLimits(options); err != nil {
 		return nil, err
@@ -73,6 +79,9 @@ func validateStoreLimits(options FileStoreOptions) error {
 	}
 	if options.MaxFileBytes > options.MaxTotalBytes {
 		return errors.New("artifact file budget exceeds total budget")
+	}
+	if options.Retention < time.Nanosecond || options.Retention > maxArtifactRetention {
+		return errors.New("artifact retention is invalid")
 	}
 	return nil
 }
@@ -217,13 +226,6 @@ func (s *fileStore) OpenForUser(ctx context.Context, id string) (io.ReadCloser, 
 		return nil, Ref{}, errors.New("artifact is unavailable")
 	}
 	return file, record.ref, nil
-}
-
-func (s *fileStore) Cleanup(ctx context.Context) (CleanupResult, error) {
-	if err := s.available(ctx); err != nil {
-		return CleanupResult{}, err
-	}
-	return CleanupResult{}, errStoreUnavailable
 }
 
 func (s *fileStore) available(ctx context.Context) error {
