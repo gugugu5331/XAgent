@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -325,6 +326,121 @@ func TestCanonicalArgumentsAndBindingsAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestExecutorConsumesTicketAtStartBoundary(t *testing.T) {
+	registry := newEmptyRegistry()
+	recorder := &startBoundaryTool{name: "Recorder"}
+	if err := registry.Register(recorder); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(registry, t.TempDir(), time.Second, 1024)
+	call := Call{ID: "start-once", Name: "Recorder", ArgumentsJSON: `{}`}
+	validated, err := executor.PrepareCall(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := executor.CallIdentity(validated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.TicketVerifier = authority
+	ticket, err := authority.Issue(call.ID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket); result.Status != StatusSuccess {
+		t.Fatalf("authorized call did not start: %#v", result)
+	}
+	if result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket); result.Status != StatusDenied {
+		t.Fatalf("consumed ticket was reusable: %#v", result)
+	}
+	if calls := recorder.calls.Load(); calls != 1 {
+		t.Fatalf("tool crossed the start boundary %d times", calls)
+	}
+}
+
+func TestResourceReplacementInvalidatesTicket(t *testing.T) {
+	projectRoot := t.TempDir()
+	registry, err := NewRegistry(projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(registry, projectRoot, time.Second, 1024)
+	call := Call{ID: "replace", Name: "Write", ArgumentsJSON: `{"path":"target.txt","content":"authorized"}`}
+	validated, err := executor.PrepareCall(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := executor.CallIdentity(validated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.TicketVerifier = authority
+	ticket, err := authority.Issue(call.ID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "target.txt"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket)
+	if result.Status != StatusDenied {
+		t.Fatalf("stale resource ticket was accepted: %#v", result)
+	}
+	content, err := os.ReadFile(filepath.Join(projectRoot, "target.txt"))
+	if err != nil || string(content) != "replacement" {
+		t.Fatalf("stale ticket changed replacement: %q, %v", content, err)
+	}
+}
+
+func TestCancelBeforeStartHasNoResultOrSideEffect(t *testing.T) {
+	registry := newEmptyRegistry()
+	recorder := &startBoundaryTool{name: "Cancelable"}
+	if err := registry.Register(recorder); err != nil {
+		t.Fatal(err)
+	}
+	executor := NewExecutor(registry, t.TempDir(), time.Second, 1024)
+	call := Call{ID: "cancel-before-start", Name: "Cancelable", ArgumentsJSON: `{}`}
+	validated, err := executor.PrepareCall(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := executor.CallIdentity(validated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.TicketVerifier = authority
+	ticket, err := authority.Issue(call.ID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if result := executor.ExecuteValidatedAuthorized(canceled, validated, ticket); !reflect.DeepEqual(result, Result{}) {
+		t.Fatalf("cancellation before start produced a result: %#v", result)
+	}
+	if calls := recorder.calls.Load(); calls != 0 {
+		t.Fatalf("cancellation before start executed tool %d times", calls)
+	}
+	if result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket); result.Status != StatusSuccess {
+		t.Fatalf("pre-start cancellation consumed the ticket: %#v", result)
+	}
+}
+
 type registryBoundaryTool struct {
 	name        string
 	description string
@@ -341,3 +457,21 @@ func (t *registryBoundaryTool) Schema() Schema { return t.schema }
 func (t *registryBoundaryTool) Risk() Risk { return t.risk }
 
 func (*registryBoundaryTool) Execute(context.Context, Input) Result { return Result{} }
+
+type startBoundaryTool struct {
+	name  string
+	calls atomic.Int32
+}
+
+func (t *startBoundaryTool) Name() string { return t.name }
+
+func (*startBoundaryTool) Description() string { return "start boundary fixture" }
+
+func (*startBoundaryTool) Schema() Schema { return ObjectSchema(nil, nil) }
+
+func (*startBoundaryTool) Risk() Risk { return RiskDangerous }
+
+func (t *startBoundaryTool) Execute(_ context.Context, input Input) Result {
+	t.calls.Add(1)
+	return Success(input, "started", "", nil)
+}

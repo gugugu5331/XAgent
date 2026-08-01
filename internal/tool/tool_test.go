@@ -423,8 +423,8 @@ func TestExecuteValidatedAuthorizedPreservesArgumentsAndTicket(t *testing.T) {
 	if result.Status != StatusSuccess {
 		t.Fatalf("validated execution failed: %#v", result)
 	}
-	if validated.Arguments["observed"] != true {
-		t.Fatalf("tool did not receive the same arguments map: %#v", validated.Arguments)
+	if validated.Arguments["observed"] == true {
+		t.Fatalf("tool mutated the authorization snapshot: %#v", validated.Arguments)
 	}
 	if _, ok := recorder.last.Arguments["large"].(json.Number); !ok {
 		t.Fatalf("tool received lossy number: %#v", recorder.last.Arguments["large"])
@@ -452,29 +452,11 @@ func TestExecuteValidatedAuthorizedPreservesArgumentsAndTicket(t *testing.T) {
 
 func mustExecutorTicket(t *testing.T, ctx context.Context, executor *Executor, call Call) permission.ExecutionTicket {
 	t.Helper()
-	validated, err := executor.Registry.ValidateCall(call)
+	validated, err := executor.PrepareCall(ctx, call)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var readRoots []string
-	if scope, scopeErr := effectiveReadScope(ctx, executor.ProjectRoot); scopeErr == nil {
-		readRoots = scope.ExtraRoots
-	} else {
-		t.Fatal(scopeErr)
-	}
-	normalized, err := permission.NormalizeArguments(
-		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
-		validated.Arguments,
-		permission.Context{ProjectRoot: executor.ProjectRoot, ReadRoots: readRoots},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	canonical, err := json.Marshal(normalized.Arguments)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonical})
+	identity, err := executor.CallIdentity(validated)
 	if err != nil {
 		t.Fatal(err)
 	}

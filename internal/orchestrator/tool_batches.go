@@ -170,6 +170,12 @@ func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Contex
 	if err != nil {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, invalidToolArgumentsResult(call, err), out)
 	}
+	if call.Name != tool.LoadSkillToolName && o.executor != nil {
+		validated, err = o.executor.PrepareCall(ctx, call)
+		if err != nil {
+			return o.rejectPreparedTool(ctx, call, indexed.Index, invalidToolArgumentsResult(call, err), out)
+		}
+	}
 	if mode == RunModePlan && call.Name != tool.LoadSkillToolName && !isReadOnlyTool(call.Name) {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, planModeDecision(call)), out)
 	}
@@ -183,6 +189,9 @@ func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Contex
 		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
 	}
 	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonicalArguments})
+	if call.Name != tool.LoadSkillToolName && o.executor != nil {
+		identity, err = o.executor.CallIdentity(validated)
+	}
 	if err != nil {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
 	}

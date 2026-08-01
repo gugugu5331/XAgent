@@ -304,15 +304,13 @@ func TestReadScopeAuthorizerTicketMatchesExecutor(t *testing.T) {
 	}
 	call := Call{ID: "read-extra", Name: "Read", ArgumentsJSON: string(raw)}
 	permissionCall := permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
-	normalized, err := permission.NormalizeCallWithReadRoots(permissionCall, project, scope.ExtraRoots)
+	ctx := WithReadScope(context.Background(), scope)
+	executor := newScopedExecutor(t, project)
+	validated, err := executor.PrepareCall(ctx, call)
 	if err != nil {
 		t.Fatal(err)
 	}
-	canonical, err := json.Marshal(normalized.Arguments)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonical})
+	identity, err := executor.CallIdentity(validated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,8 +328,6 @@ func TestReadScopeAuthorizerTicketMatchesExecutor(t *testing.T) {
 		t.Fatalf("authorizer did not ticket extra-root Read: %#v", decision)
 	}
 
-	ctx := WithReadScope(context.Background(), scope)
-	executor := newScopedExecutor(t, project)
 	executor.TicketVerifier = authority
 	result := executor.ExecuteAuthorized(ctx, call, decision.Ticket)
 	if result.Status != StatusSuccess || result.Content != "fingerprint canary" {

@@ -2,14 +2,22 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"xagent/internal/permission"
+	"xagent/internal/safefs"
 )
 
 type Executor struct {
@@ -18,6 +26,13 @@ type Executor struct {
 	Timeout        time.Duration
 	MaxOutputBytes int
 	TicketVerifier permission.TicketVerifier
+
+	rootOnce sync.Once
+	root     *safefs.Root
+	rootErr  error
+
+	extraRootsMu sync.Mutex
+	extraRoots   map[string]*safefs.Root
 }
 
 func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, maxOutputBytes int) *Executor {
@@ -36,7 +51,7 @@ func (e *Executor) NeedsConfirmation(call Call) bool {
 }
 
 func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, ticket permission.ExecutionTicket) Result {
-	validated, err := e.Registry.ValidateCall(call)
+	validated, err := e.PrepareCall(ctx, call)
 	if err != nil {
 		return e.validationFailure(call, err)
 	}
@@ -47,42 +62,170 @@ func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, ticket perm
 // ticket before executing the already parsed call.
 func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated ValidatedCall, ticket permission.ExecutionTicket) Result {
 	call := validated.Call
-	registeredTool, ok := e.Registry.Get(call.Name)
-	if !ok {
-		return e.validationFailure(call, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name))
+	if ctx == nil || ctx.Err() != nil {
+		return Result{}
 	}
-	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.Arguments == nil {
+	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.Arguments == nil || len(validated.CanonicalArguments()) == 0 {
 		return e.validationFailure(call, fmt.Errorf("validated call is inconsistent"))
 	}
-	// Always execute the registry member, even if a caller manually assembled a
-	// ValidatedCall with another Tool implementation bearing the same name.
-	validated.Tool = registeredTool
-	var readRoots []string
-	if scope, scopeErr := effectiveReadScope(ctx, e.ProjectRoot); scopeErr == nil {
-		readRoots = scope.ExtraRoots
-	} else {
-		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool read scope is invalid for permission checking.", Recoverable: true})
-	}
-	normalized, err := permission.NormalizeArguments(
-		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
-		validated.Arguments,
-		permission.Context{ProjectRoot: e.ProjectRoot, ReadRoots: readRoots},
-	)
+
+	// Re-parse through the immutable Registry snapshot and re-bind live
+	// resources at the actual start boundary. The freshly prepared call is also
+	// the only value passed to the tool, so callers cannot mutate an authorized
+	// Arguments map into a different execution.
+	current, err := e.PrepareCall(ctx, call)
 	if err != nil {
-		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool resources are unavailable for execution.", Recoverable: true})
 	}
-	canonicalArguments, err := json.Marshal(normalized.Arguments)
+	identity, err := e.CallIdentity(current)
 	if err != nil {
-		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Execution ticket verification is unavailable.", Recoverable: true})
 	}
-	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonicalArguments})
-	if err != nil || e.TicketVerifier == nil {
+	if ctx.Err() != nil {
+		return Result{}
+	}
+	if e.TicketVerifier == nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Execution ticket verification is unavailable.", Recoverable: true})
 	}
 	if err := e.TicketVerifier.VerifyAndConsume(ticket, call.ID, identity); err != nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Execution ticket does not match this tool call.", Recoverable: true})
 	}
-	return e.executeValidated(ctx, validated)
+	if ctx.Err() != nil {
+		return Result{}
+	}
+	return e.executeValidated(ctx, current)
+}
+
+// PrepareCall validates a call and freezes its current filesystem bindings.
+// Authorizers must issue a ticket for CallIdentity of this exact value.
+func (e *Executor) PrepareCall(ctx context.Context, call Call) (ValidatedCall, error) {
+	if e == nil || e.Registry == nil {
+		return ValidatedCall{}, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name)
+	}
+	if !isFileToolName(call.Name) {
+		return e.Registry.ValidateCall(call)
+	}
+	rootPath, err := e.bindingRootPath(ctx, call)
+	if err != nil {
+		return ValidatedCall{}, err
+	}
+	root, err := e.openRootAt(rootPath)
+	if err != nil {
+		return ValidatedCall{}, err
+	}
+	return e.Registry.ValidateCallWithContext(call, ValidationContext{Root: root, ProjectRoot: rootPath})
+}
+
+// CallIdentity builds the authorization identity from execution semantics,
+// including the actual Bash shell/environment and frozen file/MCP bindings.
+func (e *Executor) CallIdentity(validated ValidatedCall) (permission.CallIdentity, error) {
+	if validated.Call.Name != "Bash" {
+		return permission.NewCallIdentity(validated.IdentityInput())
+	}
+	root, err := e.openRoot()
+	if err != nil {
+		return permission.CallIdentity{}, err
+	}
+	command, ok := validated.Arguments["command"].(string)
+	if !ok {
+		return permission.CallIdentity{}, errors.New("bash command is invalid")
+	}
+	return permission.NewBashIdentity(permission.BashIdentityInput{
+		Shell:             executionShell(),
+		WorkingDirectory:  root.Identity(),
+		RawCommand:        []byte(command),
+		EnvironmentDigest: executionEnvironmentDigest(os.Environ()),
+	})
+}
+
+func (e *Executor) openRoot() (*safefs.Root, error) {
+	if e == nil {
+		return nil, errors.New("executor is unavailable")
+	}
+	e.rootOnce.Do(func() {
+		opened, err := safefs.Bootstrap(e.ProjectRoot, safefs.Policy{})
+		if err != nil {
+			e.rootErr = errors.New("executor root is unavailable")
+			return
+		}
+		e.root = opened.Root
+	})
+	if e.rootErr != nil || e.root == nil {
+		return nil, errors.New("executor root is unavailable")
+	}
+	return e.root, nil
+}
+
+func (e *Executor) openRootAt(rootPath string) (*safefs.Root, error) {
+	if rootPath == e.ProjectRoot {
+		return e.openRoot()
+	}
+	e.extraRootsMu.Lock()
+	defer e.extraRootsMu.Unlock()
+	if root := e.extraRoots[rootPath]; root != nil {
+		return root, nil
+	}
+	opened, err := safefs.Bootstrap(rootPath, safefs.Policy{})
+	if err != nil {
+		return nil, errors.New("executor read root is unavailable")
+	}
+	if e.extraRoots == nil {
+		e.extraRoots = make(map[string]*safefs.Root)
+	}
+	e.extraRoots[rootPath] = opened.Root
+	return opened.Root, nil
+}
+
+func (e *Executor) bindingRootPath(ctx context.Context, call Call) (string, error) {
+	if call.Name != "Read" {
+		return e.ProjectRoot, nil
+	}
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(call.ArgumentsJSON), &arguments); err != nil {
+		return e.ProjectRoot, nil
+	}
+	path, _ := arguments["path"].(string)
+	resolvedPath := path
+	if filepath.IsAbs(path) {
+		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+			resolvedPath = filepath.Clean(resolved)
+		}
+	}
+	if !filepath.IsAbs(path) || isPathInsideRoot(e.ProjectRoot, resolvedPath) {
+		return e.ProjectRoot, nil
+	}
+	scope, err := effectiveReadScope(ctx, e.ProjectRoot)
+	if err != nil {
+		return "", errors.New("executor read scope is unavailable")
+	}
+	for _, root := range scope.ExtraRoots {
+		if isPathInsideRoot(root, resolvedPath) {
+			return root, nil
+		}
+	}
+	return "", errors.New("file tool path is outside the opened roots")
+}
+
+func executionShell() string {
+	if runtime.GOOS == "windows" {
+		return "cmd"
+	}
+	return "/bin/sh"
+}
+
+func executionEnvironmentDigest(environment []string) [32]byte {
+	values := append([]string(nil), environment...)
+	sort.Strings(values)
+	hash := sha256.New()
+	var length [8]byte
+	for _, value := range values {
+		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	var digest [32]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 func (e *Executor) Execute(ctx context.Context, call Call) Result {

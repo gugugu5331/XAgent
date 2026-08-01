@@ -186,6 +186,9 @@ func rootRelativeBindingPath(value, projectRoot string) (string, error) {
 		if projectRoot == "" || !filepath.IsAbs(projectRoot) {
 			return "", errors.New("absolute file tool path requires a project root")
 		}
+		if resolved, err := filepath.EvalSymlinks(value); err == nil {
+			value = filepath.Clean(resolved)
+		}
 		relative, err := filepath.Rel(projectRoot, value)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 			return "", errors.New("file tool path is outside the opened root")
