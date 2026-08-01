@@ -164,6 +164,120 @@ func TestExpandConfigValueSupportsLiteralEnvSyntax(t *testing.T) {
 	}
 }
 
+func TestMCPServersMergeByNameWithWholeEntryReplacement(t *testing.T) {
+	optionalString := func(value string) Optional[string] { return Optional[string]{Set: true, Value: value} }
+	optionalBool := func(value bool) Optional[bool] { return Optional[bool]{Set: true, Value: value} }
+	optionalInt := func(value int64) Optional[int64] { return Optional[int64]{Set: true, Value: value} }
+	optionalStrings := func(value []string) Optional[[]string] { return Optional[[]string]{Set: true, Value: value} }
+	optionalMap := func(value map[string]string) Optional[map[string]string] {
+		return Optional[map[string]string]{Set: true, Value: value}
+	}
+
+	projectHeaders := map[string]string{"Authorization": "project-token"}
+	user := PartialAppConfig{MCP: PartialMCPConfig{
+		DefaultTimeoutMS: optionalInt(1_111),
+		MaxResponseBytes: optionalInt(2 * mebibyte),
+		MaxPages:         optionalInt(10),
+		Servers: map[string]PartialMCPServerConfig{
+			"shared": {
+				Disabled:  optionalBool(true),
+				Type:      optionalString(MCPTransportStdio),
+				Command:   optionalString("user-command"),
+				Args:      optionalStrings([]string{"user-arg"}),
+				Env:       optionalMap(map[string]string{"USER_SECRET": "user-secret"}),
+				TimeoutMS: optionalInt(123),
+			},
+			"user-only": {Disabled: optionalBool(true)},
+		},
+	}}
+	project := PartialAppConfig{MCP: PartialMCPConfig{
+		MaxResponseBytes: optionalInt(3 * mebibyte),
+		MaxTools:         optionalInt(200),
+		Servers: map[string]PartialMCPServerConfig{
+			"shared": {
+				Disabled:  optionalBool(false),
+				Type:      optionalString(MCPTransportHTTP),
+				URL:       optionalString("https://project.invalid/mcp"),
+				Env:       optionalMap(map[string]string{"PROJECT_SECRET": "project-secret"}),
+				Headers:   optionalMap(projectHeaders),
+				TimeoutMS: optionalInt(222),
+			},
+			"project-only": {Disabled: optionalBool(true)},
+		},
+	}}
+	runtime := PartialAppConfig{MCP: PartialMCPConfig{
+		DefaultTimeoutMS:  optionalInt(444),
+		MaxProtocolErrors: optionalInt(9),
+	}}
+	merged, err := MergeLayers(
+		ConfigLayer{Source: SourceRuntime, Value: runtime},
+		ConfigLayer{Source: SourceProject, Value: project},
+		ConfigLayer{Source: SourceUser, Value: user},
+	)
+	if err != nil {
+		t.Fatal("merge MCP layers failed")
+	}
+	projectHeaders["Authorization"] = "mutated-after-merge"
+	loaded, err := ResolveConfig(merged, LoadOptions{})
+	if err != nil {
+		t.Fatal("resolve merged MCP config failed")
+	}
+	shared := loaded.Config.MCP.Servers["shared"]
+	if shared.Disabled || shared.Type != MCPTransportHTTP || shared.Command != "" || len(shared.Args) != 0 ||
+		shared.URL != "https://project.invalid/mcp" || shared.TimeoutMS != 222 ||
+		shared.Env["PROJECT_SECRET"] != "project-secret" || len(shared.Env) != 1 ||
+		shared.Headers["Authorization"] != "project-token" || shared.Source != string(SourceProject) {
+		t.Fatal("higher-priority MCP server did not wholly replace the lower entry")
+	}
+	if _, ok := loaded.Config.MCP.Servers["user-only"]; !ok {
+		t.Fatal("user-only MCP server was discarded")
+	}
+	if _, ok := loaded.Config.MCP.Servers["project-only"]; !ok {
+		t.Fatal("project-only MCP server was discarded")
+	}
+	if loaded.Config.MCP.DefaultTimeoutMS != 444 || loaded.Config.MCP.MaxResponseBytes != 3*mebibyte ||
+		loaded.Config.MCP.MaxTools != 200 || loaded.Config.MCP.MaxPages != 10 || loaded.Config.MCP.MaxProtocolErrors != 9 {
+		t.Fatal("MCP global budgets did not retain independent field precedence")
+	}
+
+	t.Run("legacy result owns nested values", func(t *testing.T) {
+		userArgs := []string{"user-arg"}
+		userEnv := map[string]string{"USER_SECRET": "user-secret"}
+		projectHeaders := map[string]string{"Authorization": "project-token"}
+		legacy := MergeMCPConfig(
+			MCPConfig{Servers: map[string]MCPServerConfig{"user-only": {Args: userArgs, Env: userEnv}}},
+			MCPConfig{Servers: map[string]MCPServerConfig{"shared": {Headers: projectHeaders}}},
+		)
+		userArgs[0] = "mutated"
+		userEnv["USER_SECRET"] = "mutated"
+		projectHeaders["Authorization"] = "mutated"
+		if legacy.Servers["user-only"].Args[0] != "user-arg" ||
+			legacy.Servers["user-only"].Env["USER_SECRET"] != "user-secret" ||
+			legacy.Servers["shared"].Headers["Authorization"] != "project-token" {
+			t.Fatal("legacy MCP merge result aliases an input layer")
+		}
+	})
+
+	for _, testCase := range []struct {
+		name    string
+		partial PartialAppConfig
+	}{
+		{
+			name: "disabled server explicit zero timeout",
+			partial: PartialAppConfig{MCP: PartialMCPConfig{Servers: map[string]PartialMCPServerConfig{
+				"disabled": {Disabled: optionalBool(true), TimeoutMS: optionalInt(0)},
+			}}},
+		},
+		{name: "explicit zero global budget", partial: PartialAppConfig{MCP: PartialMCPConfig{MaxTools: optionalInt(0)}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := ResolveConfig(MergeResult{Value: testCase.partial}, LoadOptions{}); err == nil {
+				t.Fatal("invalid MCP timeout or budget was accepted")
+			}
+		})
+	}
+}
+
 func validConfig(extra string) string {
 	return `llm:
   protocol: anthropic

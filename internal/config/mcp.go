@@ -38,6 +38,7 @@ type MCPDiagnostic struct {
 func MergeMCPConfig(user MCPConfig, project MCPConfig) MCPConfig {
 	merged := MCPConfig{DefaultTimeoutMS: user.DefaultTimeoutMS, Servers: map[string]MCPServerConfig{}}
 	for name, server := range user.Servers {
+		server = cloneMCPServerConfig(server)
 		server.Source = sourceOrDefault(server.Source, "user")
 		merged.Servers[name] = server
 	}
@@ -45,10 +46,18 @@ func MergeMCPConfig(user MCPConfig, project MCPConfig) MCPConfig {
 		merged.DefaultTimeoutMS = project.DefaultTimeoutMS
 	}
 	for name, server := range project.Servers {
+		server = cloneMCPServerConfig(server)
 		server.Source = sourceOrDefault(server.Source, "project")
 		merged.Servers[name] = server
 	}
 	return merged
+}
+
+func cloneMCPServerConfig(server MCPServerConfig) MCPServerConfig {
+	server.Args = append([]string(nil), server.Args...)
+	server.Env = cloneStringMap(server.Env)
+	server.Headers = cloneStringMap(server.Headers)
+	return server
 }
 
 func (c *MCPConfig) addDiagnostic(server string, source string, format string, args ...any) {
