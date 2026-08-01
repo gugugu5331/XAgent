@@ -1,7 +1,5 @@
 package permission
 
-import "time"
-
 type DecisionKind string
 
 const (
@@ -45,20 +43,12 @@ type Decision struct {
 	Reason       DenyReason
 	Source       Source
 	Rule         *Rule
-	Grant        *Grant
+	Ticket       ExecutionTicket
+	Scope        GrantScope
 	Prompt       *ConfirmationPrompt
 	UserMessage  string
 	ModelMessage string
 	Recoverable  bool
-}
-
-type Grant struct {
-	CallID      string
-	Tool        string
-	Scope       GrantScope
-	Source      Source
-	IssuedAt    time.Time
-	Fingerprint string
 }
 
 type GrantScope string
@@ -106,4 +96,5 @@ type Context struct {
 	Mode           Mode
 	PlanMode       bool
 	ConversationID string
+	Identity       CallIdentity
 }

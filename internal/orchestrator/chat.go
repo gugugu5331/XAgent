@@ -109,6 +109,8 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 	if options.Executor != nil {
 		readOnlyRegistry, _ = tool.NewReadOnlyRegistry(options.Executor.ProjectRoot)
 		loaded := permission.LoadRules(options.Executor.ProjectRoot)
+		authority, _ := permission.NewTicketAuthority()
+		options.Executor.TicketVerifier = authority
 		authorizer = &permission.Authorizer{
 			Session:    permission.NewSession(),
 			User:       loaded.User,
@@ -117,6 +119,7 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 			LoadErrors: loaded.Errors,
 			Writer:     permission.Writer{},
 			Redact:     redactor,
+			Issuer:     authority,
 		}
 	}
 	runOptions := runOptionsFromConfig(options.Agent)

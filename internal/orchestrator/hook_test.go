@@ -168,7 +168,7 @@ func TestValidatedCallFlowsEndToEnd(t *testing.T) {
 	out := make(chan events.Event, 8)
 	call := tool.Call{ID: "validated", Name: "Recorder", ArgumentsJSON: `{"large":9007199254740993123456789,"label":"same"}`}
 	execution := orch.prepareToolExecutionWithRegistryAndRef(context.Background(), RunModeDefault, registry, indexedToolCall{Call: call}, hook.ExecutionRef{ExecutionID: "e", TurnID: "t"}, out)
-	if execution.Result.CallID != "" || execution.Grant == nil {
+	if execution.Result.CallID != "" || !execution.Ticket.Issued() {
 		t.Fatalf("call was not prepared: %#v", execution)
 	}
 	execution = orch.executePreparedTool(context.Background(), execution, out)
@@ -667,15 +667,14 @@ func TestNoHookWireCompatibility(t *testing.T) {
 
 func TestNoHookToolChainCompatibility(t *testing.T) {
 	type toolLine struct {
-		name             string
-		validated        string
-		grantTool        string
-		grantScope       permission.GrantScope
-		grantSource      permission.SourceKind
-		grantFingerprint bool
-		status           tool.ResultStatus
-		content          string
-		events           []events.Type
+		name         string
+		validated    string
+		ticketScope  permission.GrantScope
+		ticketSource permission.SourceKind
+		ticketIssued bool
+		status       tool.ResultStatus
+		content      string
+		events       []events.Type
 	}
 	type snapshot struct {
 		lines             []toolLine
@@ -761,8 +760,8 @@ func TestNoHookToolChainCompatibility(t *testing.T) {
 					}
 				}
 			}
-			if execution.Result.CallID != "" || execution.Grant == nil {
-				t.Fatalf("%s %s permission decision did not allow with a Grant: %#v", runtimeName, call.Name, execution)
+			if execution.Result.CallID != "" || !execution.Ticket.Issued() {
+				t.Fatalf("%s %s permission decision did not allow with a ticket: %#v", runtimeName, call.Name, execution)
 			}
 			execution = orch.executePreparedTool(context.Background(), execution, out)
 			if execution.Result.Status != tool.StatusSuccess {
@@ -773,9 +772,8 @@ func TestNoHookToolChainCompatibility(t *testing.T) {
 				t.Fatal(err)
 			}
 			line := toolLine{
-				name: call.Name, validated: string(validated), grantTool: execution.Grant.Tool,
-				grantScope: execution.Grant.Scope, grantSource: execution.Grant.Source.Kind,
-				grantFingerprint: execution.Grant.Fingerprint != "", status: execution.Result.Status,
+				name: call.Name, validated: string(validated), ticketScope: execution.Scope,
+				ticketSource: execution.Source.Kind, ticketIssued: execution.Ticket.Issued(), status: execution.Result.Status,
 				content: execution.Result.Content, events: permissionEvents,
 			}
 			for len(out) > 0 {
@@ -849,18 +847,18 @@ COMPAT ROUTE {{args}}
 	if baseline == nil || len(baseline.lines) != 2 || baseline.lines[0].name != "Read" || baseline.lines[0].content != "fixture payload" ||
 		baseline.lines[0].validated != `{"path":"fixture.txt"}` || baseline.lines[1].name != "mcp__fixture__echo" ||
 		baseline.lines[1].validated != `{"query":"same"}` || baseline.lines[1].content != "echo:same" ||
-		!baseline.lines[0].grantFingerprint || !baseline.lines[1].grantFingerprint || baseline.mcpCalls != 1 || baseline.mcpQuery != "same" ||
+		!baseline.lines[0].ticketIssued || !baseline.lines[1].ticketIssued || baseline.mcpCalls != 1 || baseline.mcpQuery != "same" ||
 		strings.Join(baseline.activeSkills, ",") != "compat" || baseline.loadResultStatus != string(tool.StatusSuccess) ||
 		!baseline.loadSystemRoute || strings.Join(baseline.loadTools, ",") != "Read,load_skill" || baseline.loadOrderedSystem != 0 ||
 		baseline.loadObserver || baseline.diagnostics != 0 {
 		t.Fatalf("legacy tool-chain golden changed: %#v", baseline)
 	}
 	readLine, mcpLine := baseline.lines[0], baseline.lines[1]
-	if readLine.grantTool != readLine.name || readLine.grantScope != permission.GrantMode || readLine.grantSource != permission.SourceMode ||
+	if readLine.ticketScope != permission.GrantMode || readLine.ticketSource != permission.SourceMode ||
 		readLine.status != tool.StatusSuccess || !reflect.DeepEqual(readLine.events, []events.Type{events.ToolPending, events.ToolRunning, events.ToolSuccess}) {
 		t.Fatalf("legacy built-in permission/event golden changed: %#v", readLine)
 	}
-	if mcpLine.grantTool != mcpLine.name || mcpLine.grantScope != permission.GrantOnce || mcpLine.grantSource != permission.SourceUserDecision ||
+	if mcpLine.ticketScope != permission.GrantOnce || mcpLine.ticketSource != permission.SourceUserDecision ||
 		mcpLine.status != tool.StatusSuccess || !reflect.DeepEqual(mcpLine.events, []events.Type{events.ToolPending, events.ToolWaitingConfirmation, events.ToolRunning, events.ToolSuccess}) {
 		t.Fatalf("legacy MCP permission/event golden changed: %#v", mcpLine)
 	}

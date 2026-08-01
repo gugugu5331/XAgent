@@ -46,6 +46,12 @@ type ExecutionTicket struct {
 	authenticator [32]byte
 }
 
+// Issued reports whether a ticket has the structural fields produced by a
+// TicketIssuer. It does not authenticate or consume the ticket.
+func (t ExecutionTicket) Issued() bool {
+	return t.version == executionTicketVersion && t.nonce != ([32]byte{}) && t.callID != "" && t.identity.version == callIdentityVersion
+}
+
 func (ExecutionTicket) MarshalJSON() ([]byte, error) {
 	return nil, errTicketSerialization
 }

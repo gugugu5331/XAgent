@@ -338,12 +338,14 @@ func TestExecutorBoundsEveryModelVisibleResultField(t *testing.T) {
 	}
 }
 
-func TestExecuteAuthorizedRejectsMismatchedGrant(t *testing.T) {
+func TestExecuteAuthorizedRejectsMismatchedTicket(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
 	executor := NewExecutor(registry, root, time.Second, 1024)
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
-	result := executor.ExecuteAuthorized(context.Background(), call, permission.Grant{CallID: "1", Tool: "Write", Fingerprint: "Write:other.txt", Scope: permission.GrantOnce})
+	other := Call{ID: call.ID, Name: call.Name, ArgumentsJSON: `{"path":"other.txt","content":"hello"}`}
+	ticket := mustExecutorTicket(t, context.Background(), executor, other)
+	result := executor.ExecuteAuthorized(context.Background(), call, ticket)
 	if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied {
 		t.Fatalf("expected permission denied, got %#v", result)
 	}
@@ -352,16 +354,13 @@ func TestExecuteAuthorizedRejectsMismatchedGrant(t *testing.T) {
 	}
 }
 
-func TestExecuteAuthorizedAllowsMatchingGrant(t *testing.T) {
+func TestExecuteAuthorizedAllowsMatchingTicket(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
 	executor := NewExecutor(registry, root, time.Second, 1024)
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
-	normalized, err := permission.NormalizeCall(permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := executor.ExecuteAuthorized(context.Background(), call, permission.Grant{CallID: "1", Tool: "Write", Fingerprint: permission.Fingerprint(normalized), Scope: permission.GrantOnce})
+	ticket := mustExecutorTicket(t, context.Background(), executor, call)
+	result := executor.ExecuteAuthorized(context.Background(), call, ticket)
 	if result.Status != StatusSuccess {
 		t.Fatalf("expected authorized write success, got %#v", result)
 	}
@@ -407,7 +406,7 @@ func TestRegistryValidateCall(t *testing.T) {
 	}
 }
 
-func TestExecuteValidatedAuthorizedPreservesArgumentsAndGrant(t *testing.T) {
+func TestExecuteValidatedAuthorizedPreservesArgumentsAndTicket(t *testing.T) {
 	registry := &Registry{tools: map[string]Tool{}}
 	recorder := &recordingTool{name: "Recorder", mutate: true}
 	if err := registry.Register(recorder); err != nil {
@@ -419,16 +418,8 @@ func TestExecuteValidatedAuthorizedPreservesArgumentsAndGrant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	normalized, err := permission.NormalizeArguments(
-		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
-		validated.Arguments,
-		permission.Context{ProjectRoot: executor.ProjectRoot},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grant := permission.Grant{CallID: call.ID, Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: permission.Fingerprint(normalized)}
-	result := executor.ExecuteValidatedAuthorized(context.Background(), validated, grant)
+	ticket := mustExecutorTicket(t, context.Background(), executor, call)
+	result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket)
 	if result.Status != StatusSuccess {
 		t.Fatalf("validated execution failed: %#v", result)
 	}
@@ -439,22 +430,90 @@ func TestExecuteValidatedAuthorizedPreservesArgumentsAndGrant(t *testing.T) {
 		t.Fatalf("tool received lossy number: %#v", recorder.last.Arguments["large"])
 	}
 
-	for name, badGrant := range map[string]permission.Grant{
-		"tool":        {CallID: call.ID, Tool: "Other", Scope: permission.GrantOnce, Fingerprint: grant.Fingerprint},
-		"call id":     {CallID: "other-call", Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: grant.Fingerprint},
-		"fingerprint": {CallID: call.ID, Tool: call.Name, Scope: permission.GrantOnce, Fingerprint: "wrong"},
+	for name, badCall := range map[string]Call{
+		"tool":      {ID: call.ID, Name: "Other", ArgumentsJSON: call.ArgumentsJSON},
+		"call id":   {ID: "other-call", Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
+		"arguments": {ID: call.ID, Name: call.Name, ArgumentsJSON: `{"large":1,"decimal":1.25}`},
 	} {
 		t.Run(name, func(t *testing.T) {
-			result := executor.ExecuteValidatedAuthorized(context.Background(), validated, badGrant)
+			badTicket := mustRawTicket(t, executor, badCall)
+			result := executor.ExecuteValidatedAuthorized(context.Background(), validated, badTicket)
 			if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied {
-				t.Fatalf("mismatched grant was not rejected: %#v", result)
+				t.Fatalf("mismatched ticket was not rejected: %#v", result)
 			}
 		})
 	}
-	compatibility := executor.ExecuteAuthorized(context.Background(), call, grant)
+	compatibilityTicket := mustExecutorTicket(t, context.Background(), executor, call)
+	compatibility := executor.ExecuteAuthorized(context.Background(), call, compatibilityTicket)
 	if compatibility.Status != StatusSuccess {
 		t.Fatalf("legacy ExecuteAuthorized wrapper changed: %#v", compatibility)
 	}
+}
+
+func mustExecutorTicket(t *testing.T, ctx context.Context, executor *Executor, call Call) permission.ExecutionTicket {
+	t.Helper()
+	validated, err := executor.Registry.ValidateCall(call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var readRoots []string
+	if scope, scopeErr := effectiveReadScope(ctx, executor.ProjectRoot); scopeErr == nil {
+		readRoots = scope.ExtraRoots
+	} else {
+		t.Fatal(scopeErr)
+	}
+	normalized, err := permission.NormalizeArguments(
+		permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON},
+		validated.Arguments,
+		permission.Context{ProjectRoot: executor.ProjectRoot, ReadRoots: readRoots},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := json.Marshal(normalized.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.TicketVerifier = authority
+	ticket, err := authority.Issue(call.ID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ticket
+}
+
+func mustRawTicket(t *testing.T, executor *Executor, call Call) permission.ExecutionTicket {
+	t.Helper()
+	arguments := map[string]any{}
+	if err := json.Unmarshal([]byte(call.ArgumentsJSON), &arguments); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.TicketVerifier = authority
+	ticket, err := authority.Issue(call.ID, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ticket
 }
 
 func TestHookDeniedError(t *testing.T) {

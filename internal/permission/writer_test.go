@@ -63,10 +63,12 @@ func TestPermissionWriterRequiresDedicatedCapabilityAndIsCrashSafe(t *testing.T)
 	authorizer := Authorizer{
 		Local:  RuleLayer{Rules: []Rule{rule}},
 		Writer: writer,
+		Issuer: mustTicketAuthority(t),
 	}
+	call := Call{ID: "closed-root", Name: "Bash", ArgumentsJSON: `{"command":"git log"}`}
 	decision := authorizer.ResolveUserDecision(
-		Call{ID: "closed-root", Name: "Bash", ArgumentsJSON: `{"command":"git log"}`},
-		Context{ProjectRoot: rootPath, Mode: ModeDefault},
+		call,
+		mustCallContext(t, call, Context{ProjectRoot: rootPath, Mode: ModeDefault}),
 		ActionAllowPermanent,
 	)
 	if decision.Kind != DecisionDeny || decision.Reason != ReasonConfigError {

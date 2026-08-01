@@ -2,6 +2,7 @@ package permission
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -166,11 +167,15 @@ func TestRuleLayerPriority(t *testing.T) {
 
 func TestPermissiveBashOnlyAllowsBuiltinReadOnlyCommands(t *testing.T) {
 	root := t.TempDir()
-	allowed := (&Authorizer{}).Decide(Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"git status"}`}, Context{ProjectRoot: root, Mode: ModePermissive})
-	if allowed.Kind != DecisionAllow {
+	authority := mustTicketAuthority(t)
+	authorizer := &Authorizer{Issuer: authority}
+	allowedCall := Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"git status"}`}
+	allowed := authorizer.Decide(allowedCall, mustCallContext(t, allowedCall, Context{ProjectRoot: root, Mode: ModePermissive}))
+	if allowed.Kind != DecisionAllow || !allowed.Ticket.Issued() {
 		t.Fatalf("expected builtin read-only bash allow, got %#v", allowed)
 	}
-	python := (&Authorizer{}).Decide(Call{ID: "2", Name: "Bash", ArgumentsJSON: `{"command":"python -c 'print(1)'"}`}, Context{ProjectRoot: root, Mode: ModePermissive})
+	pythonCall := Call{ID: "2", Name: "Bash", ArgumentsJSON: `{"command":"python -c 'print(1)'"}`}
+	python := authorizer.Decide(pythonCall, mustCallContext(t, pythonCall, Context{ProjectRoot: root, Mode: ModePermissive}))
 	if python.Kind != DecisionAsk {
 		t.Fatalf("expected unknown bash to ask in permissive mode, got %#v", python)
 	}
@@ -178,12 +183,13 @@ func TestPermissiveBashOnlyAllowsBuiltinReadOnlyCommands(t *testing.T) {
 
 func TestLoadErrorsFailClosedForDangerousTools(t *testing.T) {
 	root := t.TempDir()
-	authorizer := Authorizer{LoadErrors: []LoadError{{Source: Source{Kind: SourceProjectRule}, Err: os.ErrInvalid}}}
+	authorizer := Authorizer{LoadErrors: []LoadError{{Source: Source{Kind: SourceProjectRule}, Err: os.ErrInvalid}}, Issuer: mustTicketAuthority(t)}
 	write := authorizer.Decide(Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"x"}`}, Context{ProjectRoot: root, Mode: ModePermissive})
 	if write.Kind != DecisionDeny || write.Reason != ReasonConfigError {
 		t.Fatalf("expected config_error deny for write, got %#v", write)
 	}
-	read := authorizer.Decide(Call{ID: "2", Name: "Read", ArgumentsJSON: `{"path":"a.txt"}`}, Context{ProjectRoot: root, Mode: ModePermissive})
+	readCall := Call{ID: "2", Name: "Read", ArgumentsJSON: `{"path":"a.txt"}`}
+	read := authorizer.Decide(readCall, mustCallContext(t, readCall, Context{ProjectRoot: root, Mode: ModePermissive}))
 	if read.Kind == DecisionDeny && read.Reason == ReasonConfigError {
 		t.Fatalf("read-only tool should not fail closed on config error: %#v", read)
 	}
@@ -303,20 +309,23 @@ func TestAllowSessionAndPermanentAffectFollowingCalls(t *testing.T) {
 	root := t.TempDir()
 	call := Call{ID: "1", Name: "Write", ArgumentsJSON: `{"path":"a.txt","content":"hello"}`}
 	writer := newPermissionWriter(t, root)
-	authorizer := Authorizer{Session: NewSession(), Writer: writer}
-	if decision := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowSession); decision.Kind != DecisionAllow {
+	authority := mustTicketAuthority(t)
+	authorizer := Authorizer{Session: NewSession(), Writer: writer, Issuer: authority}
+	if decision := authorizer.ResolveUserDecision(call, mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeDefault}), ActionAllowSession); decision.Kind != DecisionAllow || !decision.Ticket.Issued() {
 		t.Fatalf("expected session allow, got %#v", decision)
 	}
-	followUp := authorizer.Decide(Call{ID: "2", Name: "Write", ArgumentsJSON: call.ArgumentsJSON}, Context{ProjectRoot: root, Mode: ModeDefault})
+	followUpCall := Call{ID: "2", Name: "Write", ArgumentsJSON: call.ArgumentsJSON}
+	followUp := authorizer.Decide(followUpCall, mustCallContext(t, followUpCall, Context{ProjectRoot: root, Mode: ModeDefault}))
 	if followUp.Kind != DecisionAllow || followUp.Source.Kind != SourceSessionRule {
 		t.Fatalf("expected follow-up session allow, got %#v", followUp)
 	}
 
-	permanent := Authorizer{Writer: writer}
-	if decision := permanent.ResolveUserDecision(call, Context{ProjectRoot: root, Mode: ModeDefault}, ActionAllowPermanent); decision.Kind != DecisionAllow {
+	permanent := Authorizer{Writer: writer, Issuer: authority}
+	if decision := permanent.ResolveUserDecision(call, mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeDefault}), ActionAllowPermanent); decision.Kind != DecisionAllow || !decision.Ticket.Issued() {
 		t.Fatalf("expected permanent allow, got %#v", decision)
 	}
-	followUp = permanent.Decide(Call{ID: "3", Name: "Write", ArgumentsJSON: call.ArgumentsJSON}, Context{ProjectRoot: root, Mode: ModeDefault})
+	followUpCall = Call{ID: "3", Name: "Write", ArgumentsJSON: call.ArgumentsJSON}
+	followUp = permanent.Decide(followUpCall, mustCallContext(t, followUpCall, Context{ProjectRoot: root, Mode: ModeDefault}))
 	if followUp.Kind != DecisionAllow || followUp.Source.Kind != SourceLocalRule {
 		t.Fatalf("expected follow-up local allow, got %#v", followUp)
 	}
@@ -532,6 +541,7 @@ func TestCheckHardSeparatesNonOverridableConstraints(t *testing.T) {
 func TestDecideCompatibility(t *testing.T) {
 	root := t.TempDir()
 	authorizer := Authorizer{
+		Issuer: mustTicketAuthority(t),
 		User: RuleLayer{Source: Source{Kind: SourceUserRule}, Rules: []Rule{
 			{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)},
 			{Tool: "Write", Pattern: "blocked.txt", MatchType: string(MatchExact), Effect: string(EffectDeny)},
@@ -543,7 +553,7 @@ func TestDecideCompatibility(t *testing.T) {
 		{ID: "deny", Name: "Write", ArgumentsJSON: `{"path":"blocked.txt","content":"x"}`},
 		{ID: "ask", Name: "Write", ArgumentsJSON: `{"path":"other.txt","content":"x"}`},
 	} {
-		context := Context{ProjectRoot: root, Mode: ModeDefault}
+		context := mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeDefault})
 		legacy := authorizer.Decide(call, context)
 		normalized, err := NormalizeCall(call, root)
 		if err != nil {
@@ -553,13 +563,11 @@ func TestDecideCompatibility(t *testing.T) {
 		if hard := authorizer.CheckHard(normalized, context); hard != nil {
 			staged = *hard
 		}
-		if !reflect.DeepEqual(legacy, staged) {
-			t.Fatalf("legacy/staged mismatch for %s:\nlegacy=%#v\nstaged=%#v", call.ID, legacy, staged)
-		}
+		assertEquivalentDecisions(t, call.ID, legacy, staged)
 	}
 }
 
-func TestResolveNormalizedUserDecisionPreservesFingerprint(t *testing.T) {
+func TestResolveNormalizedUserDecisionPreservesIdentity(t *testing.T) {
 	root := t.TempDir()
 	call := Call{ID: "large", Name: "mcp__server__tool", ArgumentsJSON: `{"large":9007199254740993}`}
 	arguments := map[string]any{"large": json.Number("9007199254740993")}
@@ -567,29 +575,38 @@ func TestResolveNormalizedUserDecisionPreservesFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authorizer := Authorizer{}
-	decision := authorizer.ResolveNormalizedUserDecision(normalized, Context{ProjectRoot: root}, ActionAllowOnce)
-	if decision.Kind != DecisionAllow || decision.Grant == nil || decision.Grant.Fingerprint != Fingerprint(normalized) {
-		t.Fatalf("normalized allow changed fingerprint: %#v", decision)
+	authority := mustTicketAuthority(t)
+	identity := mustNormalizedCallIdentity(t, normalized)
+	authorizer := Authorizer{Issuer: authority}
+	context := Context{ProjectRoot: root, Identity: identity}
+	decision := authorizer.ResolveNormalizedUserDecision(normalized, context, ActionAllowOnce)
+	if decision.Kind != DecisionAllow || !decision.Ticket.Issued() {
+		t.Fatalf("normalized allow did not issue a ticket: %#v", decision)
+	}
+	if err := authority.VerifyAndConsume(decision.Ticket, call.ID, identity); err != nil {
+		t.Fatalf("normalized allow changed execution identity: %v", err)
 	}
 	if got, ok := normalized.Arguments["large"].(json.Number); !ok || got.String() != "9007199254740993" {
 		t.Fatalf("normalized arguments changed: %#v", normalized.Arguments)
 	}
 	for _, action := range []UserAction{ActionDeny, ActionCancel} {
-		got := authorizer.ResolveNormalizedUserDecision(normalized, Context{ProjectRoot: root}, action)
+		got := authorizer.ResolveNormalizedUserDecision(normalized, context, action)
 		if got.Kind != DecisionDeny || !got.Recoverable {
 			t.Fatalf("action %s changed: %#v", action, got)
 		}
 	}
-	legacy := authorizer.ResolveUserDecision(call, Context{ProjectRoot: root}, ActionAllowOnce)
-	if !reflect.DeepEqual(legacy, decision) {
+	legacy := authorizer.ResolveUserDecision(call, context, ActionAllowOnce)
+	if legacy.Kind != decision.Kind || legacy.Scope != decision.Scope || legacy.Source != decision.Source || !legacy.Ticket.Issued() {
 		t.Fatalf("legacy normalized resolution differs:\nlegacy=%#v\nnormalized=%#v", legacy, decision)
+	}
+	if err := authority.VerifyAndConsume(legacy.Ticket, call.ID, identity); err != nil {
+		t.Fatalf("legacy resolution changed execution identity: %v", err)
 	}
 }
 
 func TestDecideStagedCompatibility(t *testing.T) {
 	root := t.TempDir()
-	authorizer := Authorizer{User: RuleLayer{Source: Source{Kind: SourceUserRule}, Rules: []Rule{{Tool: "Bash", Pattern: "git *", MatchType: string(MatchGlob), Effect: string(EffectAllow)}}}}
+	authorizer := Authorizer{Issuer: mustTicketAuthority(t), User: RuleLayer{Source: Source{Kind: SourceUserRule}, Rules: []Rule{{Tool: "Bash", Pattern: "git *", MatchType: string(MatchGlob), Effect: string(EffectAllow)}}}}
 	tests := []struct {
 		call    Call
 		context Context
@@ -601,6 +618,7 @@ func TestDecideStagedCompatibility(t *testing.T) {
 		{call: Call{ID: "large", Name: "mcp__server__tool", ArgumentsJSON: `{"large":9007199254740993}`}, context: Context{ProjectRoot: root, Mode: ModeDefault}},
 	}
 	for _, test := range tests {
+		test.context = mustCallContext(t, test.call, test.context)
 		legacy := authorizer.Decide(test.call, test.context)
 		normalized, err := NormalizeCallWithReadRoots(test.call, test.context.ProjectRoot, test.context.ReadRoots)
 		if err != nil {
@@ -614,9 +632,7 @@ func TestDecideStagedCompatibility(t *testing.T) {
 		} else {
 			staged = authorizer.DecideOrdinary(normalized, test.context)
 		}
-		if !reflect.DeepEqual(legacy, staged) {
-			t.Fatalf("legacy/staged mismatch for %s:\nlegacy=%#v\nstaged=%#v", test.call.ID, legacy, staged)
-		}
+		assertEquivalentDecisions(t, test.call.ID, legacy, staged)
 		if test.call.ID == "large" {
 			if _, ok := normalized.Arguments["large"].(json.Number); !ok {
 				t.Fatalf("large argument lost json.Number: %#v", normalized.Arguments["large"])
@@ -744,7 +760,117 @@ func TestMCPRuleDoesNotCrossServer(t *testing.T) {
 	}
 }
 
+func TestConfirmationCannotOverrideHardConstraints(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name    string
+		call    Call
+		context Context
+		reason  DenyReason
+	}{
+		{name: "blacklist", call: Call{ID: "blacklist", Name: "Bash", ArgumentsJSON: `{"command":"git reset --hard"}`}, context: Context{ProjectRoot: root, Mode: ModePermissive}, reason: ReasonBlacklist},
+		{name: "protected permission path", call: Call{ID: "protected", Name: "Write", ArgumentsJSON: `{"path":".xagent/permissions.yaml","content":"x"}`}, context: Context{ProjectRoot: root, Mode: ModePermissive}, reason: ReasonSandbox},
+		{name: "plan mode", call: Call{ID: "plan", Name: "Write", ArgumentsJSON: `{"path":"ordinary.txt","content":"x"}`}, context: Context{ProjectRoot: root, Mode: ModePermissive, PlanMode: true}, reason: ReasonPlanMode},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer := Authorizer{Session: NewSession(), Issuer: mustTicketAuthority(t)}
+			context := mustCallContext(t, test.call, test.context)
+			decision := authorizer.ResolveUserDecision(test.call, context, ActionAllowSession)
+			if decision.Kind != DecisionDeny || decision.Reason != test.reason || decision.Ticket.Issued() {
+				t.Fatalf("confirmation overrode hard constraint: %#v", decision)
+			}
+			if rules := authorizer.Session.Rules(); len(rules) != 0 {
+				t.Fatalf("hard-denied confirmation changed session rules: %#v", rules)
+			}
+		})
+	}
+}
+
+func TestTicketFailureDoesNotChangePermissionState(t *testing.T) {
+	root := t.TempDir()
+	call := Call{ID: "write", Name: "Write", ArgumentsJSON: `{"path":"ordinary.txt","content":"x"}`}
+	context := mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeDefault})
+	writer := newPermissionWriter(t, root)
+	authorizer := Authorizer{Session: NewSession(), Writer: writer, Issuer: failingTicketIssuer{}}
+
+	for _, action := range []UserAction{ActionAllowSession, ActionAllowPermanent} {
+		decision := authorizer.ResolveUserDecision(call, context, action)
+		if decision.Kind != DecisionDeny || decision.Reason != ReasonConfigError || decision.Ticket.Issued() {
+			t.Fatalf("ticket failure for %s did not fail closed: %#v", action, decision)
+		}
+	}
+	if rules := authorizer.Session.Rules(); len(rules) != 0 {
+		t.Fatalf("ticket failure changed session rules: %#v", rules)
+	}
+	if len(authorizer.Local.Rules) != 0 {
+		t.Fatalf("ticket failure changed local rules: %#v", authorizer.Local.Rules)
+	}
+	if _, err := os.Stat(LocalRulePath(root)); !os.IsNotExist(err) {
+		t.Fatalf("ticket failure wrote a permanent rule: %v", err)
+	}
+
+	authorizer.Issuer = mustTicketAuthority(t)
+	context.Identity = CallIdentity{}
+	if decision := authorizer.ResolveUserDecision(call, context, ActionAllowOnce); decision.Kind != DecisionDeny || decision.Reason != ReasonConfigError {
+		t.Fatalf("zero identity did not fail closed: %#v", decision)
+	}
+	authorizer.Issuer = nil
+	context = mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeDefault})
+	if decision := authorizer.ResolveUserDecision(call, context, ActionAllowOnce); decision.Kind != DecisionDeny || decision.Reason != ReasonConfigError {
+		t.Fatalf("nil issuer did not fail closed: %#v", decision)
+	}
+}
+
+type failingTicketIssuer struct{}
+
+func (failingTicketIssuer) Issue(string, CallIdentity) (ExecutionTicket, error) {
+	return ExecutionTicket{}, errors.New("ticket issuer failure")
+}
+
 func quote(value string) string {
 	data, _ := json.Marshal(value)
 	return string(data)
+}
+
+func mustNormalizedCallIdentity(t *testing.T, normalized NormalizedCall) CallIdentity {
+	t.Helper()
+	canonical, err := json.Marshal(normalized.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := NewCallIdentity(CallIdentityInput{ToolName: normalized.Call.Name, CanonicalArguments: canonical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
+func mustCallContext(t *testing.T, call Call, context Context) Context {
+	t.Helper()
+	normalized, err := NormalizeCallWithReadRoots(call, context.ProjectRoot, context.ReadRoots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	context.Identity = mustNormalizedCallIdentity(t, normalized)
+	return context
+}
+
+func assertEquivalentDecisions(t *testing.T, callID string, first, second Decision) {
+	t.Helper()
+	firstTicket := first.Ticket
+	secondTicket := second.Ticket
+	first.Ticket = ExecutionTicket{}
+	second.Ticket = ExecutionTicket{}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("legacy/staged mismatch for %s:\nlegacy=%#v\nstaged=%#v", callID, first, second)
+	}
+	if first.Kind == DecisionAllow {
+		if !firstTicket.Issued() || !secondTicket.Issued() {
+			t.Fatalf("allow decision for %s omitted a ticket", callID)
+		}
+		if firstTicket == secondTicket {
+			t.Fatalf("repeated allow decision for %s reused a ticket", callID)
+		}
+	}
 }

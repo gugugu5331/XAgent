@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -28,7 +29,9 @@ type ToolExecution struct {
 	SystemRoute bool
 	Result      tool.Result
 	Index       int
-	Grant       *permission.Grant
+	Ticket      permission.ExecutionTicket
+	Scope       permission.GrantScope
+	Source      permission.Source
 	StopReason  StopReason
 	Err         error
 }
@@ -175,6 +178,15 @@ func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Contex
 	if err != nil {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
 	}
+	canonicalArguments, err := json.Marshal(normalized.Arguments)
+	if err != nil {
+		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
+	}
+	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonicalArguments})
+	if err != nil {
+		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
+	}
+	permissionContext.Identity = identity
 	if o.authorizer != nil {
 		if hard := o.authorizer.CheckHard(normalized, permissionContext); hard != nil {
 			return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, *hard), out)
@@ -232,10 +244,12 @@ func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Contex
 			}
 		}
 	}
-	if decision.Grant == nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailablePermissionGrantResult(call), out)
+	if !decision.Ticket.Issued() {
+		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailablePermissionTicketResult(call), out)
 	}
-	execution.Grant = decision.Grant
+	execution.Ticket = decision.Ticket
+	execution.Scope = decision.Scope
+	execution.Source = decision.Source
 	return execution
 }
 
@@ -250,10 +264,10 @@ func (o *Orchestrator) executePreparedTool(ctx context.Context, execution ToolEx
 	var result tool.Result
 	if execution.SystemRoute {
 		result = execution.Validated.Tool.Execute(ctx, tool.Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: execution.Validated.Arguments})
-	} else if o.executor == nil || execution.Grant == nil {
+	} else if o.executor == nil || !execution.Ticket.Issued() {
 		result = unavailableToolExecutorResult(call)
 	} else {
-		result = o.executor.ExecuteValidatedAuthorized(ctx, execution.Validated, *execution.Grant)
+		result = o.executor.ExecuteValidatedAuthorized(ctx, execution.Validated, execution.Ticket)
 	}
 	duration := lifecycleDuration(started)
 	o.dispatchToolAfter(ctx, execution, result, duration)
@@ -384,8 +398,8 @@ func unavailablePermissionResult(call tool.Call) tool.Result {
 	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "权限系统不可用", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true}}
 }
 
-func unavailablePermissionGrantResult(call tool.Call) tool.Result {
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusDenied, Summary: "权限授权结果无效", Content: "Permission authorization did not produce a valid grant.", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "Permission authorization did not produce a valid grant.", Recoverable: true}}
+func unavailablePermissionTicketResult(call tool.Call) tool.Result {
+	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusDenied, Summary: "权限授权结果无效", Content: "Permission authorization did not produce a valid execution ticket.", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "Permission authorization did not produce a valid execution ticket.", Recoverable: true}}
 }
 
 func planModeDecision(call tool.Call) permission.Decision {

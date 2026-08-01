@@ -21,27 +21,27 @@ func ParseMode(value string) (Mode, bool) {
 	}
 }
 
-func DecideByMode(mode Mode, normalized NormalizedCall) Decision {
+func (a *Authorizer) decideByMode(mode Mode, normalized NormalizedCall, context Context) Decision {
 	if strings.HasPrefix(normalized.Call.Name, "mcp__") {
 		return ask(normalized, modeOrDefault(mode), "mcp tools require confirmation")
 	}
 	switch mode {
 	case ModeStrict:
 		if isReadOnlyFileTool(normalized.Call.Name) {
-			return allow(normalized, GrantMode, Source{Kind: SourceMode, Description: "strict mode"})
+			return a.allow(normalized, context, GrantMode, Source{Kind: SourceMode, Description: "strict mode"})
 		}
 		return ask(normalized, mode, "strict mode requires confirmation")
 	case ModePermissive:
 		if normalized.Call.Name == "Bash" {
 			if isBuiltinReadOnlyBash(normalized.Command) {
-				return allow(normalized, GrantMode, Source{Kind: SourceMode, Description: "permissive mode"})
+				return a.allow(normalized, context, GrantMode, Source{Kind: SourceMode, Description: "permissive mode"})
 			}
 			return ask(normalized, mode, "bash requires confirmation")
 		}
-		return allow(normalized, GrantMode, Source{Kind: SourceMode, Description: "permissive mode"})
+		return a.allow(normalized, context, GrantMode, Source{Kind: SourceMode, Description: "permissive mode"})
 	default:
 		if isReadOnlyFileTool(normalized.Call.Name) {
-			return allow(normalized, GrantMode, Source{Kind: SourceMode, Description: "default mode"})
+			return a.allow(normalized, context, GrantMode, Source{Kind: SourceMode, Description: "default mode"})
 		}
 		return ask(normalized, ModeDefault, "default mode requires confirmation")
 	}

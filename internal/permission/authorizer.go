@@ -26,6 +26,7 @@ type Authorizer struct {
 	Health     *Health
 	Writer     Writer
 	Redact     func(string) string
+	Issuer     TicketIssuer
 }
 
 func (a *Authorizer) Decide(call Call, context Context) Decision {
@@ -48,11 +49,11 @@ func (a *Authorizer) Decide(call Call, context Context) Decision {
 // CheckHard evaluates the permission constraints which ordinary rules and
 // user confirmation may never override. Plan-mode policy remains an explicit
 // orchestrator/legacy-wrapper stage and is intentionally not handled here.
-func (a *Authorizer) CheckHard(normalized NormalizedCall, _ Context) *Decision {
+func (a *Authorizer) CheckHard(normalized NormalizedCall, context Context) *Decision {
 	call := normalized.Call
 	if a != nil && a.permissionHealthDegraded() {
 		if isConservativeReadOnlyTool(call.Name) {
-			decision := allow(normalized, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
+			decision := a.allow(normalized, context, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
 			return &decision
 		}
 		decision := deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "permission config error"}, "权限配置文件损坏，无法安全执行该工具", "Permission configuration is invalid, so this action cannot be performed safely.")
@@ -82,21 +83,29 @@ func (a *Authorizer) DecideOrdinary(normalized NormalizedCall, context Context) 
 		context.Mode = ModeDefault
 	}
 	if a == nil {
-		return DecideByMode(context.Mode, normalized)
+		return a.decideByMode(context.Mode, normalized, context)
 	}
 	for _, layer := range a.layers() {
-		if rule, ok, err := FindRule(layer.Rules, normalized); err != nil {
+		if match, ok, err := FindRuleMatch(layer.Rules, normalized); err != nil {
 			return deny(normalized.Call, ReasonConfigError, layer.Source, "权限规则匹配失败", "Permission rules could not be evaluated safely.")
 		} else if ok {
+			rule := match.Rule()
 			if rule.Effect == string(EffectDeny) {
 				return deny(normalized.Call, ReasonRuleDeny, layer.Source, "工具调用被权限规则拒绝", "This tool call is denied by a permission rule.")
 			}
-			decision := allow(normalized, GrantRule, layer.Source)
-			decision.Rule = rule
+			if !match.AllowsWithoutPrompt() {
+				return ask(normalized, context.Mode, "legacy permission rule requires confirmation")
+			}
+			ticket, err := match.IssueTicket(a.Issuer, context.Identity)
+			if err != nil {
+				return ticketFailure(normalized.Call)
+			}
+			decision := allowWithTicket(ticket, GrantRule, layer.Source)
+			decision.Rule = &rule
 			return decision
 		}
 	}
-	decision := DecideByMode(context.Mode, normalized)
+	decision := a.decideByMode(context.Mode, normalized, context)
 	if decision.Prompt != nil {
 		decision.Prompt = newConfirmationPrompt(normalized, decision.Prompt.Mode, decision.Prompt.Reason, a.redactText)
 	}
@@ -112,9 +121,19 @@ func (a *Authorizer) ResolveUserDecision(call Call, context Context, action User
 }
 
 // ResolveNormalizedUserDecision applies a user's response to an existing
-// normalized call, preserving its argument types and grant fingerprint.
-func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, _ Context, action UserAction) Decision {
+// normalized call, preserving its argument types and execution identity.
+func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, context Context, action UserAction) Decision {
+	return a.resolveNormalizedUserDecision(normalized, context, action)
+}
+
+func (a *Authorizer) resolveNormalizedUserDecision(normalized NormalizedCall, context Context, action UserAction) Decision {
 	call := normalized.Call
+	if context.PlanMode && isWriteOrBash(call.Name) {
+		return deny(call, ReasonPlanMode, Source{Kind: SourceHardConstraint, Description: "plan mode"}, "Plan Mode 下不允许执行写工具或 Bash", "Plan Mode allows only read-only tools.")
+	}
+	if hard := a.CheckHard(normalized, context); hard != nil {
+		return *hard
+	}
 	switch action {
 	case ActionDeny:
 		return deny(call, ReasonUserDenied, Source{Kind: SourceUserDecision, Description: "user denied"}, "用户拒绝执行工具", "The user denied this tool call. Choose a safer alternative.")
@@ -122,10 +141,13 @@ func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, _ 
 		return deny(call, ReasonUserCancelled, Source{Kind: SourceUserDecision, Description: "user cancelled"}, "用户取消工具确认", "The user cancelled this tool call. Choose a safer alternative.")
 	case ActionAllowSession:
 		rule := Rule{Tool: call.Name, Pattern: normalized.RuleValue, MatchType: string(MatchExact), Effect: string(EffectAllow), Description: "Session allow from confirmation"}
+		decision := a.allow(normalized, context, GrantSession, Source{Kind: SourceUserDecision, Description: "session allow"})
+		if decision.Kind != DecisionAllow {
+			return decision
+		}
 		if a.Session != nil {
 			a.Session.Add(rule)
 		}
-		decision := allow(normalized, GrantSession, Source{Kind: SourceUserDecision, Description: "session allow"})
 		decision.Rule = &rule
 		return decision
 	case ActionAllowPermanent:
@@ -133,17 +155,20 @@ func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, _ 
 			return deny(call, ReasonUserDenied, Source{Kind: SourceUserDecision, Description: "permanent allow disabled"}, "该工具调用不允许永久授权", "Permanent permission is not available for this tool call.")
 		}
 		rule := a.Writer.PreviewRule(normalized)
+		decision := a.allow(normalized, context, GrantPermanent, Source{Kind: SourceUserDecision, Description: "permanent allow"})
+		if decision.Kind != DecisionAllow {
+			return decision
+		}
 		if err := a.Writer.WriteLocal(rule); err != nil {
 			return deny(call, ReasonConfigError, Source{Kind: SourceUserDecision, Description: "permanent allow failed"}, "永久权限规则写入失败", "Permission configuration could not be updated safely.")
 		}
 		a.Local.Rules = appendUniqueRule(a.Local.Rules, rule)
-		decision := allow(normalized, GrantPermanent, Source{Kind: SourceUserDecision, Description: "permanent allow"})
 		decision.Rule = &rule
 		return decision
 	case ActionAllowOnce:
 		fallthrough
 	default:
-		return allow(normalized, GrantOnce, Source{Kind: SourceUserDecision, Description: "one-time allow"})
+		return a.allow(normalized, context, GrantOnce, Source{Kind: SourceUserDecision, Description: "one-time allow"})
 	}
 }
 
@@ -172,19 +197,23 @@ func (a *Authorizer) layers() []RuleLayer {
 	}
 }
 
-func allow(normalized NormalizedCall, scope GrantScope, source Source) Decision {
-	return Decision{
-		Kind:   DecisionAllow,
-		Source: source,
-		Grant: &Grant{
-			CallID:      normalized.Call.ID,
-			Tool:        normalized.Call.Name,
-			Scope:       scope,
-			Source:      source,
-			Fingerprint: Fingerprint(normalized),
-		},
-		Recoverable: true,
+func (a *Authorizer) allow(normalized NormalizedCall, context Context, scope GrantScope, source Source) Decision {
+	if a == nil || a.Issuer == nil {
+		return ticketFailure(normalized.Call)
 	}
+	ticket, err := a.Issuer.Issue(normalized.Call.ID, context.Identity)
+	if err != nil {
+		return ticketFailure(normalized.Call)
+	}
+	return allowWithTicket(ticket, scope, source)
+}
+
+func allowWithTicket(ticket ExecutionTicket, scope GrantScope, source Source) Decision {
+	return Decision{Kind: DecisionAllow, Source: source, Ticket: ticket, Scope: scope, Recoverable: true}
+}
+
+func ticketFailure(call Call) Decision {
+	return deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "execution ticket unavailable"}, "无法安全签发执行票据", "A valid execution ticket could not be issued for this tool call.")
 }
 
 func ask(normalized NormalizedCall, mode Mode, reason string) Decision {

@@ -287,7 +287,7 @@ func TestReadScopeCannotReplaceConfiguredProjectRoot(t *testing.T) {
 	}
 }
 
-func TestReadScopeAuthorizerGrantMatchesExecutor(t *testing.T) {
+func TestReadScopeAuthorizerTicketMatchesExecutor(t *testing.T) {
 	project := t.TempDir()
 	extra := t.TempDir()
 	path := filepath.Join(extra, "reference.md")
@@ -304,26 +304,38 @@ func TestReadScopeAuthorizerGrantMatchesExecutor(t *testing.T) {
 	}
 	call := Call{ID: "read-extra", Name: "Read", ArgumentsJSON: string(raw)}
 	permissionCall := permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
-	decision := (&permission.Authorizer{}).Decide(permissionCall, permission.Context{
-		ProjectRoot: project,
-		ReadRoots:   scope.ExtraRoots,
-		Mode:        permission.ModeDefault,
-	})
-	if decision.Kind != permission.DecisionAllow || decision.Grant == nil {
-		t.Fatalf("authorizer did not grant extra-root Read: %#v", decision)
-	}
 	normalized, err := permission.NormalizeCallWithReadRoots(permissionCall, project, scope.ExtraRoots)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := decision.Grant.Fingerprint, permission.Fingerprint(normalized); got != want {
-		t.Fatalf("authorizer grant fingerprint mismatch: got %q want %q", got, want)
+	canonical, err := json.Marshal(normalized.Arguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonical})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := permission.NewTicketAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := (&permission.Authorizer{Issuer: authority}).Decide(permissionCall, permission.Context{
+		ProjectRoot: project,
+		ReadRoots:   scope.ExtraRoots,
+		Mode:        permission.ModeDefault,
+		Identity:    identity,
+	})
+	if decision.Kind != permission.DecisionAllow || !decision.Ticket.Issued() {
+		t.Fatalf("authorizer did not ticket extra-root Read: %#v", decision)
 	}
 
 	ctx := WithReadScope(context.Background(), scope)
-	result := newScopedExecutor(t, project).ExecuteAuthorized(ctx, call, *decision.Grant)
+	executor := newScopedExecutor(t, project)
+	executor.TicketVerifier = authority
+	result := executor.ExecuteAuthorized(ctx, call, decision.Ticket)
 	if result.Status != StatusSuccess || result.Content != "fingerprint canary" {
-		t.Fatalf("executor rejected the authorizer's extra-root grant: %#v", result)
+		t.Fatalf("executor rejected the authorizer's extra-root ticket: %#v", result)
 	}
 }
 

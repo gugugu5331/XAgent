@@ -14,6 +14,7 @@ func TestCorruptLayerFailsClosedForAllDangerousTools(t *testing.T) {
 	health := NewHealth(authority)
 	authorizer := Authorizer{
 		Health: health,
+		Issuer: authority,
 		User: RuleLayer{Rules: []Rule{
 			{Tool: "Read", Pattern: "blocked.txt", MatchType: string(MatchExact), Effect: string(EffectDeny)},
 			{Tool: "Bash", Pattern: "git status", MatchType: string(MatchExact), Effect: string(EffectAllow)},
@@ -67,7 +68,8 @@ func TestCorruptLayerFailsClosedForAllDangerousTools(t *testing.T) {
 		{ID: "grep", Name: "Grep", ArgumentsJSON: `{"path":"."}`},
 	}
 	for _, call := range readOnly {
-		decision := authorizer.Decide(call, Context{ProjectRoot: root, Mode: ModeStrict})
+		context := mustCallContext(t, call, Context{ProjectRoot: root, Mode: ModeStrict})
+		decision := authorizer.Decide(call, context)
 		if decision.Kind != DecisionAllow || decision.Source.Kind != SourceHardConstraint {
 			t.Errorf("degraded decision for allowlisted %s = %#v, want conservative allow", call.Name, decision)
 		}

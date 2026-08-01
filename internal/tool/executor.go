@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,7 @@ type Executor struct {
 	ProjectRoot    string
 	Timeout        time.Duration
 	MaxOutputBytes int
+	TicketVerifier permission.TicketVerifier
 }
 
 func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, maxOutputBytes int) *Executor {
@@ -33,17 +35,17 @@ func (e *Executor) NeedsConfirmation(call Call) bool {
 	return ok && tool.Risk() == RiskDangerous
 }
 
-func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, grant permission.Grant) Result {
+func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, ticket permission.ExecutionTicket) Result {
 	validated, err := e.Registry.ValidateCall(call)
 	if err != nil {
 		return e.validationFailure(call, err)
 	}
-	return e.ExecuteValidatedAuthorized(ctx, validated, grant)
+	return e.ExecuteValidatedAuthorized(ctx, validated, ticket)
 }
 
-// ExecuteValidatedAuthorized verifies a grant and executes the already parsed
-// call without decoding its arguments again.
-func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated ValidatedCall, grant permission.Grant) Result {
+// ExecuteValidatedAuthorized verifies and consumes a single-use execution
+// ticket before executing the already parsed call.
+func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated ValidatedCall, ticket permission.ExecutionTicket) Result {
 	call := validated.Call
 	registeredTool, ok := e.Registry.Get(call.Name)
 	if !ok {
@@ -69,11 +71,16 @@ func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated Val
 	if err != nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
 	}
-	if grant.Tool != call.Name || grant.Fingerprint != permission.Fingerprint(normalized) {
-		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Permission grant does not match this tool call.", Recoverable: true})
+	canonicalArguments, err := json.Marshal(normalized.Arguments)
+	if err != nil {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Tool arguments are invalid for permission checking.", Recoverable: true})
 	}
-	if grant.CallID != "" && grant.CallID != call.ID && grant.Scope == permission.GrantOnce {
-		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Permission grant does not match this tool call.", Recoverable: true})
+	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonicalArguments})
+	if err != nil || e.TicketVerifier == nil {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Execution ticket verification is unavailable.", Recoverable: true})
+	}
+	if err := e.TicketVerifier.VerifyAndConsume(ticket, call.ID, identity); err != nil {
+		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Execution ticket does not match this tool call.", Recoverable: true})
 	}
 	return e.executeValidated(ctx, validated)
 }
