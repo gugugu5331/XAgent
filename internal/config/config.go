@@ -114,6 +114,8 @@ type InstructionsConfig struct {
 type SessionConfig struct {
 	Dir             string `yaml:"dir"`
 	RetentionDays   int    `yaml:"retention_days"`
+	MaxRecordBytes  int64  `yaml:"-"`
+	MaxSessionBytes int64  `yaml:"-"`
 	MaxScanFiles    int    `yaml:"max_scan_files"`
 	MaxScanBytes    int64  `yaml:"max_scan_bytes"`
 	GapReminderDays int    `yaml:"gap_reminder_days"`

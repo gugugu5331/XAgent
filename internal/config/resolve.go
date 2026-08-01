@@ -136,6 +136,24 @@ var llmAgentStreamNumericSpecs = [...]numericSpec{
 	{path: "llm.stream.max_tool_arguments_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 8 * mebibyte},
 }
 
+var contextSessionNumericSpecs = [...]numericSpec{
+	{path: "context.tool_result_threshold_chars", defaultVal: 32 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "context.tool_results_threshold_chars", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 4 * mebibyte},
+	{path: "context.model_window_tokens", defaultVal: 200_000, minimum: 2, hardCap: 10_000_000},
+	{path: "context.auto_margin_tokens", defaultVal: 13_000, minimum: 1, hardCap: 1_000_000},
+	{path: "context.manual_margin_tokens", defaultVal: 3_000, minimum: 1, hardCap: 1_000_000},
+	{path: "context.recent_keep_tokens", defaultVal: 10_000, minimum: 1, hardCap: 1_000_000},
+	{path: "context.recent_keep_messages", defaultVal: 5, minimum: 1, hardCap: 10_000},
+	{path: "context.summary_failure_limit", defaultVal: 3, minimum: 1, hardCap: 100},
+	{path: "context.preview_chars", defaultVal: 2_000, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "session.max_record_bytes", defaultVal: 16 * mebibyte, minimum: 1, hardCap: 64 * mebibyte},
+	{path: "session.max_session_bytes", defaultVal: 256 * mebibyte, minimum: 1, hardCap: 1 * gibibyte},
+	{path: "session.max_scan_files", defaultVal: 1_000, minimum: 1, hardCap: 100_000},
+	{path: "session.max_scan_bytes", defaultVal: 10 * mebibyte, minimum: 1, hardCap: 1 * gibibyte},
+	{path: "session.retention_days", defaultVal: 30, minimum: 1, hardCap: 3_650},
+	{path: "session.gap_reminder_days", defaultVal: 7, minimum: 1, hardCap: 3_650},
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -158,11 +176,68 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 	if err := resolveLLMAgentStream(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
+	if err := resolveContextSession(&config, result.Value); err != nil {
+		return LoadedConfig{}, err
+	}
 	provenance := make(map[string]ConfigSource, len(result.Provenance))
 	for path, source := range result.Provenance {
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveContextSession(config *AppConfig, partial PartialAppConfig) error {
+	candidates := [...]Optional[int64]{
+		partial.Context.ToolResultThresholdChars,
+		partial.Context.ToolResultsThresholdChars,
+		partial.Context.ModelWindowTokens,
+		partial.Context.AutoMarginTokens,
+		partial.Context.ManualMarginTokens,
+		partial.Context.RecentKeepTokens,
+		partial.Context.RecentKeepMessages,
+		partial.Context.SummaryFailureLimit,
+		partial.Context.PreviewChars,
+		partial.Session.MaxRecordBytes,
+		partial.Session.MaxSessionBytes,
+		partial.Session.MaxScanFiles,
+		partial.Session.MaxScanBytes,
+		partial.Session.RetentionDays,
+		partial.Session.GapReminderDays,
+	}
+	values := make([]int64, len(candidates))
+	for index, spec := range contextSessionNumericSpecs {
+		value, err := spec.resolve(candidates[index])
+		if err != nil {
+			return err
+		}
+		values[index] = value
+	}
+
+	for _, index := range []int{3, 4, 5} {
+		if values[index] >= values[2] {
+			return fmt.Errorf("config field %q must be less than %q", contextSessionNumericSpecs[index].path, contextSessionNumericSpecs[2].path)
+		}
+	}
+	if values[9] > values[10] {
+		return fmt.Errorf("config field %q must not exceed %q", contextSessionNumericSpecs[9].path, contextSessionNumericSpecs[10].path)
+	}
+
+	config.Context.ToolResultThresholdChars = int(values[0])
+	config.Context.ToolResultsThresholdChars = int(values[1])
+	config.Context.ModelWindowTokens = values[2]
+	config.Context.AutoMarginTokens = values[3]
+	config.Context.ManualMarginTokens = values[4]
+	config.Context.RecentKeepTokens = values[5]
+	config.Context.RecentKeepMessages = int(values[6])
+	config.Context.SummaryFailureLimit = int(values[7])
+	config.Context.PreviewChars = int(values[8])
+	config.Session.MaxRecordBytes = values[9]
+	config.Session.MaxSessionBytes = values[10]
+	config.Session.MaxScanFiles = int(values[11])
+	config.Session.MaxScanBytes = values[12]
+	config.Session.RetentionDays = int(values[13])
+	config.Session.GapReminderDays = int(values[14])
+	return nil
 }
 
 func resolveLLMAgentStream(config *AppConfig, partial PartialAppConfig) error {

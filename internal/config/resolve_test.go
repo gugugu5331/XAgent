@@ -318,6 +318,95 @@ func TestStreamSubLimitsCannotExceedResponseLimit(t *testing.T) {
 	}
 }
 
+func TestResolveContextAndSessionNumericMatrix(t *testing.T) {
+	for _, spec := range contextSessionNumericSpecs {
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			if testCase.encoded != "" {
+				continue
+			}
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				var partial PartialAppConfig
+				prepareContextSessionBoundary(&partial, spec.path)
+				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid Context or Session boundary did not resolve")
+					}
+				} else if err == nil {
+					t.Fatal("invalid Context or Session boundary was accepted")
+				}
+			})
+		}
+	}
+
+	_, err := decodePartial("overflow.yaml", []byte("context:\n  preview_chars: 9223372036854775808\n"))
+	if err == nil {
+		t.Fatal("overflowing Context numeric configuration was accepted")
+	}
+}
+
+func prepareContextSessionBoundary(partial *PartialAppConfig, path string) {
+	switch path {
+	case "context.model_window_tokens":
+		partial.Context.AutoMarginTokens = Optional[int64]{Set: true, Value: 1}
+		partial.Context.ManualMarginTokens = Optional[int64]{Set: true, Value: 1}
+		partial.Context.RecentKeepTokens = Optional[int64]{Set: true, Value: 1}
+	case "context.auto_margin_tokens", "context.manual_margin_tokens", "context.recent_keep_tokens":
+		partial.Context.ModelWindowTokens = Optional[int64]{Set: true, Value: 10_000_000}
+	case "session.max_session_bytes":
+		partial.Session.MaxRecordBytes = Optional[int64]{Set: true, Value: 1}
+	}
+}
+
+func TestContextWindowMinimumAndThreeStrictRelations(t *testing.T) {
+	valid := PartialContextConfig{
+		ModelWindowTokens:  Optional[int64]{Set: true, Value: 2},
+		AutoMarginTokens:   Optional[int64]{Set: true, Value: 1},
+		ManualMarginTokens: Optional[int64]{Set: true, Value: 1},
+		RecentKeepTokens:   Optional[int64]{Set: true, Value: 1},
+	}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: valid}}, LoadOptions{}); err != nil {
+		t.Fatal("minimum Context window with minimum token reserves was rejected")
+	}
+
+	tooSmall := valid
+	tooSmall.ModelWindowTokens = Optional[int64]{Set: true, Value: 1}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: tooSmall}}, LoadOptions{}); err == nil {
+		t.Fatal("Context model window below its independent minimum was accepted")
+	}
+
+	for _, path := range []string{
+		"context.auto_margin_tokens",
+		"context.manual_margin_tokens",
+		"context.recent_keep_tokens",
+	} {
+		t.Run(path, func(t *testing.T) {
+			partial := PartialAppConfig{Context: valid}
+			setPartialNumericValue(t, &partial, path, Optional[int64]{Set: true, Value: 2})
+			if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
+				t.Fatal("Context token reserve equal to the model window was accepted")
+			}
+		})
+	}
+}
+
+func TestSessionRecordCannotExceedSession(t *testing.T) {
+	valid := PartialSessionConfig{
+		MaxRecordBytes:  Optional[int64]{Set: true, Value: 1},
+		MaxSessionBytes: Optional[int64]{Set: true, Value: 1},
+	}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Session: valid}}, LoadOptions{}); err != nil {
+		t.Fatal("Session record equal to the session limit was rejected")
+	}
+
+	invalid := valid
+	invalid.MaxRecordBytes = Optional[int64]{Set: true, Value: 2}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Session: invalid}}, LoadOptions{}); err == nil {
+		t.Fatal("Session record above the session limit was accepted")
+	}
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -426,6 +515,36 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return int64(config.Agent.MaxIterations)
 	case "agent.max_unknown_tool_calls":
 		return int64(config.Agent.MaxUnknownToolCalls)
+	case "context.tool_result_threshold_chars":
+		return int64(config.Context.ToolResultThresholdChars)
+	case "context.tool_results_threshold_chars":
+		return int64(config.Context.ToolResultsThresholdChars)
+	case "context.model_window_tokens":
+		return config.Context.ModelWindowTokens
+	case "context.auto_margin_tokens":
+		return config.Context.AutoMarginTokens
+	case "context.manual_margin_tokens":
+		return config.Context.ManualMarginTokens
+	case "context.recent_keep_tokens":
+		return config.Context.RecentKeepTokens
+	case "context.recent_keep_messages":
+		return int64(config.Context.RecentKeepMessages)
+	case "context.summary_failure_limit":
+		return int64(config.Context.SummaryFailureLimit)
+	case "context.preview_chars":
+		return int64(config.Context.PreviewChars)
+	case "session.max_record_bytes":
+		return config.Session.MaxRecordBytes
+	case "session.max_session_bytes":
+		return config.Session.MaxSessionBytes
+	case "session.max_scan_files":
+		return int64(config.Session.MaxScanFiles)
+	case "session.max_scan_bytes":
+		return config.Session.MaxScanBytes
+	case "session.retention_days":
+		return int64(config.Session.RetentionDays)
+	case "session.gap_reminder_days":
+		return int64(config.Session.GapReminderDays)
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0
