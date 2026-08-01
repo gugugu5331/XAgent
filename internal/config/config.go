@@ -10,6 +10,8 @@ type AppConfig struct {
 	MCP          MCPConfig          `yaml:"mcp"`
 	Agent        AgentConfig        `yaml:"agent"`
 	Tool         ToolConfig         `yaml:"tool"`
+	Artifact     ArtifactConfig     `yaml:"-"`
+	Files        FilesConfig        `yaml:"-"`
 	Context      ContextConfig      `yaml:"context"`
 	Instructions InstructionsConfig `yaml:"instructions"`
 	Session      SessionConfig      `yaml:"session"`
@@ -31,8 +33,24 @@ type AgentConfig struct {
 }
 
 type ToolConfig struct {
-	TimeoutMS      int `yaml:"timeout_ms"`
-	MaxOutputBytes int `yaml:"max_output_bytes"`
+	TimeoutMS         int   `yaml:"timeout_ms"`
+	MaxOutputBytes    int   `yaml:"max_output_bytes"`
+	InlineOutputBytes int64 `yaml:"-"`
+	CaptureBytes      int64 `yaml:"-"`
+}
+
+type ArtifactConfig struct {
+	MaxFileBytes  int64
+	MaxTotalBytes int64
+	RetentionDays int64
+}
+
+type FilesConfig struct {
+	ReadMaxBytes       int64
+	ScanMaxBytes       int64
+	ScanMaxFiles       int64
+	ScanMaxDirectories int64
+	ScanMaxLines       int64
 }
 
 type LoadOptions struct {

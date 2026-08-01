@@ -117,6 +117,50 @@ func TestNonAppConfigNumericInputsAreAbsentFromPartialConfig(t *testing.T) {
 	}
 }
 
+func TestResolveToolArtifactAndFilesNumericMatrix(t *testing.T) {
+	for _, spec := range toolArtifactFilesNumericSpecs {
+		for _, testCase := range numericBoundaryCases(spec.defaultVal, spec.minimum, spec.hardCap) {
+			if testCase.encoded != "" {
+				continue
+			}
+			t.Run(spec.path+"/"+testCase.name, func(t *testing.T) {
+				var partial PartialAppConfig
+				setPartialNumericValue(t, &partial, spec.path, testCase.candidate)
+				loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+				if testCase.wantValid {
+					if err != nil || resolvedNumericValue(t, loaded.Config, spec.path) != testCase.want {
+						t.Fatal("valid numeric boundary did not resolve to the expected value")
+					}
+				} else if err == nil {
+					t.Fatal("invalid numeric boundary was accepted")
+				}
+			})
+		}
+	}
+
+	_, err := decodePartial("overflow.yaml", []byte("tool:\n  timeout_ms: 9223372036854775808\n"))
+	if err == nil {
+		t.Fatal("overflowing numeric configuration was accepted")
+	}
+}
+
+func TestLegacyToolOutputMapsOnlyToInlineAndConflictsWithNewKey(t *testing.T) {
+	partial := PartialAppConfig{Tool: PartialToolConfig{MaxOutputBytes: Optional[int64]{Set: true, Value: 123}}}
+	loaded, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{})
+	if err != nil {
+		t.Fatal("legacy tool output value did not resolve")
+	}
+	if loaded.Config.Tool.InlineOutputBytes != 123 || loaded.Config.Tool.MaxOutputBytes != 123 ||
+		loaded.Config.Tool.CaptureBytes != 64*mebibyte {
+		t.Fatal("legacy tool output value mapped beyond inline output")
+	}
+
+	partial.Tool.InlineOutputBytes = Optional[int64]{Set: true, Value: 456}
+	if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
+		t.Fatal("legacy and current inline output keys did not conflict")
+	}
+}
+
 type numericBoundaryCase struct {
 	name      string
 	candidate Optional[int64]
@@ -134,6 +178,60 @@ func numericBoundaryCases(defaultValue int64, minimum int64, hardCap int64) []nu
 		{name: "explicit_zero", candidate: Optional[int64]{Set: true, Value: 0}},
 		{name: "negative", candidate: Optional[int64]{Set: true, Value: -1}},
 		{name: "overflow", encoded: "9223372036854775808"},
+	}
+}
+
+func setPartialNumericValue(t *testing.T, partial *PartialAppConfig, path string, value Optional[int64]) {
+	t.Helper()
+	current := reflect.ValueOf(partial).Elem()
+	parts := strings.Split(path, ".")
+	for index, part := range parts {
+		fieldIndex := -1
+		for candidate := 0; candidate < current.NumField(); candidate++ {
+			if strings.Split(current.Type().Field(candidate).Tag.Get("yaml"), ",")[0] == part {
+				fieldIndex = candidate
+				break
+			}
+		}
+		if fieldIndex < 0 {
+			t.Fatal("numeric test path is absent from PartialAppConfig")
+		}
+		current = current.Field(fieldIndex)
+		if index == len(parts)-1 {
+			current.Set(reflect.ValueOf(value))
+			return
+		}
+	}
+}
+
+func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
+	t.Helper()
+	switch path {
+	case "tool.inline_output_bytes":
+		return config.Tool.InlineOutputBytes
+	case "tool.capture_bytes":
+		return config.Tool.CaptureBytes
+	case "tool.timeout_ms":
+		return int64(config.Tool.TimeoutMS)
+	case "artifact.max_file_bytes":
+		return config.Artifact.MaxFileBytes
+	case "artifact.max_total_bytes":
+		return config.Artifact.MaxTotalBytes
+	case "artifact.retention_days":
+		return config.Artifact.RetentionDays
+	case "files.read_max_bytes":
+		return config.Files.ReadMaxBytes
+	case "files.scan_max_bytes":
+		return config.Files.ScanMaxBytes
+	case "files.scan_max_files":
+		return config.Files.ScanMaxFiles
+	case "files.scan_max_directories":
+		return config.Files.ScanMaxDirectories
+	case "files.scan_max_lines":
+		return config.Files.ScanMaxLines
+	default:
+		t.Fatal("resolved numeric test path is unknown")
+		return 0
 	}
 }
 
