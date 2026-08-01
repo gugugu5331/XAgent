@@ -64,6 +64,26 @@ func TestBootstrapSeparatesCapabilities(t *testing.T) {
 	}
 }
 
+func TestRootCloseIsIdempotent(t *testing.T) {
+	root := mustBootstrap(t, t.TempDir(), Policy{}).Root
+	if err := root.Close(); err != nil {
+		t.Fatal("first Root close failed")
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal("repeated Root close changed the final result")
+	}
+	if root.Identity() != (Identity{}) {
+		t.Fatal("closed Root retained a usable identity")
+	}
+	if _, err := root.Bind("target"); err == nil {
+		t.Fatal("closed Root accepted a new binding")
+	}
+	var nilRoot *Root
+	if err := nilRoot.Close(); err != nil {
+		t.Fatal("nil Root close was not idempotent")
+	}
+}
+
 func TestZeroAndCrossRootCapabilitiesFail(t *testing.T) {
 	rootPath := t.TempDir()
 	first := mustBootstrap(t, rootPath, Policy{})

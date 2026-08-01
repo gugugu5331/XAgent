@@ -64,6 +64,37 @@ func TestUnsupportedRunnerFailsBeforeTargetStart(t *testing.T) {
 	}
 }
 
+func TestProtectionUnavailableFailsBeforeTargetStart(t *testing.T) {
+	root := bootstrapTestRoot(t)
+	defer root.Close()
+	plan, err := newProtectionPlanWithScratch([]*safefs.Root{root}, t.TempDir())
+	if err != nil {
+		t.Fatal("create unavailable protection plan failed")
+	}
+	defer plan.cleanupScratch()
+	marker := filepath.Join(t.TempDir(), "target-started")
+	runner, err := newUnsupportedRunner(Options{})
+	if err != nil {
+		t.Fatal("create unavailable protection runner failed")
+	}
+	process, err := runner.Start(context.Background(), Request{
+		Executable: os.Args[0],
+		Args:       []string{"-test.run=^TestUnsupportedRunnerTargetHelper$", "-test.count=1"},
+		WorkingDir: root,
+		Env:        append(os.Environ(), unsupportedTargetMarkerEnvironment+"="+marker),
+		Mode:       ProtectionRequired,
+		Protection: plan,
+	})
+	var startErr *StartError
+	if process != nil || !errors.As(err, &startErr) ||
+		startErr.Code != startCodeProtectedExecUnavailable || startErr.TargetStarted {
+		t.Fatal("unavailable protection did not fail before target start")
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) || plan.valid() {
+		t.Fatal("unavailable protection started its target or retained scratch")
+	}
+}
+
 func TestUnsupportedRunnerTargetHelper(t *testing.T) {
 	marker := os.Getenv(unsupportedTargetMarkerEnvironment)
 	if marker == "" {
