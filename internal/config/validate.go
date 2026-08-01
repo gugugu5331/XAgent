@@ -98,6 +98,103 @@ func Validate(config *AppConfig) error {
 	return nil
 }
 
+func validateResolvedConfig(config *AppConfig) error {
+	if config == nil {
+		return errors.New("配置为空")
+	}
+	config.LLM.Protocol = strings.TrimSpace(config.LLM.Protocol)
+	if config.LLM.Protocol != ProtocolAnthropic && config.LLM.Protocol != ProtocolOpenAI {
+		return fmt.Errorf("llm.protocol 必须是 %q 或 %q；请在 config.yaml 的 llm.protocol 中配置 provider 协议", ProtocolAnthropic, ProtocolOpenAI)
+	}
+	config.LLM.Model = strings.TrimSpace(config.LLM.Model)
+	if config.LLM.Model == "" {
+		return errors.New("llm.model 不能为空；请配置要使用的模型名")
+	}
+	config.LLM.BaseURL = strings.TrimSpace(config.LLM.BaseURL)
+	if config.LLM.BaseURL == "" {
+		return errors.New("llm.base_url 不能为空；请配置 provider API 地址")
+	}
+	config.LLM.APIKey = strings.TrimSpace(config.LLM.APIKey)
+	if config.LLM.APIKey == "" {
+		return errors.New("llm.api_key 不能为空；建议使用 ${XAGENT_TEST_API_KEY} 或对应 provider 的环境变量")
+	}
+	config.UI.StartMode = strings.TrimSpace(config.UI.StartMode)
+	if config.UI.StartMode != StartModeList && config.UI.StartMode != StartModeNew {
+		return fmt.Errorf("ui.start_mode 必须是 %q 或 %q", StartModeList, StartModeNew)
+	}
+	config.Permission.Mode = strings.TrimSpace(config.Permission.Mode)
+	if config.Permission.Mode != PermissionStrict && config.Permission.Mode != PermissionDefault && config.Permission.Mode != PermissionPermissive {
+		return fmt.Errorf("permission.mode 必须是 %q、%q 或 %q", PermissionStrict, PermissionDefault, PermissionPermissive)
+	}
+	if err := validateResolvedMCP(&config.MCP); err != nil {
+		return err
+	}
+	config.Instructions.ProjectFile = strings.TrimSpace(config.Instructions.ProjectFile)
+	config.Instructions.ProjectDir = strings.TrimSpace(config.Instructions.ProjectDir)
+	config.Instructions.UserDir = strings.TrimSpace(config.Instructions.UserDir)
+	if config.Instructions.ProjectFile == "" {
+		return errors.New("instructions.project_file 不能为空")
+	}
+	if config.Instructions.ProjectDir == "" {
+		return errors.New("instructions.project_dir 不能为空")
+	}
+	if config.Instructions.UserDir == "" {
+		return errors.New("instructions.user_dir 不能为空")
+	}
+	config.Session.Dir = strings.TrimSpace(config.Session.Dir)
+	if config.Session.Dir == "" {
+		return errors.New("session.dir 不能为空")
+	}
+	config.Memory.UserDir = strings.TrimSpace(config.Memory.UserDir)
+	config.Memory.ProjectDir = strings.TrimSpace(config.Memory.ProjectDir)
+	if config.Memory.UserDir == "" {
+		return errors.New("memory.user_dir 不能为空")
+	}
+	if config.Memory.ProjectDir == "" {
+		return errors.New("memory.project_dir 不能为空")
+	}
+	return nil
+}
+
+func validateResolvedMCP(mcp *MCPConfig) error {
+	if mcp.Servers == nil {
+		return nil
+	}
+	valid := make(map[string]MCPServerConfig, len(mcp.Servers))
+	for name, server := range mcp.Servers {
+		serverName := strings.TrimSpace(name)
+		if serverName == "" {
+			mcp.addDiagnostic(name, server.Source, "server 名不能为空")
+			continue
+		}
+		if server.Disabled {
+			valid[serverName] = server
+			continue
+		}
+		server.Type = strings.TrimSpace(server.Type)
+		switch server.Type {
+		case MCPTransportStdio:
+			server.Command = strings.TrimSpace(server.Command)
+			if server.Command == "" {
+				mcp.addDiagnostic(serverName, server.Source, "server %s stdio command 不能为空", serverName)
+				continue
+			}
+		case MCPTransportHTTP:
+			server.URL = strings.TrimSpace(server.URL)
+			if server.URL == "" {
+				mcp.addDiagnostic(serverName, server.Source, "server %s http url 不能为空", serverName)
+				continue
+			}
+		default:
+			mcp.addDiagnostic(serverName, server.Source, "server %s type 必须是 %q 或 %q", serverName, MCPTransportStdio, MCPTransportHTTP)
+			continue
+		}
+		valid[serverName] = server
+	}
+	mcp.Servers = valid
+	return nil
+}
+
 func validateAgent(agent *AgentConfig) error {
 	if agent.MaxIterations <= 0 {
 		return errors.New("agent.max_iterations 必须大于 0")

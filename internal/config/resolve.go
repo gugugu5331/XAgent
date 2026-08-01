@@ -182,6 +182,7 @@ func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 
 func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error) {
 	var config AppConfig
+	resolveNonNumeric(&config, result.Value)
 	if err := resolveToolArtifactFiles(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
@@ -205,6 +206,57 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func resolveNonNumeric(config *AppConfig, partial PartialAppConfig) {
+	config.LLM.Protocol = partial.LLM.Protocol.Value
+	config.LLM.Model = partial.LLM.Model.Value
+	config.LLM.BaseURL = partial.LLM.BaseURL.Value
+	config.LLM.Thinking.Enabled = partial.LLM.Thinking.Enabled.Value
+	config.LLM.Thinking.Show = partial.LLM.Thinking.Show.Value
+
+	config.UI.ShowResponseTimer = true
+	if partial.UI.ShowResponseTimer.Set {
+		config.UI.ShowResponseTimer = partial.UI.ShowResponseTimer.Value
+	}
+	config.UI.StartMode = DefaultStartMode
+	if partial.UI.StartMode.Set {
+		config.UI.StartMode = partial.UI.StartMode.Value
+	}
+	config.Storage.DataDir = DefaultDataDir
+	if partial.Storage.DataDir.Set {
+		config.Storage.DataDir = partial.Storage.DataDir.Value
+	}
+	config.Permission.Mode = PermissionDefault
+	if partial.Permission.Mode.Set {
+		config.Permission.Mode = partial.Permission.Mode.Value
+	}
+
+	config.Context.Enabled = boolPtr(true)
+	if partial.Context.Enabled.Set {
+		config.Context.Enabled = boolPtr(partial.Context.Enabled.Value)
+	}
+	config.Instructions.Enabled = boolPtr(true)
+	if partial.Instructions.Enabled.Set {
+		config.Instructions.Enabled = boolPtr(partial.Instructions.Enabled.Value)
+	}
+	config.Instructions.ProjectFile = optionalStringOrDefault(partial.Instructions.ProjectFile, DefaultInstructionsProjectFile)
+	config.Instructions.ProjectDir = optionalStringOrDefault(partial.Instructions.ProjectDir, DefaultInstructionsProjectDir)
+	config.Instructions.UserDir = optionalStringOrDefault(partial.Instructions.UserDir, DefaultInstructionsUserDir)
+	config.Session.Dir = optionalStringOrDefault(partial.Session.Dir, DefaultSessionDir)
+	config.Memory.Enabled = boolPtr(true)
+	if partial.Memory.Enabled.Set {
+		config.Memory.Enabled = boolPtr(partial.Memory.Enabled.Value)
+	}
+	config.Memory.UserDir = optionalStringOrDefault(partial.Memory.UserDir, DefaultMemoryUserDir)
+	config.Memory.ProjectDir = optionalStringOrDefault(partial.Memory.ProjectDir, DefaultMemoryProjectDir)
+}
+
+func optionalStringOrDefault(value Optional[string], defaultValue string) string {
+	if value.Set {
+		return value.Value
+	}
+	return defaultValue
 }
 
 func resolveEffectiveExpandedSecrets(config *AppConfig, partial PartialAppConfig, runtimeRedactor *redact.RuntimeRedactor) error {

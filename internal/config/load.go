@@ -58,31 +58,33 @@ func LoadWithOptions(path string, options LoadOptions) (*AppConfig, error) {
 		path = DefaultConfigFile
 	}
 
-	projectCfg, err := loadSingle(path)
+	projectCfg, err := DecodePartial(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("无法读取配置文件 %q: %w；请复制 config.example.yaml 到 config.yaml 并填写 llm 配置", path, err)
+		}
 		return nil, err
 	}
-	projectCfg.MCP = markMCPSource(projectCfg.MCP, "project")
-
-	cfg := projectCfg
+	layers := []ConfigLayer{{Source: SourceProject, Path: path, Value: projectCfg}}
 	if userPath := userConfigPath(); userPath != "" && userPath != path {
-		if userCfg, err := loadSingle(userPath); err == nil {
-			userCfg.MCP = markMCPSource(userCfg.MCP, "user")
-			cfg.MCP = MergeMCPConfig(userCfg.MCP, projectCfg.MCP)
+		if userCfg, err := DecodePartial(userPath); err == nil {
+			layers = append(layers, ConfigLayer{Source: SourceUser, Path: userPath, Value: userCfg})
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 	}
-
-	applyDefaults(cfg)
-	if err := expandSensitiveConfig(cfg, options); err != nil {
+	merged, err := MergeLayers(layers...)
+	if err != nil {
 		return nil, err
 	}
-	if err := Validate(cfg); err != nil {
+	loaded, err := ResolveConfig(merged, options)
+	if err != nil {
 		return nil, err
 	}
-
-	return cfg, nil
+	if err := validateResolvedConfig(&loaded.Config); err != nil {
+		return nil, err
+	}
+	return &loaded.Config, nil
 }
 
 func loadSingle(path string) (*AppConfig, error) {

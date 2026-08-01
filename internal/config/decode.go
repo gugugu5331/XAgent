@@ -42,7 +42,7 @@ func (e *configDecodeError) Error() string {
 func DecodePartial(path string) (PartialAppConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return PartialAppConfig{}, fmt.Errorf("read config source %q failed", path)
+		return PartialAppConfig{}, fmt.Errorf("read config source %q failed: %w", path, err)
 	}
 	return decodePartial(path, data)
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -728,6 +729,71 @@ func TestResolveRegistersOnlyEffectiveExpandedSecrets(t *testing.T) {
 	}
 	if failingRedactor.Text("literal-before-failure-canary") != "literal-before-failure-canary" {
 		t.Fatal("failed resolution partially registered a secret")
+	}
+}
+
+func TestLegacyConfigCompatibilityAndConflict(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	base := `
+llm:
+  protocol: anthropic
+  model: claude-test
+  base_url: http://127.0.0.1:1
+  api_key: test-key
+ui:
+  show_response_timer: false
+`
+
+	legacyPath := writeConfig(t, base+`
+tool:
+  max_output_bytes: 12345
+`)
+	legacy, err := Load(legacyPath)
+	if err != nil {
+		t.Fatal("legacy tool output configuration no longer loads")
+	}
+	if legacy.Tool.InlineOutputBytes != 12_345 || legacy.Tool.MaxOutputBytes != 12_345 ||
+		legacy.Tool.CaptureBytes != 64*mebibyte || legacy.UI.ShowResponseTimer {
+		t.Fatal("legacy tool output did not map only to inline output or explicit false was lost")
+	}
+
+	currentPath := writeConfig(t, base+`
+tool:
+  inline_output_bytes: 54321
+`)
+	current, err := Load(currentPath)
+	if err != nil {
+		t.Fatal("current inline output configuration did not load")
+	}
+	if current.Tool.InlineOutputBytes != 54_321 || current.Tool.MaxOutputBytes != 54_321 {
+		t.Fatal("current inline output did not materialize through the compatibility field")
+	}
+
+	conflictPath := writeConfig(t, base+`
+tool:
+  max_output_bytes: 12345
+  inline_output_bytes: 54321
+`)
+	before, err := os.ReadFile(conflictPath)
+	if err != nil {
+		t.Fatal("read conflict fixture failed")
+	}
+	_, err = Load(conflictPath)
+	if err == nil || !strings.Contains(err.Error(), "tool.inline_output_bytes") ||
+		!strings.Contains(err.Error(), "tool.max_output_bytes") {
+		t.Fatal("legacy and current tool output keys did not report an explicit conflict")
+	}
+	after, err := os.ReadFile(conflictPath)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatal("compatibility conflict rewrote the source configuration")
+	}
+
+	zeroPath := writeConfig(t, base+`
+tool:
+  max_output_bytes: 0
+`)
+	if _, err := Load(zeroPath); err == nil || !strings.Contains(err.Error(), "tool.inline_output_bytes") {
+		t.Fatal("legacy explicit zero bypassed inline output validation")
 	}
 }
 
