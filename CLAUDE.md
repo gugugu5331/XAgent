@@ -1,4 +1,4 @@
-# MewCode
+# XAgent
 
 我正在构建一个终端 AI 编程助手（类似 Claude Code），项目名叫 XAgent，使用 Go 实现。
 
