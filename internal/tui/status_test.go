@@ -33,6 +33,18 @@ func TestStatusModeKeepsUsageMCPAndError(t *testing.T) {
 	}
 }
 
+func TestStatusShowsTaskCountsAndWaitingConfirmation(t *testing.T) {
+	output := Status{
+		Mode: "default", Provider: "fake", Model: "model",
+		TaskCount: 5, RunningTasks: 2, WaitingTaskConfirmations: 1,
+	}.View()
+	for _, want := range []string{"任务: 5", "运行中: 2", "等待任务确认: 1"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("status missing %q: %q", want, output)
+		}
+	}
+}
+
 func TestStatusSkillAndRequestModel(t *testing.T) {
 	running := Status{
 		Mode: "default", Provider: "fake", Model: "default-model",

@@ -1,6 +1,10 @@
 package config
 
-import "xagent/internal/redact"
+import (
+	"xagent/internal/agentrole"
+	"xagent/internal/redact"
+	"xagent/internal/subagent"
+)
 
 type AppConfig struct {
 	LLM          LLMConfig          `yaml:"llm"`
@@ -18,16 +22,34 @@ type AppConfig struct {
 	Memory       MemoryConfig       `yaml:"memory"`
 	Diagnostics  DiagnosticsConfig  `yaml:"-"`
 	Lifecycle    LifecycleConfig    `yaml:"-"`
+	Subagent     SubagentConfig     `yaml:"-"`
 }
 
 type LLMConfig struct {
-	Protocol         string         `yaml:"protocol"`
-	Model            string         `yaml:"model"`
-	BaseURL          string         `yaml:"base_url"`
-	APIKey           string         `yaml:"api_key"`
-	RequestTimeoutMS int            `yaml:"request_timeout_ms"`
-	Thinking         ThinkingConfig `yaml:"thinking"`
-	Stream           StreamConfig   `yaml:"-"`
+	Protocol         string               `yaml:"protocol"`
+	Model            string               `yaml:"model"`
+	BaseURL          string               `yaml:"base_url"`
+	APIKey           string               `yaml:"api_key"`
+	RequestTimeoutMS int                  `yaml:"request_timeout_ms"`
+	Thinking         ThinkingConfig       `yaml:"thinking"`
+	Stream           StreamConfig         `yaml:"-"`
+	ModelAliases     ResolvedModelAliases `yaml:"-"`
+}
+
+type ResolvedModelAliases struct {
+	Haiku  string
+	Sonnet string
+	Opus   string
+}
+
+func (a ResolvedModelAliases) ToAgentRole() agentrole.ModelAliases {
+	return agentrole.ModelAliases{Haiku: a.Haiku, Sonnet: a.Sonnet, Opus: a.Opus}
+}
+
+type SubagentConfig struct {
+	RoleLimits      agentrole.Limits
+	Limits          subagent.Limits
+	BackgroundTools []string
 }
 
 type StreamConfig struct {

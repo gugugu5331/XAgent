@@ -137,6 +137,7 @@ go run ./cmd/xagent
 
 | 命令 | 别名 | 类型 | 作用 |
 | --- | --- | --- | --- |
+| `/agent defined|fork [options] <task>` | — | `ui` | 提交子 Agent 任务 |
 | `/artifact <opaque-id>` | — | `ui` | 打开本地 Artifact |
 | `/clear` | `/cls` | `ui` | 清空当前消息显示 |
 | `/compact` | `/ctx` | `local` | 压缩当前会话上下文 |
@@ -149,6 +150,8 @@ go run ./cmd/xagent
 | `/session` | `/sess` | `local` | 显示当前会话摘要 |
 | `/sessions` | `/list` | `ui` | 打开会话列表 |
 | `/status` | `/st` | `local` | 显示统一运行状态 |
+| `/task <task-id> [operation]` | — | `ui` | 查看或操作子 Agent 任务 |
+| `/tasks` | — | `ui` | 显示子 Agent 任务列表 |
 
 权限模式以及公开状态/诊断入口也由同一元数据生成：
 

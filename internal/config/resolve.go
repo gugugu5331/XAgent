@@ -4,8 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
+	"xagent/internal/agentrole"
 	"xagent/internal/redact"
+	"xagent/internal/subagent"
 )
 
 // appConfigNumericManifest is the closed set of numeric values owned by the
@@ -69,6 +73,45 @@ var appConfigNumericManifest = [...]string{
 	"diagnostics.max_item_bytes",
 	"diagnostics.max_total_bytes",
 	"lifecycle.cleanup_timeout_ms",
+	"subagent.auto_background_after_ms",
+	"subagent.max_concurrent",
+	"subagent.max_event_bytes",
+	"subagent.max_events_per_task",
+	"subagent.max_global_events",
+	"subagent.max_pending_results",
+	"subagent.max_queued",
+	"subagent.max_result_bytes",
+	"subagent.max_result_total_bytes",
+	"subagent.max_results_per_claim",
+	"subagent.max_retained_tasks",
+	"subagent.max_role_name_bytes",
+	"subagent.max_subscriber_buffer",
+	"subagent.max_task_bytes",
+	"subagent.max_task_duration_ms",
+	"subagent.max_task_tombstones",
+	"subagent.read_cache_max_bytes",
+	"subagent.read_cache_max_dependencies_per_entry",
+	"subagent.read_cache_max_entries",
+	"subagent.read_cache_max_value_bytes",
+	"subagent.role_limits.max_body_bytes",
+	"subagent.role_limits.max_candidates",
+	"subagent.role_limits.max_description_bytes",
+	"subagent.role_limits.max_diagnostics",
+	"subagent.role_limits.max_entry_bytes",
+	"subagent.role_limits.max_files",
+	"subagent.role_limits.max_frontmatter_bytes",
+	"subagent.role_limits.max_instruction_bytes",
+	"subagent.role_limits.max_model_bytes",
+	"subagent.role_limits.max_name_bytes",
+	"subagent.role_limits.max_origin_bytes",
+	"subagent.role_limits.max_provider_id_bytes",
+	"subagent.role_limits.max_providers",
+	"subagent.role_limits.max_root_bytes",
+	"subagent.role_limits.max_source_id_bytes",
+	"subagent.role_limits.max_tool_list_bytes",
+	"subagent.role_limits.max_tool_name_bytes",
+	"subagent.role_limits.max_tool_names",
+	"subagent.role_limits.max_total_bytes",
 }
 
 func appConfigNumericKeys() []string {
@@ -142,7 +185,7 @@ var llmAgentStreamNumericSpecs = [...]numericSpec{
 var contextSessionNumericSpecs = [...]numericSpec{
 	{path: "context.tool_result_threshold_chars", defaultVal: 32 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
 	{path: "context.tool_results_threshold_chars", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 4 * mebibyte},
-	{path: "context.model_window_tokens", defaultVal: 200_000, minimum: 2, hardCap: 10_000_000},
+	{path: "context.model_window_tokens", defaultVal: 200_000, minimum: 131, hardCap: 10_000_000},
 	{path: "context.auto_margin_tokens", defaultVal: 13_000, minimum: 1, hardCap: 1_000_000},
 	{path: "context.manual_margin_tokens", defaultVal: 3_000, minimum: 1, hardCap: 1_000_000},
 	{path: "context.recent_keep_tokens", defaultVal: 10_000, minimum: 1, hardCap: 1_000_000},
@@ -170,6 +213,51 @@ var memoryDiagnosticsLifecycleNumericSpecs = [...]numericSpec{
 	{path: "lifecycle.cleanup_timeout_ms", defaultVal: 2_000, minimum: 1, hardCap: 2_000},
 }
 
+var roleLimitNumericSpecs = [...]numericSpec{
+	{path: "subagent.role_limits.max_files", defaultVal: 256, minimum: 1, hardCap: 4_096},
+	{path: "subagent.role_limits.max_entry_bytes", defaultVal: 256 * kibibyte, minimum: 1, hardCap: 4 * mebibyte},
+	{path: "subagent.role_limits.max_frontmatter_bytes", defaultVal: 32 * kibibyte, minimum: 1, hardCap: 256 * kibibyte},
+	{path: "subagent.role_limits.max_body_bytes", defaultVal: 128 * kibibyte, minimum: 1, hardCap: 2 * mebibyte},
+	{path: "subagent.role_limits.max_name_bytes", defaultVal: 64, minimum: 1, hardCap: 64},
+	{path: "subagent.role_limits.max_description_bytes", defaultVal: 8 * kibibyte, minimum: 1, hardCap: 64 * kibibyte},
+	{path: "subagent.role_limits.max_instruction_bytes", defaultVal: 128 * kibibyte, minimum: 1, hardCap: 2 * mebibyte},
+	{path: "subagent.role_limits.max_tool_name_bytes", defaultVal: 128, minimum: 1, hardCap: 512},
+	{path: "subagent.role_limits.max_tool_list_bytes", defaultVal: 8 * kibibyte, minimum: 1, hardCap: 128 * kibibyte},
+	{path: "subagent.role_limits.max_origin_bytes", defaultVal: 256, minimum: 1, hardCap: 4 * kibibyte},
+	{path: "subagent.role_limits.max_source_id_bytes", defaultVal: 256, minimum: 1, hardCap: 4 * kibibyte},
+	{path: "subagent.role_limits.max_provider_id_bytes", defaultVal: 256, minimum: 1, hardCap: 4 * kibibyte},
+	{path: "subagent.role_limits.max_root_bytes", defaultVal: 4 * kibibyte, minimum: 1, hardCap: 64 * kibibyte},
+	{path: "subagent.role_limits.max_model_bytes", defaultVal: 256, minimum: 1, hardCap: 4 * kibibyte},
+	{path: "subagent.role_limits.max_total_bytes", defaultVal: 64 * mebibyte, minimum: 1, hardCap: 512 * mebibyte},
+	{path: "subagent.role_limits.max_tool_names", defaultVal: 128, minimum: 1, hardCap: 1_024},
+	{path: "subagent.role_limits.max_providers", defaultVal: 64, minimum: 1, hardCap: 256},
+	{path: "subagent.role_limits.max_candidates", defaultVal: 512, minimum: 1, hardCap: 4_096},
+	{path: "subagent.role_limits.max_diagnostics", defaultVal: 256, minimum: 1, hardCap: 4_096},
+}
+
+var subagentRuntimeNumericSpecs = [...]numericSpec{
+	{path: "subagent.max_task_bytes", defaultVal: 32 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "subagent.max_concurrent", defaultVal: 4, minimum: 1, hardCap: 64},
+	{path: "subagent.max_queued", defaultVal: 32, minimum: 1, hardCap: 4_096},
+	{path: "subagent.max_retained_tasks", defaultVal: 256, minimum: 2, hardCap: 65_536},
+	{path: "subagent.max_task_tombstones", defaultVal: 1_024, minimum: 1, hardCap: 65_536},
+	{path: "subagent.max_global_events", defaultVal: 8_192, minimum: 1, hardCap: 1_000_000},
+	{path: "subagent.max_events_per_task", defaultVal: 1_024, minimum: 1, hardCap: 100_000},
+	{path: "subagent.max_event_bytes", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "subagent.max_subscriber_buffer", defaultVal: 128, minimum: 1, hardCap: 65_536},
+	{path: "subagent.max_result_bytes", defaultVal: 64 * kibibyte, minimum: 1, hardCap: 1 * mebibyte},
+	{path: "subagent.max_pending_results", defaultVal: 256, minimum: 1, hardCap: 65_536},
+	{path: "subagent.max_result_total_bytes", defaultVal: 8 * mebibyte, minimum: 1, hardCap: 512 * mebibyte},
+	{path: "subagent.max_results_per_claim", defaultVal: 32, minimum: 1, hardCap: 1_024},
+	{path: "subagent.read_cache_max_entries", defaultVal: 128, minimum: 1, hardCap: 65_536},
+	{path: "subagent.read_cache_max_bytes", defaultVal: 8 * mebibyte, minimum: 1, hardCap: 512 * mebibyte},
+	{path: "subagent.read_cache_max_value_bytes", defaultVal: 1 * mebibyte, minimum: 1, hardCap: 64 * mebibyte},
+	{path: "subagent.read_cache_max_dependencies_per_entry", defaultVal: 4_096, minimum: 1, hardCap: 1_000_000},
+	{path: "subagent.max_role_name_bytes", defaultVal: 64, minimum: 1, hardCap: 64},
+	{path: "subagent.auto_background_after_ms", defaultVal: 10_000, minimum: 1, hardCap: 3_600_000},
+	{path: "subagent.max_task_duration_ms", defaultVal: 0, minimum: 0, hardCap: 86_400_000},
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -183,6 +271,15 @@ func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error) {
 	var config AppConfig
 	resolveNonNumeric(&config, result.Value)
+	resolvedSubagent, err := ResolveSubagentConfig(result.Value.Subagent)
+	if err != nil {
+		return LoadedConfig{}, err
+	}
+	config.Subagent = resolvedSubagent
+	config.LLM.ModelAliases, err = ResolveModelAliases(result.Value.LLM.ModelAliases, resolvedSubagent.RoleLimits.MaxModelBytes)
+	if err != nil {
+		return LoadedConfig{}, err
+	}
 	if err := resolveToolArtifactFiles(&config, result.Value); err != nil {
 		return LoadedConfig{}, err
 	}
@@ -193,6 +290,9 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 		return LoadedConfig{}, err
 	}
 	if err := resolveContextSession(&config, result.Value); err != nil {
+		return LoadedConfig{}, err
+	}
+	if err := validateSubagentResultPlanningReserve(config); err != nil {
 		return LoadedConfig{}, err
 	}
 	if err := resolveMemoryDiagnosticsLifecycle(&config, result.Value); err != nil {
@@ -206,6 +306,226 @@ func ResolveConfig(result MergeResult, options LoadOptions) (LoadedConfig, error
 		provenance[path] = source
 	}
 	return LoadedConfig{Config: config, Provenance: provenance}, nil
+}
+
+func validateSubagentResultPlanningReserve(config AppConfig) error {
+	reserve, err := subagent.ResultPlanningReserveTokens(config.Subagent.Limits.MaxResultBytes)
+	if err != nil {
+		return errors.New("config field \"subagent.max_result_bytes\" has an invalid planning reserve")
+	}
+	planningWindow := config.Context.ModelWindowTokens - config.Context.AutoMarginTokens
+	if planningWindow <= 0 || reserve >= planningWindow {
+		return errors.New("config field \"subagent.max_result_bytes\" cannot fit inside the automatic context planning window")
+	}
+	return nil
+}
+
+func ResolveModelAliases(partial PartialModelAliases, maxModelBytes int64) (ResolvedModelAliases, error) {
+	if maxModelBytes <= 0 {
+		return ResolvedModelAliases{}, errors.New("config field \"llm.model_aliases\" has an invalid size limit")
+	}
+	resolve := func(path string, value Optional[string]) (string, error) {
+		if !value.Set {
+			return "", nil
+		}
+		trimmed := strings.TrimSpace(value.Value)
+		if trimmed == "" || int64(len(trimmed)) > maxModelBytes {
+			return "", fmt.Errorf("config field %q must be non-empty and at most %d bytes", path, maxModelBytes)
+		}
+		return trimmed, nil
+	}
+	var resolved ResolvedModelAliases
+	var err error
+	if resolved.Haiku, err = resolve("llm.model_aliases.haiku", partial.Haiku); err != nil {
+		return ResolvedModelAliases{}, err
+	}
+	if resolved.Sonnet, err = resolve("llm.model_aliases.sonnet", partial.Sonnet); err != nil {
+		return ResolvedModelAliases{}, err
+	}
+	if resolved.Opus, err = resolve("llm.model_aliases.opus", partial.Opus); err != nil {
+		return ResolvedModelAliases{}, err
+	}
+	return resolved, nil
+}
+
+func ResolveSubagentConfig(partial PartialSubagentConfig) (SubagentConfig, error) {
+	roleLimits := agentrole.DefaultLimits()
+	if err := applyRoleLimits(&roleLimits, partial.RoleLimits); err != nil {
+		return SubagentConfig{}, err
+	}
+	if err := roleLimits.Validate(); err != nil {
+		return SubagentConfig{}, fmt.Errorf("config field \"subagent.role_limits\": %w", err)
+	}
+
+	runtimeLimits := subagent.DefaultLimits()
+	if err := applySubagentLimits(&runtimeLimits, partial); err != nil {
+		return SubagentConfig{}, err
+	}
+	if err := runtimeLimits.Validate(); err != nil {
+		return SubagentConfig{}, fmt.Errorf("config field \"subagent\": %w", err)
+	}
+
+	var backgroundTools []string
+	if partial.BackgroundTools.Set {
+		backgroundTools = append([]string{}, partial.BackgroundTools.Value...)
+	}
+	return SubagentConfig{RoleLimits: roleLimits, Limits: runtimeLimits, BackgroundTools: backgroundTools}, nil
+}
+
+func applyRoleLimits(target *agentrole.Limits, partial PartialRoleLimits) error {
+	if target == nil {
+		return errors.New("config field \"subagent.role_limits\" target is nil")
+	}
+	intFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(int)
+	}{
+		{"subagent.role_limits.max_files", partial.MaxFiles, func(value int) { target.MaxFiles = value }},
+		{"subagent.role_limits.max_tool_names", partial.MaxToolNames, func(value int) { target.MaxToolNames = value }},
+		{"subagent.role_limits.max_providers", partial.MaxProviders, func(value int) { target.MaxProviders = value }},
+		{"subagent.role_limits.max_candidates", partial.MaxCandidates, func(value int) { target.MaxCandidates = value }},
+		{"subagent.role_limits.max_diagnostics", partial.MaxDiagnostics, func(value int) { target.MaxDiagnostics = value }},
+	}
+	for _, field := range intFields {
+		if !field.value.Set {
+			continue
+		}
+		resolved, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return err
+		}
+		value, err := positiveInt(field.path, resolved)
+		if err != nil {
+			return err
+		}
+		field.set(value)
+	}
+	byteFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(int64)
+	}{
+		{"subagent.role_limits.max_entry_bytes", partial.MaxEntryBytes, func(value int64) { target.MaxEntryBytes = value }},
+		{"subagent.role_limits.max_frontmatter_bytes", partial.MaxFrontmatterBytes, func(value int64) { target.MaxFrontmatterBytes = value }},
+		{"subagent.role_limits.max_body_bytes", partial.MaxBodyBytes, func(value int64) { target.MaxBodyBytes = value }},
+		{"subagent.role_limits.max_name_bytes", partial.MaxNameBytes, func(value int64) { target.MaxNameBytes = value }},
+		{"subagent.role_limits.max_description_bytes", partial.MaxDescriptionBytes, func(value int64) { target.MaxDescriptionBytes = value }},
+		{"subagent.role_limits.max_instruction_bytes", partial.MaxInstructionBytes, func(value int64) { target.MaxInstructionBytes = value }},
+		{"subagent.role_limits.max_tool_name_bytes", partial.MaxToolNameBytes, func(value int64) { target.MaxToolNameBytes = value }},
+		{"subagent.role_limits.max_tool_list_bytes", partial.MaxToolListBytes, func(value int64) { target.MaxToolListBytes = value }},
+		{"subagent.role_limits.max_origin_bytes", partial.MaxOriginBytes, func(value int64) { target.MaxOriginBytes = value }},
+		{"subagent.role_limits.max_source_id_bytes", partial.MaxSourceIDBytes, func(value int64) { target.MaxSourceIDBytes = value }},
+		{"subagent.role_limits.max_provider_id_bytes", partial.MaxProviderIDBytes, func(value int64) { target.MaxProviderIDBytes = value }},
+		{"subagent.role_limits.max_root_bytes", partial.MaxRootBytes, func(value int64) { target.MaxRootBytes = value }},
+		{"subagent.role_limits.max_model_bytes", partial.MaxModelBytes, func(value int64) { target.MaxModelBytes = value }},
+		{"subagent.role_limits.max_total_bytes", partial.MaxTotalBytes, func(value int64) { target.MaxTotalBytes = value }},
+	}
+	for _, field := range byteFields {
+		if !field.value.Set {
+			continue
+		}
+		value, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return err
+		}
+		field.set(value)
+	}
+	return nil
+}
+
+func applySubagentLimits(target *subagent.Limits, partial PartialSubagentConfig) error {
+	if target == nil {
+		return errors.New("config field \"subagent\" target is nil")
+	}
+	intFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(int)
+	}{
+		{"subagent.max_concurrent", partial.MaxConcurrent, func(value int) { target.MaxConcurrent = value }},
+		{"subagent.max_queued", partial.MaxQueued, func(value int) { target.MaxQueued = value }},
+		{"subagent.max_retained_tasks", partial.MaxRetainedTasks, func(value int) { target.MaxRetainedTasks = value }},
+		{"subagent.max_task_tombstones", partial.MaxTaskTombstones, func(value int) { target.MaxTaskTombstones = value }},
+		{"subagent.max_global_events", partial.MaxGlobalEvents, func(value int) { target.MaxGlobalEvents = value }},
+		{"subagent.max_events_per_task", partial.MaxEventsPerTask, func(value int) { target.MaxEventsPerTask = value }},
+		{"subagent.max_subscriber_buffer", partial.MaxSubscriberBuffer, func(value int) { target.MaxSubscriberBuffer = value }},
+		{"subagent.max_pending_results", partial.MaxPendingResults, func(value int) { target.MaxPendingResults = value }},
+		{"subagent.max_results_per_claim", partial.MaxResultsPerClaim, func(value int) { target.MaxResultsPerClaim = value }},
+		{"subagent.read_cache_max_entries", partial.ReadCacheMaxEntries, func(value int) { target.ReadCacheMaxEntries = value }},
+		{"subagent.read_cache_max_dependencies_per_entry", partial.ReadCacheMaxDependenciesPerEntry, func(value int) { target.ReadCacheMaxDependenciesPerEntry = value }},
+	}
+	for _, field := range intFields {
+		if !field.value.Set {
+			continue
+		}
+		resolved, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return err
+		}
+		value, err := positiveInt(field.path, resolved)
+		if err != nil {
+			return err
+		}
+		field.set(value)
+	}
+	byteFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(int64)
+	}{
+		{"subagent.max_task_bytes", partial.MaxTaskBytes, func(value int64) { target.MaxTaskBytes = value }},
+		{"subagent.max_event_bytes", partial.MaxEventBytes, func(value int64) { target.MaxEventBytes = value }},
+		{"subagent.max_result_bytes", partial.MaxResultBytes, func(value int64) { target.MaxResultBytes = value }},
+		{"subagent.max_result_total_bytes", partial.MaxResultTotalBytes, func(value int64) { target.MaxResultTotalBytes = value }},
+		{"subagent.read_cache_max_bytes", partial.ReadCacheMaxBytes, func(value int64) { target.ReadCacheMaxBytes = value }},
+		{"subagent.read_cache_max_value_bytes", partial.ReadCacheMaxValueBytes, func(value int64) { target.ReadCacheMaxValueBytes = value }},
+		{"subagent.max_role_name_bytes", partial.MaxRoleNameBytes, func(value int64) { target.MaxRoleNameBytes = value }},
+	}
+	for _, field := range byteFields {
+		if !field.value.Set {
+			continue
+		}
+		value, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return err
+		}
+		field.set(value)
+	}
+	if partial.AutoBackgroundAfterMS.Set {
+		value, err := resolveSubagentNumeric("subagent.auto_background_after_ms", partial.AutoBackgroundAfterMS)
+		if err != nil {
+			return err
+		}
+		target.AutoBackgroundAfter = time.Duration(value) * time.Millisecond
+	}
+	if partial.MaxTaskDurationMS.Set {
+		value, err := resolveSubagentNumeric("subagent.max_task_duration_ms", partial.MaxTaskDurationMS)
+		if err != nil {
+			return err
+		}
+		target.MaxTaskDuration = time.Duration(value) * time.Millisecond
+	}
+	return nil
+}
+
+func resolveSubagentNumeric(path string, candidate Optional[int64]) (int64, error) {
+	for _, specs := range [][]numericSpec{roleLimitNumericSpecs[:], subagentRuntimeNumericSpecs[:]} {
+		for _, spec := range specs {
+			if spec.path == path {
+				return spec.resolve(candidate)
+			}
+		}
+	}
+	return 0, fmt.Errorf("config field %q is not a registered subagent limit", path)
+}
+
+func positiveInt(path string, value int64) (int, error) {
+	maxInt := int64(^uint(0) >> 1)
+	if value <= 0 || value > maxInt {
+		return 0, fmt.Errorf("config field %q must be a positive platform integer", path)
+	}
+	return int(value), nil
 }
 
 func resolveNonNumeric(config *AppConfig, partial PartialAppConfig) {

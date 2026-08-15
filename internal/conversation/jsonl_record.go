@@ -182,6 +182,16 @@ func validV2Messages(messages []Message) bool {
 		if !validV2MessageRole(message.Role) || message.CreatedAt.IsZero() {
 			return false
 		}
+		if message.Role == RoleSubagentNotification {
+			if message.Tool != nil || message.Subagent == nil || message.CreatedAt != message.Subagent.CreatedAt ||
+				message.Content.Text() != message.Subagent.Summary.Text() || !validSubagentNotification(*message.Subagent) {
+				return false
+			}
+			continue
+		}
+		if message.Subagent != nil {
+			return false
+		}
 		if message.Tool == nil {
 			if message.Role == RoleToolCall || message.Role == RoleToolResult {
 				return false
@@ -252,7 +262,7 @@ func validOpaqueV2ArtifactID(id string) bool {
 
 func validV2MessageRole(role MessageRole) bool {
 	switch role {
-	case RoleUser, RoleAssistant, RoleThinking, RoleToolCall, RoleToolResult, RoleContextSummary, RoleContextBoundary:
+	case RoleUser, RoleAssistant, RoleThinking, RoleToolCall, RoleToolResult, RoleContextSummary, RoleContextBoundary, RoleSubagentNotification:
 		return true
 	default:
 		return false
@@ -577,10 +587,22 @@ type conversationV2Wire struct {
 }
 
 type messageV2Wire struct {
-	Role      MessageRole      `json:"role"`
-	Content   string           `json:"content"`
-	CreatedAt time.Time        `json:"created_at"`
-	Tool      *toolStateV2Wire `json:"tool"`
+	Role      MessageRole                      `json:"role"`
+	Content   string                           `json:"content"`
+	CreatedAt time.Time                        `json:"created_at"`
+	Tool      *toolStateV2Wire                 `json:"tool"`
+	Subagent  *subagentNotificationMessageWire `json:"subagent_notification,omitempty"`
+}
+
+type subagentNotificationMessageWire struct {
+	NotificationID   string    `json:"notification_id"`
+	TaskID           string    `json:"task_id"`
+	Status           string    `json:"status"`
+	Summary          string    `json:"summary"`
+	SummaryTruncated bool      `json:"summary_truncated"`
+	TruncationReason string    `json:"truncation_reason"`
+	StopReason       string    `json:"stop_reason"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type toolStateV2Wire struct {
@@ -654,9 +676,23 @@ func toMessageV2Wires(messages []Message) []messageV2Wire {
 	}
 	result := make([]messageV2Wire, len(messages))
 	for index, message := range messages {
-		result[index] = messageV2Wire{Role: message.Role, Content: message.Content.Text(), CreatedAt: message.CreatedAt, Tool: toToolStateV2Wire(message.Tool)}
+		result[index] = messageV2Wire{
+			Role: message.Role, Content: message.Content.Text(), CreatedAt: message.CreatedAt,
+			Tool: toToolStateV2Wire(message.Tool), Subagent: toSubagentNotificationMessageWire(message.Subagent),
+		}
 	}
 	return result
+}
+
+func toSubagentNotificationMessageWire(notification *SubagentNotificationMessage) *subagentNotificationMessageWire {
+	if notification == nil {
+		return nil
+	}
+	return &subagentNotificationMessageWire{
+		NotificationID: notification.NotificationID, TaskID: notification.TaskID, Status: notification.Status,
+		Summary: notification.Summary.Text(), SummaryTruncated: notification.SummaryTruncated,
+		TruncationReason: notification.TruncationReason.Text(), StopReason: notification.StopReason, CreatedAt: notification.CreatedAt,
+	}
 }
 
 func toToolStateV2Wire(state *ToolState) *toolStateV2Wire {
@@ -730,9 +766,23 @@ func fromMessageV2Wires(messages []messageV2Wire, redactor *redact.RuntimeRedact
 	}
 	result := make([]Message, len(messages))
 	for index, message := range messages {
-		result[index] = Message{Role: message.Role, Content: redactor.Redact(message.Content), CreatedAt: message.CreatedAt, Tool: fromToolStateV2Wire(message.Tool, redactor)}
+		result[index] = Message{
+			Role: message.Role, Content: redactor.Redact(message.Content), CreatedAt: message.CreatedAt,
+			Tool: fromToolStateV2Wire(message.Tool, redactor), Subagent: fromSubagentNotificationMessageWire(message.Subagent, redactor),
+		}
 	}
 	return result
+}
+
+func fromSubagentNotificationMessageWire(notification *subagentNotificationMessageWire, redactor *redact.RuntimeRedactor) *SubagentNotificationMessage {
+	if notification == nil {
+		return nil
+	}
+	return &SubagentNotificationMessage{
+		NotificationID: notification.NotificationID, TaskID: notification.TaskID, Status: notification.Status,
+		Summary: redactor.Redact(notification.Summary), SummaryTruncated: notification.SummaryTruncated,
+		TruncationReason: redactor.Redact(notification.TruncationReason), StopReason: notification.StopReason, CreatedAt: notification.CreatedAt,
+	}
 }
 
 func fromToolStateV2Wire(state *toolStateV2Wire, redactor *redact.RuntimeRedactor) *ToolState {

@@ -33,25 +33,24 @@ func TestDecodeCapturedCallToolResponseWritesBeforeTailAndScrubsDTO(t *testing.T
 	prefix := `{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"` + canary + `"}]`
 	tail := `,"structuredContent":{"private":"` + canary + `"}}}`
 	reader := &gatedCodecReader{prefix: []byte(prefix), release: make(chan struct{})}
-	var output bytes.Buffer
+	output := newSynchronizedCodecCaptureBuffer()
 	type outcome struct {
 		value CapturedCallToolResponse
 		err   error
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		value, err := DecodeCapturedCallToolResponse(json.NewDecoder(reader), &output)
+		value, err := DecodeCapturedCallToolResponse(json.NewDecoder(reader), output)
 		done <- outcome{value: value, err: err}
 	}()
 
-	deadline := time.After(time.Second)
-	for output.String() != canary {
-		select {
-		case <-deadline:
-			t.Fatalf("capture was not written before response tail: %q", output.String())
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case <-output.firstWrite:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("capture was not written before response tail: %q", output.String())
+	}
+	if captured := output.String(); captured != canary {
+		t.Fatalf("capture wrote unexpected content before response tail: %q", captured)
 	}
 	select {
 	case completed := <-done:
@@ -66,6 +65,33 @@ func TestDecodeCapturedCallToolResponseWritesBeforeTailAndScrubsDTO(t *testing.T
 		completed.value.Result.StructuredContent != nil {
 		t.Fatalf("captured response retained user output: %#v / %v", completed.value, completed.err)
 	}
+}
+
+type synchronizedCodecCaptureBuffer struct {
+	mu         sync.Mutex
+	buffer     bytes.Buffer
+	firstWrite chan struct{}
+	writeOnce  sync.Once
+}
+
+func newSynchronizedCodecCaptureBuffer() *synchronizedCodecCaptureBuffer {
+	return &synchronizedCodecCaptureBuffer{firstWrite: make(chan struct{})}
+}
+
+func (buffer *synchronizedCodecCaptureBuffer) Write(value []byte) (int, error) {
+	buffer.mu.Lock()
+	count, err := buffer.buffer.Write(value)
+	buffer.mu.Unlock()
+	if count > 0 {
+		buffer.writeOnce.Do(func() { close(buffer.firstWrite) })
+	}
+	return count, err
+}
+
+func (buffer *synchronizedCodecCaptureBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.String()
 }
 
 type gatedCodecReader struct {

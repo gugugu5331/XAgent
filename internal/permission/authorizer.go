@@ -27,6 +27,9 @@ type Authorizer struct {
 	Writer     Writer
 	Redact     func(string) string
 	Issuer     TicketIssuer
+
+	fixedMode         Mode
+	permanentDisabled bool
 }
 
 func (a *Authorizer) Decide(call Call, context Context) Decision {
@@ -34,9 +37,7 @@ func (a *Authorizer) Decide(call Call, context Context) Decision {
 	if err != nil {
 		return deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "invalid tool arguments"}, "工具参数无法用于权限判断", "Tool arguments are invalid for permission checking.")
 	}
-	if context.Mode == "" {
-		context.Mode = ModeDefault
-	}
+	context.Mode = a.effectiveMode(context.Mode)
 	if context.PlanMode && isWriteOrBash(call.Name) {
 		return deny(call, ReasonPlanMode, Source{Kind: SourceHardConstraint, Description: "plan mode"}, "Plan Mode 下不允许执行写工具或 Bash", "Plan Mode allows only read-only tools.")
 	}
@@ -81,9 +82,7 @@ func (a *Authorizer) CheckHard(normalized NormalizedCall, context Context) *Deci
 // DecideOrdinary applies configured layers and the mode default to a call that
 // has already passed normalization, profile policy, and hard constraints.
 func (a *Authorizer) DecideOrdinary(normalized NormalizedCall, context Context) Decision {
-	if context.Mode == "" {
-		context.Mode = ModeDefault
-	}
+	context.Mode = a.effectiveMode(context.Mode)
 	if a != nil && a.permissionHealthDegraded() {
 		if isConservativeReadOnlyTool(normalized.Call.Name) {
 			return a.allow(normalized, context, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
@@ -115,7 +114,7 @@ func (a *Authorizer) DecideOrdinary(normalized NormalizedCall, context Context) 
 	}
 	decision := a.decideByMode(context.Mode, normalized, context)
 	if decision.Prompt != nil {
-		decision.Prompt = newConfirmationPrompt(normalized, decision.Prompt.Mode, decision.Prompt.Reason, a.redactText)
+		decision.Prompt = newConfirmationPrompt(normalized, decision.Prompt.Mode, decision.Prompt.Reason, a.redactText, a.permanentPermissionEnabled())
 	}
 	return decision
 }
@@ -135,6 +134,7 @@ func (a *Authorizer) ResolveNormalizedUserDecision(normalized NormalizedCall, co
 }
 
 func (a *Authorizer) resolveNormalizedUserDecision(normalized NormalizedCall, context Context, action UserAction) Decision {
+	context.Mode = a.effectiveMode(context.Mode)
 	call := normalized.Call
 	if context.PlanMode && isWriteOrBash(call.Name) {
 		return deny(call, ReasonPlanMode, Source{Kind: SourceHardConstraint, Description: "plan mode"}, "Plan Mode 下不允许执行写工具或 Bash", "Plan Mode allows only read-only tools.")
@@ -225,7 +225,7 @@ func ticketFailure(call Call) Decision {
 }
 
 func ask(normalized NormalizedCall, mode Mode, reason string) Decision {
-	prompt := newConfirmationPrompt(normalized, mode, reason, redact.Text)
+	prompt := newConfirmationPrompt(normalized, mode, reason, redact.Text, true)
 	return Decision{
 		Kind:        DecisionAsk,
 		Source:      Source{Kind: SourceNone, Description: reason},
@@ -234,12 +234,12 @@ func ask(normalized NormalizedCall, mode Mode, reason string) Decision {
 	}
 }
 
-func newConfirmationPrompt(normalized NormalizedCall, mode Mode, reason string, redactText func(string) string) *ConfirmationPrompt {
+func newConfirmationPrompt(normalized NormalizedCall, mode Mode, reason string, redactText func(string) string, permanentEnabled bool) *ConfirmationPrompt {
 	risk := RiskMedium
 	if normalized.Call.Name == "Bash" && normalized.ComplexShell {
 		risk = RiskHigh
 	}
-	allowPermanent := canAllowPermanentWith(normalized, redactText)
+	allowPermanent := permanentEnabled && canAllowPermanentWith(normalized, redactText)
 	prompt := &ConfirmationPrompt{
 		Tool:           normalized.Call.Name,
 		Risk:           risk,
@@ -279,10 +279,38 @@ func canAllowPermanent(normalized NormalizedCall) bool {
 }
 
 func (a *Authorizer) canAllowPermanent(normalized NormalizedCall) bool {
+	if a != nil && a.permanentDisabled {
+		return false
+	}
 	if a == nil {
 		return canAllowPermanent(normalized)
 	}
 	return canAllowPermanentWith(normalized, a.redactText)
+}
+
+func (a *Authorizer) permanentPermissionEnabled() bool {
+	return a == nil || !a.permanentDisabled
+}
+
+func (a *Authorizer) effectiveMode(requested Mode) Mode {
+	if a == nil || a.fixedMode == "" {
+		return modeOrDefault(requested)
+	}
+	fixed, fixedRank, fixedOK := normalizedModeRank(a.fixedMode)
+	if !fixedOK {
+		return ModeStrict
+	}
+	if requested == "" {
+		return fixed
+	}
+	requested, requestedRank, requestedOK := normalizedModeRank(requested)
+	if !requestedOK {
+		return ModeStrict
+	}
+	if requestedRank < fixedRank {
+		return requested
+	}
+	return fixed
 }
 
 func canAllowPermanentWith(normalized NormalizedCall, redactText func(string) string) bool {

@@ -5,6 +5,19 @@ import (
 	"encoding/json"
 )
 
+// ExecutionRoute selects the trusted dispatcher for a validated tool call.
+// System-routed tools are definitions only and must never reach Executor.
+type ExecutionRoute uint8
+
+const (
+	RouteExecutor ExecutionRoute = iota
+	RouteSystem
+)
+
+func (r ExecutionRoute) valid() bool {
+	return r == RouteExecutor || r == RouteSystem
+}
+
 // Definition is the detached, non-executable view exposed by Registry.
 // Callers may inspect and advertise registered tools, but only Executor can
 // recover the private execution target after a ticket has been consumed.

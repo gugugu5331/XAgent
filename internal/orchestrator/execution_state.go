@@ -10,16 +10,50 @@ import (
 
 	"xagent/internal/contextmgr"
 	"xagent/internal/hook"
+	"xagent/internal/provider"
 	"xagent/internal/redact"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
 
 type executionState struct {
-	activity      *skill.Activity
-	profile       skill.ExecutionProfile
-	ref           hook.ExecutionRef
-	modelContents modelContentSlotState
+	activity          *skill.Activity
+	profile           skill.ExecutionProfile
+	ref               hook.ExecutionRef
+	requestGeneration uint64
+	modelContents     modelContentSlotState
+	parentPromptMu    sync.Mutex
+	parentPromptRef   hook.ExecutionRef
+	parentPrompt      provider.PromptPrefixSnapshot
+}
+
+func (s *executionState) captureParentPrompt(ref hook.ExecutionRef, snapshot provider.PromptPrefixSnapshot) error {
+	if s == nil || s.requestGeneration == 0 || ref.ExecutionID == "" || ref.ExecutionID != s.ref.ExecutionID || ref.SessionID != s.ref.SessionID {
+		return fmt.Errorf("parent prompt identity is invalid")
+	}
+	cloned, err := clonePromptPrefixSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+	s.parentPromptMu.Lock()
+	s.parentPromptRef = ref
+	s.parentPrompt = cloned
+	s.parentPromptMu.Unlock()
+	return nil
+}
+
+func (s *executionState) currentParentPrompt(ref hook.ExecutionRef) (provider.PromptPrefixSnapshot, error) {
+	if s == nil || s.requestGeneration == 0 {
+		return provider.PromptPrefixSnapshot{}, fmt.Errorf("parent prompt state is unavailable")
+	}
+	s.parentPromptMu.Lock()
+	storedRef := s.parentPromptRef
+	stored := s.parentPrompt
+	s.parentPromptMu.Unlock()
+	if storedRef.ExecutionID == "" || storedRef.ExecutionID != ref.ExecutionID || storedRef.SessionID != ref.SessionID {
+		return provider.PromptPrefixSnapshot{}, fmt.Errorf("parent prompt identity is stale")
+	}
+	return clonePromptPrefixSnapshot(stored)
 }
 
 // modelContentSlotKey identifies one temporary model-only tool result. CallID

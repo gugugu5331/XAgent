@@ -10,8 +10,10 @@ import (
 type Screen string
 
 const (
-	ScreenList Screen = "list"
-	ScreenChat Screen = "chat"
+	ScreenList       Screen = "list"
+	ScreenChat       Screen = "chat"
+	ScreenTasks      Screen = "tasks"
+	ScreenTaskDetail Screen = "task_detail"
 )
 
 // ViewModelSpec is the capability-free construction input owned by App. The
@@ -25,6 +27,8 @@ type ViewModelSpec struct {
 	Conversation    ConversationViewSpec
 	Request         RequestViewSpec
 	Sessions        SessionListViewSpec
+	Tasks           TaskListViewSpec
+	TaskDetail      TaskDetailViewSpec
 }
 
 type ConversationViewSpec struct {
@@ -58,6 +62,7 @@ type SafeErrorViewSpec struct {
 
 type ConfirmationViewSpec struct {
 	Present        bool
+	ConfirmationID string
 	CallID         string
 	Name           string
 	Prompt         redact.SafeText
@@ -110,6 +115,8 @@ type ViewModel struct {
 	conversation    ConversationView
 	request         RequestView
 	sessions        SessionListView
+	tasks           TaskListView
+	taskDetail      TaskDetailView
 }
 
 type ConversationView struct {
@@ -143,6 +150,7 @@ type SafeErrorView struct {
 }
 
 type ConfirmationView struct {
+	confirmationID string
 	callID         string
 	name           string
 	prompt         redact.SafeText
@@ -217,17 +225,8 @@ func NewStateViewModel(spec ViewModelSpec) ViewModel {
 			cacheCreated: spec.Request.CacheCreated, cacheRead: spec.Request.CacheRead, stopReason: spec.Request.StopReason,
 			lastError: SafeErrorView{code: spec.Request.LastError.Code, source: spec.Request.LastError.Source,
 				message: spec.Request.LastError.Message, recoverable: spec.Request.LastError.Recoverable},
-			hasError: spec.Request.LastError.Present,
-			confirmation: ConfirmationView{
-				callID: spec.Request.Confirmation.CallID, name: spec.Request.Confirmation.Name,
-				prompt: spec.Request.Confirmation.Prompt, target: spec.Request.Confirmation.Target,
-				risk:           spec.Request.Confirmation.Risk,
-				permissionMode: spec.Request.Confirmation.PermissionMode, scopePreview: spec.Request.Confirmation.ScopePreview,
-				ruleLocation: spec.Request.Confirmation.RuleLocation,
-				scopes:       projectConfirmationScopes(spec.Request.Confirmation.Scopes),
-				warning:      spec.Request.Confirmation.Warning, revokeHint: spec.Request.Confirmation.RevokeHint,
-				allowPermanent: spec.Request.Confirmation.AllowPermanent,
-			},
+			hasError:     spec.Request.LastError.Present,
+			confirmation: projectConfirmationView(spec.Request.Confirmation),
 			hasConfirm:   spec.Request.Confirmation.Present,
 			transientIDs: cloneSlice(spec.Request.TransientIDs),
 		},
@@ -235,6 +234,8 @@ func NewStateViewModel(spec ViewModelSpec) ViewModel {
 			entries: entries, truncated: spec.Sessions.Truncated, scannedFiles: spec.Sessions.ScannedFiles,
 			scannedBytes: spec.Sessions.ScannedBytes, notice: spec.Sessions.Notice,
 		},
+		tasks:      NewTaskListView(spec.Tasks),
+		taskDetail: NewTaskDetailView(spec.TaskDetail),
 	}
 }
 
@@ -258,6 +259,8 @@ func (view ViewModel) Sessions() SessionListView {
 	sessions.entries = cloneSlice(view.sessions.entries)
 	return sessions
 }
+func (view ViewModel) Tasks() TaskListView        { return view.tasks.clone() }
+func (view ViewModel) TaskDetail() TaskDetailView { return view.taskDetail.clone() }
 
 // Lines returns a defensive copy so a renderer cannot mutate the snapshot.
 func (view ViewModel) Lines() []redact.SafeText {
@@ -292,6 +295,7 @@ func (view SafeErrorView) Source() string           { return view.source }
 func (view SafeErrorView) Message() redact.SafeText { return view.message }
 func (view SafeErrorView) Recoverable() bool        { return view.recoverable }
 
+func (view ConfirmationView) ConfirmationID() string        { return view.confirmationID }
 func (view ConfirmationView) CallID() string                { return view.callID }
 func (view ConfirmationView) Name() string                  { return view.name }
 func (view ConfirmationView) Prompt() redact.SafeText       { return view.prompt }

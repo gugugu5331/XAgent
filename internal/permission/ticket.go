@@ -34,11 +34,19 @@ type TicketVerifier interface {
 	VerifyAndConsume(ticket ExecutionTicket, callID string, identity CallIdentity) error
 }
 
+// ScopedTicketVerifier exposes the immutable scope binding required by task
+// executors without widening the legacy TicketVerifier contract.
+type ScopedTicketVerifier interface {
+	TicketVerifier
+	ScopeID() string
+}
+
 // ExecutionTicket is an opaque, process-local, single-use capability. All
 // fields remain private and common serialization paths explicitly fail.
 type ExecutionTicket struct {
 	version       uint16
 	nonce         [32]byte
+	scopeID       string
 	callID        string
 	identity      CallIdentity
 	expiresAt     int64
@@ -74,6 +82,7 @@ type TicketAuthority struct {
 	mu sync.Mutex
 
 	secret      [32]byte
+	scopeID     string
 	issued      map[[32]byte]time.Time
 	safetyEpoch uint64
 	lifetime    time.Duration
@@ -83,7 +92,12 @@ type TicketAuthority struct {
 
 // NewTicketAuthority creates an authority with a fresh process-local key.
 func NewTicketAuthority() (*TicketAuthority, error) {
+	return newTicketAuthority("")
+}
+
+func newTicketAuthority(scopeID string) (*TicketAuthority, error) {
 	authority := &TicketAuthority{
+		scopeID:     scopeID,
 		issued:      make(map[[32]byte]time.Time),
 		safetyEpoch: 1,
 		lifetime:    defaultTicketLifetime,
@@ -94,6 +108,15 @@ func NewTicketAuthority() (*TicketAuthority, error) {
 		return nil, errors.New("create ticket authority failed")
 	}
 	return authority, nil
+}
+
+// ScopeID returns the immutable task scope bound to this verifier. The empty
+// value identifies a legacy, non-task authority.
+func (a *TicketAuthority) ScopeID() string {
+	if a == nil {
+		return ""
+	}
+	return a.scopeID
 }
 
 // Issue signs a new ticket even when the call ID and identity match a previous
@@ -136,6 +159,7 @@ func (a *TicketAuthority) Issue(callID string, identity CallIdentity) (Execution
 	ticket := ExecutionTicket{
 		version:     executionTicketVersion,
 		nonce:       nonce,
+		scopeID:     a.scopeID,
 		callID:      callID,
 		identity:    identity,
 		expiresAt:   expiresAt.UnixNano(),
@@ -160,6 +184,7 @@ func (a *TicketAuthority) VerifyAndConsume(ticket ExecutionTicket, callID string
 	}
 	if ticket.version != executionTicketVersion ||
 		ticket.nonce == ([32]byte{}) ||
+		ticket.scopeID != a.scopeID ||
 		ticket.callID != callID ||
 		ticket.identity != identity ||
 		identity.version != callIdentityVersion {
@@ -210,6 +235,7 @@ func ticketMAC(secret [32]byte, ticket ExecutionTicket) [32]byte {
 	writeIdentityUint16(&encoded, ticket.version)
 	writeIdentityBytes(&encoded, []byte(ticketMACDomain))
 	writeIdentityBytes(&encoded, ticket.nonce[:])
+	writeIdentityBytes(&encoded, []byte(ticket.scopeID))
 	writeIdentityBytes(&encoded, []byte(ticket.callID))
 	writeIdentityUint16(&encoded, ticket.identity.version)
 	writeIdentityBytes(&encoded, ticket.identity.digest[:])
@@ -224,6 +250,7 @@ func ticketMAC(secret [32]byte, ticket ExecutionTicket) [32]byte {
 }
 
 var (
-	_ TicketIssuer   = (*TicketAuthority)(nil)
-	_ TicketVerifier = (*TicketAuthority)(nil)
+	_ TicketIssuer         = (*TicketAuthority)(nil)
+	_ TicketVerifier       = (*TicketAuthority)(nil)
+	_ ScopedTicketVerifier = (*TicketAuthority)(nil)
 )

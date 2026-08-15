@@ -18,22 +18,21 @@ func TestNextCapturedWritesBeforeStdioFrameTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
+	output := newSynchronizedStdioCaptureBuffer()
 	done := make(chan error, 1)
 	go func() {
 		_, err := decoder.NextCaptured(context.Background(), func(id protocol.RPCID) (io.Writer, bool) {
-			return &output, id.IsNumber()
+			return output, id.IsNumber()
 		})
 		done <- err
 	}()
-	deadline := time.After(time.Second)
-	for output.String() != text {
-		select {
-		case <-deadline:
-			t.Fatalf("stdio capture did not precede frame tail: %q", output.String())
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case <-output.firstWrite:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("stdio capture did not precede frame tail: %q", output.String())
+	}
+	if captured := output.String(); captured != text {
+		t.Fatalf("stdio capture wrote unexpected content before frame tail: %q", captured)
 	}
 	select {
 	case err := <-done:
@@ -44,6 +43,33 @@ func TestNextCapturedWritesBeforeStdioFrameTail(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type synchronizedStdioCaptureBuffer struct {
+	mu         sync.Mutex
+	buffer     bytes.Buffer
+	firstWrite chan struct{}
+	writeOnce  sync.Once
+}
+
+func newSynchronizedStdioCaptureBuffer() *synchronizedStdioCaptureBuffer {
+	return &synchronizedStdioCaptureBuffer{firstWrite: make(chan struct{})}
+}
+
+func (buffer *synchronizedStdioCaptureBuffer) Write(value []byte) (int, error) {
+	buffer.mu.Lock()
+	count, err := buffer.buffer.Write(value)
+	buffer.mu.Unlock()
+	if count > 0 {
+		buffer.writeOnce.Do(func() { close(buffer.firstWrite) })
+	}
+	return count, err
+}
+
+func (buffer *synchronizedStdioCaptureBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.String()
 }
 
 type gatedStdioReader struct {

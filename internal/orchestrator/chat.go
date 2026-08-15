@@ -26,6 +26,7 @@ import (
 	"xagent/internal/resources"
 	"xagent/internal/sessionctx"
 	"xagent/internal/skill"
+	"xagent/internal/subagent"
 	"xagent/internal/tool"
 )
 
@@ -49,6 +50,9 @@ type OrchestratorOptions struct {
 	Authorizer          *permission.Authorizer
 	ContextManager      *contextmgr.Manager
 	ResultFactory       *tool.ResultFactory
+	ResultProjector     *ResultProjector
+	Subagents           subagent.Service
+	SubagentLimits      subagent.Limits
 	SkillHistoryPolicy  SkillHistoryPolicy
 	RequestBudgeter     contextmgr.RequestBudgeter
 	MaxRecordBytes      int64
@@ -92,6 +96,8 @@ type Orchestrator struct {
 	authorizer           *permission.Authorizer
 	contextManager       *contextmgr.Manager
 	resultFactory        *tool.ResultFactory
+	resultProjector      *ResultProjector
+	systemToolRouter     *SystemToolRouter
 	skillHistoryPolicy   SkillHistoryPolicy
 	skillHistoryBudgeter contextmgr.RequestBudgeter
 	maxRecordBytes       int64
@@ -148,6 +154,13 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 	}
 	var readOnlyRegistry *tool.Registry
 	authorizer := options.Authorizer
+	// Compatibility constructors historically handed ownership of a fully
+	// populated registry to Orchestrator without an explicit finalization
+	// step. Seal that boundary once here; production Assembly seals earlier so
+	// registration/definition failures can still abort startup explicitly.
+	if options.Registry != nil && !options.Registry.IsSealed() {
+		_ = options.Registry.Seal()
+	}
 	if options.Executor != nil {
 		if options.Registry != nil {
 			// Assembly supplies one safe-candidate Registry. Derive an immutable
@@ -175,6 +188,12 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 			}
 		}
 	}
+	var systemToolRouter *SystemToolRouter
+	if options.Subagents != nil && options.ResultFactory != nil {
+		systemToolRouter, _ = NewSystemToolRouter(SystemToolRouterOptions{
+			Service: options.Subagents, ResultFactory: options.ResultFactory, Limits: options.SubagentLimits,
+		})
+	}
 	runOptions := runOptionsFromConfig(options.Agent)
 	hooks := options.Hooks
 	if hooks == nil {
@@ -183,7 +202,8 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 	return &Orchestrator{
 		provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking,
 		registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer,
-		contextManager: options.ContextManager, resultFactory: options.ResultFactory,
+		contextManager: options.ContextManager, resultFactory: options.ResultFactory, resultProjector: options.ResultProjector,
+		systemToolRouter:   systemToolRouter,
 		skillHistoryPolicy: options.SkillHistoryPolicy, skillHistoryBudgeter: options.RequestBudgeter,
 		maxRecordBytes: options.MaxRecordBytes, maxSessionBytes: options.MaxSessionBytes,
 		sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics,
@@ -203,15 +223,23 @@ func (o *Orchestrator) candidateResultsEnabled() bool {
 }
 
 func (o *Orchestrator) configureCandidateState(state *executionState, conversationID string) error {
-	if !o.candidateResultsEnabled() {
-		return nil
+	if o == nil || state == nil {
+		return fmt.Errorf("execution state is unavailable")
 	}
-	if o.contextManager == nil || o.maxRecordBytes <= 0 || o.maxSessionBytes <= 0 || o.maxRecordBytes > o.maxSessionBytes {
+	if state.requestGeneration != 0 {
+		return fmt.Errorf("request generation is already assigned")
+	}
+	if o.candidateResultsEnabled() &&
+		(o.contextManager == nil || o.maxRecordBytes <= 0 || o.maxSessionBytes <= 0 || o.maxRecordBytes > o.maxSessionBytes) {
 		return fmt.Errorf("safe tool result candidate dependencies are incomplete")
 	}
 	generation := o.requestGeneration.Add(1)
 	if generation == 0 {
 		return fmt.Errorf("request generation overflow")
+	}
+	state.requestGeneration = generation
+	if !o.candidateResultsEnabled() {
+		return nil
 	}
 	return state.configureModelContentSlots(conversationID, generation, o.maxRecordBytes, o.maxSessionBytes)
 }
@@ -368,7 +396,13 @@ func (o *Orchestrator) SendRequest(ctx context.Context, conv *conversation.Conve
 		return nil, err
 	}
 	runtime := o.hookRuntime()
-	state.ref = runtime.BeginTurn(requestCtxOrBackground(ctx), conv.ID, hook.ExecutionMain, hookMode(req.Mode))
+	state.ref = normalizeExecutionRef(
+		runtime.BeginTurn(requestCtxOrBackground(ctx), conv.ID, hook.ExecutionMain, hookMode(req.Mode)),
+		conv.ID,
+		hook.ExecutionMain,
+		hookMode(req.Mode),
+		state.requestGeneration,
+	)
 	message := runtime.BeginMessage(requestCtxOrBackground(ctx), state.ref, hook.MessageUser, req.UserText)
 	o.appendConversationMessage(conv, conversation.RoleUser, o.safeText(req.UserText), nil)
 	runtime.EndMessage(requestCtxOrBackground(ctx), message)
@@ -417,6 +451,25 @@ func hookMode(mode RunMode) hook.HookMode {
 		return hook.ModePlan
 	}
 	return hook.ModeDefault
+}
+
+func normalizeExecutionRef(ref hook.ExecutionRef, sessionID string, kind hook.ExecutionKind, mode hook.HookMode, generation uint64) hook.ExecutionRef {
+	if ref.SessionID == "" {
+		ref.SessionID = sessionID
+	}
+	if ref.ExecutionID == "" {
+		ref.ExecutionID = fmt.Sprintf("request-%d", generation)
+	}
+	if ref.TurnID == "" {
+		ref.TurnID = fmt.Sprintf("turn-%d", generation)
+	}
+	if ref.Kind == "" {
+		ref.Kind = kind
+	}
+	if ref.Mode == "" {
+		ref.Mode = mode
+	}
+	return ref
 }
 
 func hookTurnStatus(result RunResult) hook.TurnStatus {
@@ -493,6 +546,9 @@ func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conve
 		Mode:             contextmgr.ModeAuto,
 		PersistArtifacts: profile.Persist,
 		Observer:         hookCompactionObserver{runtime: o.hookRuntime(), binding: binding, redact: o.redactText},
+	}
+	if o.resultProjector != nil && ref.Kind == hook.ExecutionMain {
+		prepareOptions.ReservePlanningTokens = o.resultProjector.ReservePlanningTokens()
 	}
 	if o.sessionContext != nil {
 		var prepared sessionctx.PreparedContext
@@ -586,7 +642,7 @@ func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conve
 		DynamicSystem: o.providerDynamicBlocks(bundle.DynamicBlocks),
 		Messages:      messages,
 		Thinking:      o.thinking,
-		Cache:         provider.CachePolicy{EnablePromptCache: true},
+		Cache:         provider.CachePolicy{EnablePromptCache: true, CacheTools: includeTools},
 	}
 	if includeTools {
 		request.Tools = toolDefinitionsFromRegistry(requestRegistry)
@@ -617,7 +673,65 @@ func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conve
 		}
 		return nil, err
 	}
+	startProvider := func(startCtx context.Context, finalRequest provider.ChatRequest) (provider.ChatStream, error) {
+		if shouldCaptureParentPrompt(state, ref) {
+			snapshot, snapshotErr := provider.CapturePromptPrefix(finalRequest)
+			if snapshotErr != nil {
+				return nil, snapshotErr
+			}
+			if snapshotErr = state.captureParentPrompt(ref, snapshot); snapshotErr != nil {
+				return nil, snapshotErr
+			}
+		}
+		return o.streamChat(startCtx, finalRequest)
+	}
+	if o.resultProjector != nil && ref.Kind == hook.ExecutionMain {
+		owner, ownerErr := subagentResultOwner(conv, state, ref)
+		if ownerErr != nil {
+			if lease != nil {
+				lease.Release()
+			}
+			return nil, ownerErr
+		}
+		stream, projectionErr := o.resultProjector.StreamChat(ctx, owner, request, startProvider)
+		if projectionErr != nil && lease != nil {
+			lease.Release()
+		}
+		return stream, projectionErr
+	}
+	if shouldCaptureParentPrompt(state, ref) {
+		snapshot, snapshotErr := provider.CapturePromptPrefix(request)
+		if snapshotErr == nil {
+			snapshotErr = state.captureParentPrompt(ref, snapshot)
+		}
+		if snapshotErr != nil {
+			if lease != nil {
+				lease.Release()
+			}
+			return nil, snapshotErr
+		}
+	}
 	return o.streamChat(ctx, request)
+}
+
+func shouldCaptureParentPrompt(state *executionState, ref hook.ExecutionRef) bool {
+	return state != nil && state.requestGeneration > 0 && ref.ExecutionID != "" && ref.SessionID != "" &&
+		state.ref.ExecutionID == ref.ExecutionID && state.ref.SessionID == ref.SessionID
+}
+
+func subagentResultOwner(conv *conversation.Conversation, state *executionState, ref hook.ExecutionRef) (subagent.ParentRef, error) {
+	if conv == nil || state == nil {
+		return subagent.ParentRef{}, errors.New("subagent result owner state is unavailable")
+	}
+	owner := subagent.ParentRef{
+		ConversationID:    conv.ID,
+		ExecutionID:       ref.ExecutionID,
+		RequestGeneration: state.requestGeneration,
+	}
+	if !validResultProjectionOwner(owner) {
+		return subagent.ParentRef{}, errors.New("subagent result owner is invalid")
+	}
+	return owner, nil
 }
 
 // streamChat is the single Provider handoff. Concrete Providers that own a
@@ -779,6 +893,16 @@ type projectedToolPublication struct {
 	arguments      redact.SafeText
 }
 
+// projectToolResult is the sole ContextManager projection authority for both
+// the main loop and isolated subagent loops. Keeping one production call site
+// prevents either path from bypassing the same safe candidate boundary.
+func projectToolResult(manager *contextmgr.Manager, result tool.Result) (contextmgr.ToolResultProjection, error) {
+	if manager == nil {
+		return contextmgr.ToolResultProjection{}, errors.New("tool result projector is unavailable")
+	}
+	return manager.ProjectToolResult(result)
+}
+
 type orderedToolCommitError struct {
 	err error
 }
@@ -845,7 +969,7 @@ func (o *Orchestrator) publishToolExecutions(ctx context.Context, conv *conversa
 			state.clearModelContentSlots()
 			return executions, fmt.Errorf("tool execution state does not match its result")
 		}
-		projection, err := o.contextManager.ProjectToolResult(execution.Result)
+		projection, err := projectToolResult(o.contextManager, execution.Result)
 		if err != nil {
 			state.clearModelContentSlots()
 			return executions, err

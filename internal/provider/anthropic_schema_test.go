@@ -14,19 +14,17 @@ import (
 
 func TestAnthropicRequestUsesSafeDTO(t *testing.T) {
 	metadataCanary := "/private/project/.xagent/hooks.yaml#anthropic"
-	params := anthropicMessageParams("fallback-model", ChatRequest{
+	params, err := anthropicMessageParams("fallback-model", ChatRequest{
 		Model: "  request-model  ",
 		System: []SystemBlock{
 			{Name: "fixed", Content: safeText("fixed rules"), Cacheable: true},
 			{Name: metadataCanary, Content: safeText("runtime rules"), Cacheable: true},
 		},
-		StableSystem:  []SystemBlock{{Name: "legacy", Content: safeText("legacy system must not win")}},
-		DynamicSystem: []SystemBlock{{Name: "legacy-dynamic", Content: safeText("legacy dynamic must not win")}},
 		Messages: []ModelMessage{
 			{Role: ModelMessageRoleUser, Content: safeText("user message")},
 			{Role: ModelMessageRoleAssistant, Content: safeText("assistant message")},
 			{Role: ModelMessageRoleToolCall, ToolCallID: "call-1", ToolName: "Read", ArgumentsJSON: safeText(`{"path":"go.mod"}`)},
-			{Role: ModelMessageRoleToolResult, ToolCallID: "call-1", ToolResult: safeText("tool result"), ToolResultStatus: "failed"},
+			{Role: ModelMessageRoleToolResult, ToolCallID: "call-1", ToolName: "Read", ToolResult: safeText("tool result"), ToolResultStatus: string(tool.StatusError)},
 			{Role: ModelMessageRoleContextSummary, Content: safeText("summary")},
 			{Role: ModelMessageRoleContextBoundary, Content: safeText("boundary")},
 		},
@@ -41,6 +39,9 @@ func TestAnthropicRequestUsesSafeDTO(t *testing.T) {
 			CacheTools:           true,
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	wire, err := json.Marshal(params)
 	if err != nil {
@@ -134,7 +135,7 @@ func TestAnthropicSchemaCompatibility(t *testing.T) {
 }
 
 func TestRequestModelOverrideAnthropic(t *testing.T) {
-	overridden := anthropicMessageParams("configured-model", ChatRequest{
+	overridden, err := anthropicMessageParams("configured-model", ChatRequest{
 		Model: "  skill-model  ",
 		Tools: []ToolDefinition{{
 			Name:        "Read",
@@ -142,6 +143,9 @@ func TestRequestModelOverrideAnthropic(t *testing.T) {
 			Schema:      tool.Schema{Type: "object"},
 		}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(overridden.Model) != "skill-model" {
 		t.Fatalf("request model did not override config: %q", overridden.Model)
 	}
@@ -149,11 +153,17 @@ func TestRequestModelOverrideAnthropic(t *testing.T) {
 		t.Fatalf("model override dropped tools: %#v", overridden.Tools)
 	}
 
-	defaulted := anthropicMessageParams("configured-model", ChatRequest{})
+	defaulted, err := anthropicMessageParams("configured-model", ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(defaulted.Model) != "configured-model" {
 		t.Fatalf("empty request model did not restore config model: %q", defaulted.Model)
 	}
-	fallback := anthropicMessageParams("", ChatRequest{})
+	fallback, err := anthropicMessageParams("", ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(fallback.Model) != "claude-opus-4-7" {
 		t.Fatalf("empty config fallback changed: %q", fallback.Model)
 	}

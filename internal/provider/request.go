@@ -1,7 +1,14 @@
 package provider
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"xagent/internal/config"
 	"xagent/internal/redact"
@@ -17,7 +24,12 @@ const (
 	ModelMessageRoleToolResult      ModelMessageRole = "tool_result"
 	ModelMessageRoleContextSummary  ModelMessageRole = "context_summary"
 	ModelMessageRoleContextBoundary ModelMessageRole = "context_boundary"
+	ModelMessageRoleSubagentResult  ModelMessageRole = "subagent_result"
 )
+
+const SubagentResultMarker = "[subagent_result]"
+
+var ErrInvalidChatRequest = errors.New("provider chat request invalid")
 
 // ModelMessage is the Provider-owned request DTO. All message payloads have
 // already crossed the redaction boundary; string fields are stable metadata.
@@ -62,8 +74,183 @@ type CachePolicy struct {
 	CacheTools           bool
 }
 
+// Validate is the shared fail-closed request boundary used before any wire
+// adapter. It prevents adapters from silently dropping unknown internal roles
+// and enforces the mutually exclusive ordered/split system representations.
+func (request ChatRequest) Validate() error {
+	if request.System != nil && (request.StableSystem != nil || request.DynamicSystem != nil) {
+		return invalidChatRequest("system layout is ambiguous")
+	}
+	if !utf8.ValidString(request.Model) || request.Thinking.BudgetTokens < 0 ||
+		!utf8.ValidString(request.Cache.SystemBreakpointName) {
+		return invalidChatRequest("request metadata is invalid")
+	}
+	for _, blocks := range [][]SystemBlock{request.System, request.StableSystem, request.DynamicSystem} {
+		for _, block := range blocks {
+			if !utf8.ValidString(block.Name) || !utf8.ValidString(block.Content.Text()) {
+				return invalidChatRequest("system block is invalid")
+			}
+		}
+	}
+	for index := range request.Messages {
+		if err := validateModelMessage(request.Messages[index]); err != nil {
+			return fmt.Errorf("%w: message %d", err, index)
+		}
+	}
+	for index, definition := range toolDefinitions(request) {
+		if strings.TrimSpace(definition.Name) == "" || !utf8.ValidString(definition.Name) ||
+			!utf8.ValidString(definition.Description) {
+			return invalidChatRequest(fmt.Sprintf("tool %d metadata is invalid", index))
+		}
+		if _, err := json.Marshal(definition.Schema); err != nil {
+			return invalidChatRequest(fmt.Sprintf("tool %d schema is invalid", index))
+		}
+	}
+	return nil
+}
+
+func invalidChatRequest(reason string) error {
+	return fmt.Errorf("%w: %s", ErrInvalidChatRequest, reason)
+}
+
+func validateModelMessage(message ModelMessage) error {
+	if !utf8.ValidString(message.Content.Text()) || !utf8.ValidString(message.ToolCallID) ||
+		!utf8.ValidString(message.ToolName) || !utf8.ValidString(message.ArgumentsJSON.Text()) ||
+		!utf8.ValidString(message.ToolResult.Text()) || !utf8.ValidString(message.ToolResultStatus) {
+		return invalidChatRequest("message text is invalid")
+	}
+	toolFieldsEmpty := message.ToolCallID == "" && message.ToolName == "" && message.ArgumentsJSON.Text() == "" &&
+		message.ToolResult.Text() == "" && message.ToolResultStatus == ""
+	switch message.Role {
+	case ModelMessageRoleUser, ModelMessageRoleAssistant, ModelMessageRoleContextSummary, ModelMessageRoleContextBoundary:
+		if !toolFieldsEmpty {
+			return invalidChatRequest("base message contains tool fields")
+		}
+		return nil
+	case ModelMessageRoleSubagentResult:
+		if !toolFieldsEmpty || !validSubagentResultJSON(message.Content.Text()) {
+			return invalidChatRequest("subagent result is invalid")
+		}
+		return nil
+	case ModelMessageRoleToolCall:
+		if strings.TrimSpace(message.ToolCallID) == "" || strings.TrimSpace(message.ToolName) == "" ||
+			message.ToolResult.Text() != "" || message.ToolResultStatus != "" {
+			return invalidChatRequest("tool call is invalid")
+		}
+		arguments := strings.TrimSpace(message.ArgumentsJSON.Text())
+		if arguments != "" && !json.Valid([]byte(arguments)) {
+			return invalidChatRequest("tool arguments are invalid")
+		}
+		return nil
+	case ModelMessageRoleToolResult:
+		if strings.TrimSpace(message.ToolCallID) == "" || strings.TrimSpace(message.ToolName) == "" ||
+			message.ArgumentsJSON.Text() != "" || message.ToolResult.Text() == "" || !validToolResultStatus(message.ToolResultStatus) {
+			return invalidChatRequest("tool result is invalid")
+		}
+		return nil
+	default:
+		return invalidChatRequest("message role is unknown")
+	}
+}
+
+func validToolResultStatus(status string) bool {
+	switch tool.ResultStatus(status) {
+	case tool.StatusSuccess, tool.StatusError, tool.StatusDenied, tool.StatusTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func validSubagentResultJSON(payload string) bool {
+	if payload == "" || len(payload) > 64<<10 || !utf8.ValidString(payload) {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewBufferString(payload))
+	decoder.DisallowUnknownFields()
+	decoder.UseNumber()
+	var value subagentResultPayload
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	if value.SchemaVersion != 1 || !validSubagentResultID(value.TaskID) ||
+		len(value.Summary) > 64<<10 || !utf8.ValidString(value.Summary) ||
+		len(value.TruncationReason) > 256 || !utf8.ValidString(value.TruncationReason) ||
+		value.SummaryTruncated != (value.TruncationReason != "") ||
+		!validSubagentResultTerminalPair(value.Status, value.StopReason) || value.Usage == nil || !value.Usage.valid() {
+		return false
+	}
+	return value.Error == nil || value.Error.valid()
+}
+
+type subagentResultPayload struct {
+	SchemaVersion    int                         `json:"schema_version"`
+	TaskID           string                      `json:"task_id"`
+	Status           string                      `json:"status"`
+	Summary          string                      `json:"summary"`
+	SummaryTruncated bool                        `json:"summary_truncated"`
+	TruncationReason string                      `json:"truncation_reason"`
+	StopReason       string                      `json:"stop_reason"`
+	Usage            *subagentResultUsagePayload `json:"usage"`
+	Error            *subagentResultErrorPayload `json:"error"`
+}
+
+type subagentResultUsagePayload struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+}
+
+func (usage subagentResultUsagePayload) valid() bool {
+	return usage.InputTokens >= 0 && usage.OutputTokens >= 0 && usage.CacheCreationInputTokens >= 0 && usage.CacheReadInputTokens >= 0
+}
+
+type subagentResultErrorPayload struct {
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+	Recoverable bool   `json:"recoverable,omitempty"`
+}
+
+func (safeError subagentResultErrorPayload) valid() bool {
+	return validSubagentResultID(safeError.Code) && len(safeError.Message) <= 64<<10 && utf8.ValidString(safeError.Message)
+}
+
+func validSubagentResultID(value string) bool {
+	if value == "" || len(value) > 128 || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSubagentResultTerminalPair(status, stopReason string) bool {
+	switch status {
+	case "completed":
+		return stopReason == "completed"
+	case "failed":
+		return stopReason == "provider_error" || stopReason == "tool_error" || stopReason == "internal_error"
+	case "cancelled":
+		return stopReason == "cancelled" || stopReason == "application_closed"
+	case "timed_out":
+		return stopReason == "task_timeout"
+	case "limit_reached":
+		return stopReason == "max_iterations" || stopReason == "unknown_tool_limit"
+	default:
+		return false
+	}
+}
+
 func systemBlocks(req ChatRequest) []SystemBlock {
-	if len(req.System) > 0 {
+	if req.System != nil {
 		return nonEmptySystemBlocks(req.System)
 	}
 	blocks := make([]SystemBlock, 0, len(req.StableSystem)+len(req.DynamicSystem))
@@ -73,7 +260,7 @@ func systemBlocks(req ChatRequest) []SystemBlock {
 }
 
 func usesOrderedSystem(req ChatRequest) bool {
-	return len(req.System) > 0
+	return req.System != nil
 }
 
 func joinedSystemBlocks(req ChatRequest) string {
@@ -98,7 +285,7 @@ func nonEmptySystemBlocks(blocks []SystemBlock) []SystemBlock {
 }
 
 func toolDefinitions(req ChatRequest) []ToolDefinition {
-	if len(req.Tools) > 0 {
+	if req.Tools != nil {
 		return nonEmptyToolDefinitions(req.Tools)
 	}
 	if req.ToolDefs == nil {

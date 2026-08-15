@@ -33,6 +33,7 @@ const (
 	appCleanupDiagnosticSource      = "app"
 	appWaitIdleDiagnosticCode       = "app_wait_idle_failed"
 	appSaveDiagnosticCode           = "app_save_failed"
+	appTaskShutdownDiagnosticCode   = "app_task_shutdown_failed"
 )
 
 // RuntimeOptions are the lifecycle-only inputs owned by an App runtime.

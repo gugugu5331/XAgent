@@ -156,6 +156,7 @@ const (
 	ErrHookDenied                   = "hook_denied"
 	ErrNoResults                    = "no_results"
 	ErrInternalRoutingRequired      = "internal_routing_required"
+	ErrToolFiltered                 = "tool_filtered"
 )
 
 func Success(call Input, summary string, content string, data map[string]any) Result {

@@ -532,6 +532,7 @@ func TestNavigationOrdersOldEndCommitAndNewStart(t *testing.T) {
 		requestState := RequestState{Generation: 27, StopReason: "keep"}
 		messageView := []redact.SafeText{redactor.Redact("old")}
 		active := &conversation.Conversation{ID: "same"}
+		liveTrackedActive := active
 		activity := &navigationCommitActivity{}
 		if !navigation.commitNavigationCandidate(context.Background(), candidate, navigationCommitTarget{
 			runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
@@ -541,7 +542,7 @@ func TestNavigationOrdersOldEndCommitAndNewStart(t *testing.T) {
 		}
 		if screenState != screenChat || conversationState.Mode != "plan" || !reflect.DeepEqual(conversationState.Skills, []string{"review"}) || conversationState.SkillGeneration != 27 ||
 			conversationState.Input.Text() != "draft" || conversationState.Notice.Text() != "notice" || requestState.Generation != 27 || requestState.StopReason != "keep" || activity.clears != 0 ||
-			active != trackedActive || len(active.Messages) != 1 || active.Messages[0].Content.Text() != "refreshed" || len(messageView) != 1 || messageView[0].Text() != "refreshed" ||
+			active != liveTrackedActive || active == trackedActive || len(active.Messages) != 1 || active.Messages[0].Content.Text() != "refreshed" || len(messageView) != 1 || messageView[0].Text() != "refreshed" ||
 			len(conversationState.Messages) != 1 || conversationState.Messages[0].Text() != "refreshed" {
 			t.Fatalf("same-ID Load reset or incompletely refreshed state: screen=%q conversation=%#v request=%#v active=%#v messages=%#v", screenState, conversationState, requestState, active, messageView)
 		}

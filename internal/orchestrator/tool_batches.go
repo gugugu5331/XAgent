@@ -132,7 +132,7 @@ func (o *Orchestrator) executePreparedTool(ctx context.Context, execution ToolEx
 	started := time.Now()
 	var result tool.Result
 	if execution.SystemRoute {
-		result = o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Completed, Status: tool.StatusError, Summary: "load_skill 必须由 Orchestrator 系统路由处理", Error: &tool.Error{Code: tool.ErrInternalRoutingRequired, Message: "load_skill 必须由 Orchestrator 系统路由处理", Recoverable: true}})
+		result = o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Completed, Status: tool.StatusError, Summary: "系统工具必须由 Orchestrator 系统路由处理", Error: &tool.Error{Code: tool.ErrInternalRoutingRequired, Message: "系统工具必须由 Orchestrator 系统路由处理", Recoverable: true}})
 	} else if o.executor == nil || !execution.Ticket.Issued() {
 		result = o.unavailableToolExecutorResult(call)
 	} else {

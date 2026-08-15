@@ -123,6 +123,29 @@ func TestConfirmationShowsCancellableAuthorizationScope(t *testing.T) {
 	})
 }
 
+func TestTaskConfirmationAlwaysRejectsPermanentAuthorizationUI(t *testing.T) {
+	view := confirmationTestView(t, ConfirmationViewSpec{
+		Present: true, ConfirmationID: "confirmation-task", CallID: "call-task", Name: "Bash",
+		Scopes: []ConfirmationScopeViewSpec{
+			{Scope: "once", Available: true},
+			{Scope: "session", Available: true},
+			{Scope: "permanent", Available: true},
+		},
+		AllowPermanent: true,
+	})
+	panel := NewTaskConfirmationPanel(view)
+	panel.SetRegion(Region{Width: 120, Height: 4})
+	output := panel.View()
+	if strings.Contains(output, "p永久") || strings.Contains(output, "permanent(可用)") {
+		t.Fatalf("task confirmation offered permanent authorization: %q", output)
+	}
+	for _, want := range []string{"y本次", "s会话", "n拒绝", "Esc取消", "permanent(不可用)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("task confirmation missing %q: %q", want, output)
+		}
+	}
+}
+
 func confirmationTestView(t *testing.T, spec ConfirmationViewSpec) ConfirmationView {
 	t.Helper()
 	view := NewStateViewModel(ViewModelSpec{Request: RequestViewSpec{Confirmation: spec}})

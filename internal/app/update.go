@@ -77,6 +77,16 @@ func (c *commandController) HandleIntent(intent command.IntentKind) error {
 // request the sessions screen.
 func (m *Model) handleEscape() (bool, tea.Cmd) {
 	waitingConfirmation := m.confirmation != nil && m.confirmation.Confirmation != nil
+	if !waitingConfirmation && !m.streaming {
+		switch m.screen {
+		case screenTaskDetail:
+			m.screen = screenTasks
+			return true, nil
+		case screenTasks:
+			m.screen = screenChat
+			return true, nil
+		}
+	}
 	shortcutContext := command.ShortcutChatIdle
 	switch {
 	case waitingConfirmation:
@@ -231,8 +241,13 @@ func (m *Model) advanceArtifactGeneration() uint64 {
 
 func (m *Model) applyWindowSize(size tea.WindowSizeMsg) {
 	screen := tui.ScreenChat
-	if m.screen == screenList {
+	switch m.screen {
+	case screenList:
 		screen = tui.ScreenList
+	case screenTasks:
+		screen = tui.ScreenTasks
+	case screenTaskDetail:
+		screen = tui.ScreenTaskDetail
 	}
 	input := tui.LayoutInput{
 		Terminal:         tui.Size{Width: size.Width, Height: size.Height},
@@ -247,9 +262,17 @@ func (m *Model) applyWindowSize(size tea.WindowSizeMsg) {
 
 	m.status.SetRegion(layout.Status)
 	if m.screen == screenList {
+		m.taskRegion = tui.Region{}
 		tui.ApplyConversationListLayout(&m.list, layout)
 		return
 	}
+	if m.screen == screenTasks || m.screen == screenTaskDetail {
+		m.taskRegion = layout.Main
+		m.input.SetRegion(layout.Input)
+		m.commandMenu.SetRegion(layout.CommandMenu)
+		return
+	}
+	m.taskRegion = tui.Region{}
 	m.messages.SetRegion(layout.Main)
 	m.input.SetRegion(layout.Input)
 	m.commandMenu.SetRegion(layout.CommandMenu)
@@ -316,6 +339,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		view := loaded.View
 		m.artifactView = &view
 		return m, nil
+	}
+	switch message := msg.(type) {
+	case taskSubscribedMsg:
+		return m, m.handleTaskSubscribed(message)
+	case taskEventMsg:
+		return m, m.handleTaskEvent(message)
+	case taskEventStreamClosedMsg:
+		return m, m.handleTaskEventStreamClosed(message)
+	case taskEventResyncMsg:
+		return m, m.handleTaskEventResync(message)
+	case taskEventRetryMsg:
+		return m, m.handleTaskEventRetry(message)
+	case taskForegroundOutcomeMsg:
+		return m, m.handleTaskForegroundOutcome(message)
 	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:

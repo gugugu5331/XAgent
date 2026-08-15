@@ -392,6 +392,11 @@ func canonicalConversationMessage(message conversation.Message) (provider.ModelM
 			return provider.ModelMessage{}, false, errors.New("conversation thinking message contains tool state")
 		}
 		return provider.ModelMessage{}, false, nil
+	case conversation.RoleSubagentNotification:
+		if message.Tool != nil || message.Subagent == nil {
+			return provider.ModelMessage{}, false, errors.New("conversation subagent notification is invalid")
+		}
+		return provider.ModelMessage{}, false, nil
 	default:
 		return provider.ModelMessage{}, false, errors.New("conversation message role is unsupported")
 	}
@@ -451,6 +456,15 @@ func (c *requestByteCounter) validateBaseMessage(message provider.ModelMessage) 
 		if message.ToolCallID != "" || message.ToolName != "" || message.ArgumentsJSON.Text() != "" ||
 			message.ToolResult.Text() != "" || message.ToolResultStatus != "" {
 			return errors.New("request base message contains tool fields")
+		}
+		return nil
+	case provider.ModelMessageRoleSubagentResult:
+		if message.ToolCallID != "" || message.ToolName != "" || message.ArgumentsJSON.Text() != "" ||
+			message.ToolResult.Text() != "" || message.ToolResultStatus != "" {
+			return errors.New("request subagent result contains tool fields")
+		}
+		if err := (provider.ChatRequest{Messages: []provider.ModelMessage{message}}).Validate(); err != nil {
+			return errors.New("request subagent result is invalid")
 		}
 		return nil
 	case provider.ModelMessageRoleToolCall:
@@ -1561,6 +1575,11 @@ type PrepareOptions struct {
 	Mode             Mode
 	PersistArtifacts bool
 	Observer         CompactionObserver
+	// ReservePlanningTokens moves the automatic compaction threshold earlier
+	// for a bounded message that will be appended only after ordinary context
+	// preparation (for example one asynchronous subagent result). It is a
+	// planning reserve, not Provider usage and is never persisted.
+	ReservePlanningTokens int64
 }
 
 type Manager struct {
@@ -1681,6 +1700,9 @@ func (m *Manager) PrepareWithOptions(ctx context.Context, conv *conversation.Con
 	if m == nil || conv == nil || !config.Enabled(m.cfg.Enabled, true) {
 		return result, nil
 	}
+	if opts.ReservePlanningTokens < 0 || opts.ReservePlanningTokens >= m.cfg.ModelWindowTokens {
+		return result, errors.New("context preparation planning reserve is invalid")
+	}
 	if opts.Mode == "" {
 		opts.Mode = ModeAuto
 	}
@@ -1707,7 +1729,7 @@ func (m *Manager) PrepareWithOptions(ctx context.Context, conv *conversation.Con
 	meta.LastEstimatedTokens = estimated
 	meta.LastEstimatedCharacters = countConversationChars(conv)
 
-	if !m.shouldSummarize(conv, estimated, opts.Mode) {
+	if !m.shouldSummarize(conv, estimated, opts.Mode, opts.ReservePlanningTokens) {
 		return result, nil
 	}
 	if meta.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
@@ -1751,7 +1773,7 @@ func (m *Manager) preflight(conv *conversation.Conversation, opts PrepareOptions
 		Messages:        len(contextMessages(conv)),
 		EstimatedTokens: estimated,
 	}}
-	summaryAttempt := m.shouldSummarize(conv, estimated, opts.Mode)
+	summaryAttempt := m.shouldSummarize(conv, estimated, opts.Mode, opts.ReservePlanningTokens)
 	if conv.Context != nil && conv.Context.SummaryFailureCount >= m.cfg.SummaryFailureLimit {
 		summaryAttempt = false
 	}
@@ -1863,7 +1885,7 @@ func (m *Manager) UpdateUsage(conv *conversation.Conversation, usage provider.Us
 	return nil
 }
 
-func (m *Manager) shouldSummarize(conv *conversation.Conversation, estimated int64, mode Mode) bool {
+func (m *Manager) shouldSummarize(conv *conversation.Conversation, estimated int64, mode Mode, reservePlanningTokens int64) bool {
 	margin := m.cfg.AutoMarginTokens
 	if mode == ModeManual {
 		margin = m.cfg.ManualMarginTokens
@@ -1871,7 +1893,11 @@ func (m *Manager) shouldSummarize(conv *conversation.Conversation, estimated int
 	if mode == ModeManual {
 		return len(conv.Messages) > m.cfg.RecentKeepMessages
 	}
-	return estimated >= m.cfg.ModelWindowTokens-margin
+	threshold := m.cfg.ModelWindowTokens - margin
+	if reservePlanningTokens >= threshold {
+		return true
+	}
+	return estimated >= threshold-reservePlanningTokens
 }
 
 func (m *Manager) summarize(ctx context.Context, conv *conversation.Conversation) (summary string, summarized int, err error) {

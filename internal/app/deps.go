@@ -20,6 +20,7 @@ import (
 	"xagent/internal/resources"
 	"xagent/internal/sessionctx"
 	"xagent/internal/skill"
+	"xagent/internal/subagent"
 	"xagent/internal/tool"
 )
 
@@ -56,6 +57,18 @@ type HookLifecycle interface {
 	SystemStart(context.Context)
 	SessionStart(context.Context, string, hook.SessionState)
 	SessionEnd(context.Context, string, hook.SessionEndReason)
+}
+
+// TaskSubmitPreparer captures the App's current committed parent state and
+// returns a context-bound immutable runtime snapshot before the one shared
+// subagent Service.Submit call. It owns no task lifecycle or task storage.
+type TaskSubmitPreparer interface {
+	PrepareTUISubagentSubmit(
+		context.Context,
+		*conversation.Conversation,
+		orchestrator.RunMode,
+		subagent.SubmitInput,
+	) (context.Context, subagent.SubmitInput, error)
 }
 
 // AppServices is the capability boundary consumed by the future state-driven
@@ -104,4 +117,8 @@ type Deps struct {
 		Diagnostics() []mcpclient.Diagnostic
 	}
 	CommandRegistry *command.Registry
+	// Tasks is optional so ordinary interactive operation remains compatible
+	// when the subagent subsystem is not assembled.
+	Tasks              subagent.Service
+	TaskSubmitPreparer TaskSubmitPreparer
 }

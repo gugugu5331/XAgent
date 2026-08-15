@@ -146,6 +146,41 @@ func stateDigestMutations() []stateDigestMutation {
 		messageMutation("Conversation.Messages[].CreatedAt", func(value *Conversation) {
 			value.Messages[0].CreatedAt = value.Messages[0].CreatedAt.Add(time.Nanosecond)
 		}),
+		messageMutation("Conversation.Messages[].Subagent.$present", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+		}),
+		messageMutation("Conversation.Messages[].Subagent.NotificationID", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.NotificationID += "-changed"
+		}),
+		messageMutation("Conversation.Messages[].Subagent.TaskID", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.TaskID += "-changed"
+		}),
+		messageMutation("Conversation.Messages[].Subagent.Status", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.Status = "failed"
+		}),
+		messageMutation("Conversation.Messages[].Subagent.Summary", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.Summary = digestSafeText("changed notification summary")
+		}),
+		messageMutation("Conversation.Messages[].Subagent.SummaryTruncated", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.SummaryTruncated = true
+		}),
+		messageMutation("Conversation.Messages[].Subagent.TruncationReason", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.TruncationReason = digestSafeText("changed_reason")
+		}),
+		messageMutation("Conversation.Messages[].Subagent.StopReason", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.StopReason = "provider_error"
+		}),
+		messageMutation("Conversation.Messages[].Subagent.CreatedAt", func(value *Conversation) {
+			value.Messages[0].Subagent = digestNotificationFixture(value.Messages[0].CreatedAt)
+			value.Messages[0].Subagent.CreatedAt = value.Messages[0].Subagent.CreatedAt.Add(time.Nanosecond)
+		}),
 		messageMutation("Conversation.Messages[].Tool.$present", func(value *Conversation) { value.Messages[1].Tool = nil }),
 		messageMutation("Conversation.Messages[].Tool.CallID", func(value *Conversation) { value.Messages[1].Tool.CallID += "-changed" }),
 		messageMutation("Conversation.Messages[].Tool.Name", func(value *Conversation) { value.Messages[1].Tool.Name += "-changed" }),
@@ -239,6 +274,13 @@ func stateDigestFixture() *Conversation {
 	}
 }
 
+func digestNotificationFixture(createdAt time.Time) *SubagentNotificationMessage {
+	return &SubagentNotificationMessage{
+		NotificationID: "notification-digest", TaskID: "task-digest", Status: "completed",
+		Summary: digestSafeText("notification summary"), StopReason: "completed", CreatedAt: createdAt,
+	}
+}
+
 func cloneConversationV2(source *Conversation) *Conversation {
 	if source == nil {
 		return nil
@@ -246,6 +288,10 @@ func cloneConversationV2(source *Conversation) *Conversation {
 	cloned := *source
 	cloned.Messages = append([]Message(nil), source.Messages...)
 	for index := range cloned.Messages {
+		if source.Messages[index].Subagent != nil {
+			notification := *source.Messages[index].Subagent
+			cloned.Messages[index].Subagent = &notification
+		}
 		if source.Messages[index].Tool == nil {
 			continue
 		}

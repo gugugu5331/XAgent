@@ -27,8 +27,10 @@ import (
 type screen string
 
 const (
-	screenList screen = "list"
-	screenChat screen = "chat"
+	screenList       screen = "list"
+	screenChat       screen = "chat"
+	screenTasks      screen = "tasks"
+	screenTaskDetail screen = "task_detail"
 )
 
 // ConversationListEntryState is the safe App projection of one Store list
@@ -105,6 +107,13 @@ type Model struct {
 	artifactExpectedID   string
 	artifactExpectedPage int64
 	artifactGeneration   uint64
+	// Task views are detached, capability-free TUI projections. The App never
+	// retains TaskManager snapshots or callable task objects in display state.
+	taskListView    tui.TaskListView
+	taskDetailView  tui.TaskDetailView
+	taskRegion      tui.Region
+	taskEvents      *taskEventStreamState
+	taskEventCursor uint64
 }
 
 func New(deps Deps) Model {
@@ -224,6 +233,9 @@ func newModel(deps Deps, runtimeOptions RuntimeOptions) Model {
 		hooks:                hooks,
 		status:               status,
 	}
+	if deps.Tasks != nil {
+		model.taskEvents = newTaskEventStreamState()
+	}
 	model.lifecycle.bindModel(&model)
 	model.installInitialSkillCommands()
 	model.refreshMCPStatus()
@@ -236,7 +248,14 @@ func newModel(deps Deps, runtimeOptions RuntimeOptions) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	if m.deps.Tasks == nil {
+		return nil
+	}
+	state := m.taskEvents
+	if state == nil {
+		state = newTaskEventStreamState()
+	}
+	return subscribeTaskEvents(state, m.deps.Tasks, m.taskEventCursor)
 }
 
 func (m Model) View() string {
@@ -245,6 +264,20 @@ func (m Model) View() string {
 	}
 	if m.screen == screenList {
 		return m.list.View() + "\n" + m.status.View() + "\n按 Enter 选择，q 退出"
+	}
+	if m.screen == screenTasks {
+		screen := tui.NewTaskList(m.taskListView)
+		if m.taskRegion.Width > 0 && m.taskRegion.Height > 0 {
+			screen.SetRegion(m.taskRegion)
+		}
+		return fmt.Sprintf("%s\n%s\n%s\n%s", screen.View(), m.status.View(), m.input.Text.View(), "Enter 提交命令，Esc 返回对话，q/ctrl+c 退出")
+	}
+	if m.screen == screenTaskDetail {
+		screen := tui.NewTaskDetail(m.taskDetailView)
+		if m.taskRegion.Width > 0 && m.taskRegion.Height > 0 {
+			screen.SetRegion(m.taskRegion)
+		}
+		return fmt.Sprintf("%s\n%s\n%s\n%s", screen.View(), m.status.View(), m.input.Text.View(), "Enter 提交命令，Esc 返回任务列表，q/ctrl+c 退出")
 	}
 	content := lipgloss.NewStyle().Padding(1, 2).Render(m.messages.View())
 	footer := "Enter 提交，q/ctrl+c 退出"
@@ -267,8 +300,13 @@ func newViewModel(
 	currentScreen screen,
 ) tui.ViewModel {
 	viewScreen := tui.ScreenList
-	if currentScreen == screenChat {
+	switch currentScreen {
+	case screenChat:
 		viewScreen = tui.ScreenChat
+	case screenTasks:
+		viewScreen = tui.ScreenTasks
+	case screenTaskDetail:
+		viewScreen = tui.ScreenTaskDetail
 	}
 
 	entries := make([]tui.SessionListEntrySpec, len(listState.Entries))
@@ -628,6 +666,25 @@ func (m *Model) runCloseCleanup() error {
 		}
 		closeErrors = append(closeErrors, label+": "+m.redactText(err.Error()))
 		m.addCleanupDiagnostic(code, "cleanup_failed", err)
+	}
+
+	// Task subscriptions and foreground waits are App-owned consumers. Stop
+	// them before TaskManager shutdown; canceling these waits never calls the
+	// task-level Cancel operation. TaskManager then stops admission and joins
+	// every producer before ordinary interactive resources are released.
+	if m.taskEvents != nil {
+		m.taskEvents.close()
+	}
+	if m.deps.Tasks != nil {
+		if timedOut {
+			appCleanupFireAndForget(m.deps.Tasks.Shutdown)
+		} else {
+			err, hitDeadline := appCleanupCall(cleanupCtx, m.deps.Tasks.Shutdown)
+			if hitDeadline {
+				timedOut = true
+			}
+			recordFailure("等待子任务收尾", appTaskShutdownDiagnosticCode, err)
+		}
 	}
 
 	// Stop/cancel is synchronous and precedes WaitIdle. A hostile Cancel

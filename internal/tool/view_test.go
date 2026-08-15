@@ -35,6 +35,9 @@ func TestRegistryView(t *testing.T) {
 	if err := base.Register(NewLoadSkillTool()); err != nil {
 		t.Fatal(err)
 	}
+	if err := base.Seal(); err != nil {
+		t.Fatal(err)
+	}
 	baseNames := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", LoadSkillToolName}
 	if !reflect.DeepEqual(base.Names(), baseNames) {
 		t.Fatalf("unexpected base order: %#v", base.Names())
@@ -46,8 +49,8 @@ func TestRegistryView(t *testing.T) {
 		want    []string
 	}{
 		{name: "unrestricted", options: ViewOptions{}, want: baseNames},
-		{name: "empty allowlist keeps system tool", options: ViewOptions{AllowedNames: map[string]struct{}{}, AlwaysInclude: []string{LoadSkillToolName}}, want: []string{LoadSkillToolName}},
-		{name: "partial", options: ViewOptions{AllowedNames: nameSet("Bash", "Read"), AlwaysInclude: []string{LoadSkillToolName}}, want: []string{"Read", "Bash", LoadSkillToolName}},
+		{name: "empty allowlist cannot revive system tool", options: ViewOptions{AllowedNames: map[string]struct{}{}, AlwaysInclude: []string{LoadSkillToolName}}, want: []string{}},
+		{name: "partial cannot revive system tool", options: ViewOptions{AllowedNames: nameSet("Bash", "Read"), AlwaysInclude: []string{LoadSkillToolName}}, want: []string{"Read", "Bash"}},
 		{name: "read only", options: ViewOptions{ReadOnly: true, AlwaysInclude: []string{LoadSkillToolName}}, want: []string{"Read", "Glob", "Grep", LoadSkillToolName}},
 		{name: "allowlist and read only intersect", options: ViewOptions{AllowedNames: nameSet("Read", "Write", "Grep", LoadSkillToolName), AlwaysInclude: []string{LoadSkillToolName}, ReadOnly: true}, want: []string{"Read", "Grep", LoadSkillToolName}},
 	}

@@ -86,11 +86,11 @@ func (c *testController) lastError() string {
 	return c.errors[len(c.errors)-1].Error()
 }
 
-func TestBuiltinsRegisterTwelveVisibleCommands(t *testing.T) {
+func TestBuiltinsRegisterFifteenVisibleCommands(t *testing.T) {
 	registry := MustNew(Builtins()...)
 	visible := registry.Visible()
-	if len(visible) != 12 {
-		t.Fatalf("expected 12 visible commands, got %d: %#v", len(visible), visible)
+	if len(visible) != 15 {
+		t.Fatalf("expected 15 visible commands, got %d: %#v", len(visible), visible)
 	}
 	expected := map[string]struct {
 		aliases []string
@@ -103,6 +103,7 @@ func TestBuiltinsRegisterTwelveVisibleCommands(t *testing.T) {
 		"new": {typeOf: TypeUI}, "sessions": {aliases: []string{"list"}, typeOf: TypeUI},
 		"memory": {aliases: []string{"mem"}, typeOf: TypeLocal}, "permission": {aliases: []string{"perm"}, typeOf: TypeLocal},
 		"status": {aliases: []string{"st"}, typeOf: TypeLocal},
+		"agent":  {typeOf: TypeUI}, "tasks": {typeOf: TypeUI}, "task": {typeOf: TypeUI},
 	}
 	seenTypes := map[Type]bool{}
 	for _, definition := range visible {

@@ -10,11 +10,18 @@ import (
 	"xagent/internal/tool"
 )
 
-func anthropicMessageParams(defaultModel string, req ChatRequest) anthropic.MessageNewParams {
+func anthropicMessageParams(defaultModel string, req ChatRequest) (anthropic.MessageNewParams, error) {
+	if err := req.Validate(); err != nil {
+		return anthropic.MessageNewParams{}, err
+	}
+	messages, err := toAnthropicMessages(req.Messages)
+	if err != nil {
+		return anthropic.MessageNewParams{}, err
+	}
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(reqModel(requestModel(req.Model, defaultModel))),
 		MaxTokens: 64000,
-		Messages:  toAnthropicMessages(req.Messages),
+		Messages:  messages,
 		Tools:     toAnthropicTools(req),
 		System:    toAnthropicSystemBlocks(req),
 	}
@@ -26,7 +33,7 @@ func anthropicMessageParams(defaultModel string, req ChatRequest) anthropic.Mess
 		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
 	}
 
-	return params
+	return params, nil
 }
 
 func reqModel(model string) string {
@@ -36,7 +43,7 @@ func reqModel(model string) string {
 	return model
 }
 
-func toAnthropicMessages(messages []ModelMessage) []anthropic.MessageParam {
+func toAnthropicMessages(messages []ModelMessage) ([]anthropic.MessageParam, error) {
 	result := make([]anthropic.MessageParam, 0, len(messages))
 	for _, message := range messages {
 		switch message.Role {
@@ -53,9 +60,13 @@ func toAnthropicMessages(messages []ModelMessage) []anthropic.MessageParam {
 		case ModelMessageRoleToolResult:
 			isError := message.ToolResultStatus != string(tool.StatusSuccess)
 			result = append(result, anthropic.NewUserMessage(anthropic.NewToolResultBlock(message.ToolCallID, message.ToolResult.Text(), isError)))
+		case ModelMessageRoleSubagentResult:
+			result = append(result, anthropic.NewUserMessage(anthropic.NewTextBlock(markedSubagentResult(message.Content.Text()))))
+		default:
+			return nil, ErrInvalidChatRequest
 		}
 	}
-	return result
+	return result, nil
 }
 
 func toAnthropicSystemBlocks(req ChatRequest) []anthropic.TextBlockParam {
@@ -97,7 +108,7 @@ func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
 		}
 		tools = append(tools, anthropic.ToolUnionParam{OfTool: &param})
 	}
-	if req.Cache.EnablePromptCache && (!usesOrderedSystem(req) || req.Cache.CacheTools) {
+	if req.Cache.EnablePromptCache && req.Cache.CacheTools {
 		last := len(tools) - 1
 		tools[last].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}

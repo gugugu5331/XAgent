@@ -26,6 +26,9 @@ type Status struct {
 	OutputTokens             int64
 	CacheCreationInputTokens int64
 	CacheReadInputTokens     int64
+	TaskCount                int
+	RunningTasks             int
+	WaitingTaskConfirmations int
 	Duration                 time.Duration
 	MCP                      string
 	Notice                   string
@@ -66,6 +69,15 @@ func (s Status) View() string {
 	}
 	if s.CacheCreationInputTokens > 0 || s.CacheReadInputTokens > 0 {
 		parts = append(parts, fmt.Sprintf("Cache: %d create / %d read", s.CacheCreationInputTokens, s.CacheReadInputTokens))
+	}
+	if s.TaskCount > 0 {
+		parts = append(parts, fmt.Sprintf("任务: %d", s.TaskCount))
+	}
+	if s.RunningTasks > 0 {
+		parts = append(parts, fmt.Sprintf("运行中: %d", s.RunningTasks))
+	}
+	if s.WaitingTaskConfirmations > 0 {
+		parts = append(parts, fmt.Sprintf("等待任务确认: %d", s.WaitingTaskConfirmations))
 	}
 	if strings.TrimSpace(s.MCP) != "" {
 		parts = append(parts, "MCP: "+s.MCP)
@@ -153,6 +165,15 @@ func (s Status) responsiveView() string {
 	}
 	if s.CacheCreationInputTokens > 0 || s.CacheReadInputTokens > 0 {
 		metrics = append(metrics, fmt.Sprintf("Cache: %d create / %d read", s.CacheCreationInputTokens, s.CacheReadInputTokens))
+	}
+	if s.TaskCount > 0 {
+		metrics = append(metrics, fmt.Sprintf("任务: %d", s.TaskCount))
+	}
+	if s.RunningTasks > 0 {
+		metrics = append(metrics, fmt.Sprintf("运行中: %d", s.RunningTasks))
+	}
+	if s.WaitingTaskConfirmations > 0 {
+		critical = append(critical, fmt.Sprintf("等待任务确认: %d", s.WaitingTaskConfirmations))
 	}
 	if strings.TrimSpace(s.MCP) != "" {
 		metrics = append(metrics, "MCP: "+s.MCP)

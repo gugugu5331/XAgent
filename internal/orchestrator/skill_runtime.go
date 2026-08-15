@@ -102,6 +102,31 @@ func (o *Orchestrator) handleSkillToolCalls(
 		return nil, StopReasonProviderError, 0, err
 	}
 	for index, call := range calls {
+		if call.Name == tool.AgentToolName {
+			execution := o.prepareToolExecutionWithRegistryAndRef(execCtx, req.Mode, registry, indexedToolCall{Call: call, Index: index}, state.ref, out)
+			if execution.Err != nil {
+				return nil, execution.StopReason, unknownTools, execution.Err
+			}
+			if execution.HasResult {
+				execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+				if err != nil {
+					return nil, StopReasonProviderError, unknownTools, err
+				}
+				unknownTools += countUnknownToolResults([]ToolExecution{execution})
+				continue
+			}
+			handlerStarted := time.Now()
+			result := o.routeAgentSystemTool(ctx, conv, state, parentCheckpoint, iterationProfile, req.Mode, execution.Validated)
+			execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
+			execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+			if err != nil {
+				return nil, StopReasonProviderError, unknownTools, err
+			}
+			if execution.Err != nil {
+				return nil, execution.StopReason, unknownTools, execution.Err
+			}
+			continue
+		}
 		if call.Name != tool.LoadSkillToolName {
 			executions, reason, err := o.executeToolBatchesWithRegistryAndRef(execCtx, req.Mode, registry, []ToolBatch{{Calls: []indexedToolCall{{Call: call, Index: index}}}}, state.ref, out)
 			executions, publishErr := o.publishToolExecutions(ctx, conv, state, iteration, executions, out)
@@ -230,9 +255,13 @@ func (o *Orchestrator) handleSkillToolCalls(
 	return nil, "", unknownTools, nil
 }
 
-func containsLoadSkillCall(calls []tool.Call) bool {
+func containsSystemRouteCall(registry *tool.Registry, calls []tool.Call) bool {
+	if registry == nil {
+		return false
+	}
 	for _, call := range calls {
-		if call.Name == tool.LoadSkillToolName {
+		descriptor, ok := registry.Descriptor(call.Name)
+		if ok && descriptor.Route == tool.RouteSystem {
 			return true
 		}
 	}

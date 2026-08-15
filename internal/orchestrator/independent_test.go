@@ -819,7 +819,10 @@ func TestIndependentTextIsVisibleBeforeProviderCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	released := false
-	timer := time.NewTimer(time.Second)
+	// The provider cannot complete until the test closes release, so ordering is
+	// established by that explicit gate. This timer is only a deadlock watchdog;
+	// leave enough headroom for race instrumentation and loaded CI hosts.
+	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 	for {
 		select {

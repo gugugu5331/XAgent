@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"xagent/internal/redact"
 )
@@ -69,11 +70,51 @@ var approvedAppConfigNumericKeys = []string{
 	"tool.capture_bytes",
 	"tool.inline_output_bytes",
 	"tool.timeout_ms",
+	"subagent.auto_background_after_ms",
+	"subagent.max_concurrent",
+	"subagent.max_event_bytes",
+	"subagent.max_events_per_task",
+	"subagent.max_global_events",
+	"subagent.max_pending_results",
+	"subagent.max_queued",
+	"subagent.max_result_bytes",
+	"subagent.max_result_total_bytes",
+	"subagent.max_results_per_claim",
+	"subagent.max_retained_tasks",
+	"subagent.max_role_name_bytes",
+	"subagent.max_subscriber_buffer",
+	"subagent.max_task_bytes",
+	"subagent.max_task_duration_ms",
+	"subagent.max_task_tombstones",
+	"subagent.read_cache_max_bytes",
+	"subagent.read_cache_max_dependencies_per_entry",
+	"subagent.read_cache_max_entries",
+	"subagent.read_cache_max_value_bytes",
+	"subagent.role_limits.max_body_bytes",
+	"subagent.role_limits.max_candidates",
+	"subagent.role_limits.max_description_bytes",
+	"subagent.role_limits.max_diagnostics",
+	"subagent.role_limits.max_entry_bytes",
+	"subagent.role_limits.max_files",
+	"subagent.role_limits.max_frontmatter_bytes",
+	"subagent.role_limits.max_instruction_bytes",
+	"subagent.role_limits.max_model_bytes",
+	"subagent.role_limits.max_name_bytes",
+	"subagent.role_limits.max_origin_bytes",
+	"subagent.role_limits.max_provider_id_bytes",
+	"subagent.role_limits.max_providers",
+	"subagent.role_limits.max_root_bytes",
+	"subagent.role_limits.max_source_id_bytes",
+	"subagent.role_limits.max_tool_list_bytes",
+	"subagent.role_limits.max_tool_name_bytes",
+	"subagent.role_limits.max_tool_names",
+	"subagent.role_limits.max_total_bytes",
 }
 
 func TestAppConfigNumericManifestIsExact(t *testing.T) {
 	manifest := appConfigNumericKeys()
 	sort.Strings(manifest)
+	sort.Strings(approvedAppConfigNumericKeys)
 	if !reflect.DeepEqual(manifest, approvedAppConfigNumericKeys) {
 		t.Fatal("AppConfig numeric manifest differs from the approved snapshot")
 	}
@@ -384,6 +425,7 @@ func prepareContextSessionBoundary(partial *PartialAppConfig, path string) {
 		partial.Context.AutoMarginTokens = Optional[int64]{Set: true, Value: 1}
 		partial.Context.ManualMarginTokens = Optional[int64]{Set: true, Value: 1}
 		partial.Context.RecentKeepTokens = Optional[int64]{Set: true, Value: 1}
+		partial.Subagent.MaxResultBytes = Optional[int64]{Set: true, Value: 1}
 	case "context.auto_margin_tokens", "context.manual_margin_tokens", "context.recent_keep_tokens":
 		partial.Context.ModelWindowTokens = Optional[int64]{Set: true, Value: 10_000_000}
 	case "session.max_session_bytes":
@@ -393,18 +435,19 @@ func prepareContextSessionBoundary(partial *PartialAppConfig, path string) {
 
 func TestContextWindowMinimumAndThreeStrictRelations(t *testing.T) {
 	valid := PartialContextConfig{
-		ModelWindowTokens:  Optional[int64]{Set: true, Value: 2},
+		ModelWindowTokens:  Optional[int64]{Set: true, Value: 131},
 		AutoMarginTokens:   Optional[int64]{Set: true, Value: 1},
 		ManualMarginTokens: Optional[int64]{Set: true, Value: 1},
 		RecentKeepTokens:   Optional[int64]{Set: true, Value: 1},
 	}
-	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: valid}}, LoadOptions{}); err != nil {
+	minimumResult := PartialSubagentConfig{MaxResultBytes: Optional[int64]{Set: true, Value: 1}}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: valid, Subagent: minimumResult}}, LoadOptions{}); err != nil {
 		t.Fatal("minimum Context window with minimum token reserves was rejected")
 	}
 
 	tooSmall := valid
-	tooSmall.ModelWindowTokens = Optional[int64]{Set: true, Value: 1}
-	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: tooSmall}}, LoadOptions{}); err == nil {
+	tooSmall.ModelWindowTokens = Optional[int64]{Set: true, Value: 130}
+	if _, err := ResolveConfig(MergeResult{Value: PartialAppConfig{Context: tooSmall, Subagent: minimumResult}}, LoadOptions{}); err == nil {
 		t.Fatal("Context model window below its independent minimum was accepted")
 	}
 
@@ -414,8 +457,8 @@ func TestContextWindowMinimumAndThreeStrictRelations(t *testing.T) {
 		"context.recent_keep_tokens",
 	} {
 		t.Run(path, func(t *testing.T) {
-			partial := PartialAppConfig{Context: valid}
-			setPartialNumericValue(t, &partial, path, Optional[int64]{Set: true, Value: 2})
+			partial := PartialAppConfig{Context: valid, Subagent: minimumResult}
+			setPartialNumericValue(t, &partial, path, Optional[int64]{Set: true, Value: 131})
 			if _, err := ResolveConfig(MergeResult{Value: partial}, LoadOptions{}); err == nil {
 				t.Fatal("Context token reserve equal to the model window was accepted")
 			}
@@ -807,10 +850,15 @@ func allAppConfigNumericSpecs() []numericSpec {
 	result = append(result, llmAgentStreamNumericSpecs[:]...)
 	result = append(result, contextSessionNumericSpecs[:]...)
 	result = append(result, memoryDiagnosticsLifecycleNumericSpecs[:]...)
+	result = append(result, roleLimitNumericSpecs[:]...)
+	result = append(result, subagentRuntimeNumericSpecs[:]...)
 	return result
 }
 
 func prepareCompleteNumericBoundary(partial *PartialAppConfig, path string) {
+	set := func(value int64) Optional[int64] {
+		return Optional[int64]{Set: true, Value: value}
+	}
 	prepareLLMAgentStreamBoundary(partial, path)
 	prepareContextSessionBoundary(partial, path)
 	prepareMemoryDiagnosticsLifecycleBoundary(partial, path)
@@ -834,6 +882,41 @@ func prepareCompleteNumericBoundary(partial *PartialAppConfig, path string) {
 		partial.Context.ToolResultThresholdChars = Optional[int64]{Set: true, Value: 1}
 	case "mcp.servers.<name>.timeout_ms":
 		partial.MCP.Servers = map[string]PartialMCPServerConfig{"local": {}}
+	case "subagent.role_limits.max_entry_bytes":
+		partial.Subagent.RoleLimits.MaxFrontmatterBytes = set(1)
+		partial.Subagent.RoleLimits.MaxBodyBytes = set(1)
+		partial.Subagent.RoleLimits.MaxInstructionBytes = set(1)
+		partial.Subagent.RoleLimits.MaxTotalBytes = set(512 * mebibyte)
+	case "subagent.role_limits.max_frontmatter_bytes":
+		partial.Subagent.RoleLimits.MaxEntryBytes = set(4 * mebibyte)
+	case "subagent.role_limits.max_body_bytes":
+		partial.Subagent.RoleLimits.MaxEntryBytes = set(4 * mebibyte)
+		partial.Subagent.RoleLimits.MaxInstructionBytes = set(1)
+	case "subagent.role_limits.max_instruction_bytes":
+		partial.Subagent.RoleLimits.MaxEntryBytes = set(4 * mebibyte)
+		partial.Subagent.RoleLimits.MaxBodyBytes = set(2 * mebibyte)
+	case "subagent.role_limits.max_total_bytes":
+		partial.Subagent.RoleLimits.MaxEntryBytes = set(1)
+		partial.Subagent.RoleLimits.MaxFrontmatterBytes = set(1)
+		partial.Subagent.RoleLimits.MaxBodyBytes = set(1)
+		partial.Subagent.RoleLimits.MaxInstructionBytes = set(1)
+	case "subagent.max_queued":
+		partial.Subagent.MaxRetainedTasks = set(65_536)
+	case "subagent.max_retained_tasks":
+		partial.Subagent.MaxConcurrent = set(1)
+		partial.Subagent.MaxQueued = set(1)
+	case "subagent.max_global_events":
+		partial.Subagent.MaxEventsPerTask = set(1)
+	case "subagent.max_events_per_task":
+		partial.Subagent.MaxGlobalEvents = set(1_000_000)
+	case "subagent.max_result_total_bytes":
+		partial.Subagent.MaxResultBytes = set(1)
+	case "subagent.max_result_bytes":
+		partial.Context.ModelWindowTokens = set(10_000_000)
+	case "subagent.read_cache_max_bytes":
+		partial.Subagent.ReadCacheMaxValueBytes = set(1)
+	case "subagent.read_cache_max_value_bytes":
+		partial.Subagent.ReadCacheMaxBytes = set(512 * mebibyte)
 	}
 }
 
@@ -873,12 +956,13 @@ type numericBoundaryCase struct {
 }
 
 func numericBoundaryCases(defaultValue int64, minimum int64, hardCap int64) []numericBoundaryCase {
+	explicitZeroValid := minimum == 0
 	return []numericBoundaryCase{
 		{name: "absent_default", want: defaultValue, wantValid: true},
 		{name: "minimum", candidate: Optional[int64]{Set: true, Value: minimum}, want: minimum, wantValid: true},
 		{name: "hard_cap", candidate: Optional[int64]{Set: true, Value: hardCap}, want: hardCap, wantValid: true},
 		{name: "hard_cap_plus_one", candidate: Optional[int64]{Set: true, Value: hardCap + 1}},
-		{name: "explicit_zero", candidate: Optional[int64]{Set: true, Value: 0}},
+		{name: "explicit_zero", candidate: Optional[int64]{Set: true, Value: 0}, want: 0, wantValid: explicitZeroValid},
 		{name: "negative", candidate: Optional[int64]{Set: true, Value: -1}},
 		{name: "overflow", encoded: "9223372036854775808"},
 	}
@@ -1024,6 +1108,84 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return config.Diagnostics.MaxTotalBytes
 	case "lifecycle.cleanup_timeout_ms":
 		return config.Lifecycle.CleanupTimeoutMS
+	case "subagent.max_task_bytes":
+		return config.Subagent.Limits.MaxTaskBytes
+	case "subagent.max_concurrent":
+		return int64(config.Subagent.Limits.MaxConcurrent)
+	case "subagent.max_queued":
+		return int64(config.Subagent.Limits.MaxQueued)
+	case "subagent.max_retained_tasks":
+		return int64(config.Subagent.Limits.MaxRetainedTasks)
+	case "subagent.max_task_tombstones":
+		return int64(config.Subagent.Limits.MaxTaskTombstones)
+	case "subagent.max_global_events":
+		return int64(config.Subagent.Limits.MaxGlobalEvents)
+	case "subagent.max_events_per_task":
+		return int64(config.Subagent.Limits.MaxEventsPerTask)
+	case "subagent.max_event_bytes":
+		return config.Subagent.Limits.MaxEventBytes
+	case "subagent.max_subscriber_buffer":
+		return int64(config.Subagent.Limits.MaxSubscriberBuffer)
+	case "subagent.max_result_bytes":
+		return config.Subagent.Limits.MaxResultBytes
+	case "subagent.max_pending_results":
+		return int64(config.Subagent.Limits.MaxPendingResults)
+	case "subagent.max_result_total_bytes":
+		return config.Subagent.Limits.MaxResultTotalBytes
+	case "subagent.max_results_per_claim":
+		return int64(config.Subagent.Limits.MaxResultsPerClaim)
+	case "subagent.read_cache_max_entries":
+		return int64(config.Subagent.Limits.ReadCacheMaxEntries)
+	case "subagent.read_cache_max_bytes":
+		return config.Subagent.Limits.ReadCacheMaxBytes
+	case "subagent.read_cache_max_value_bytes":
+		return config.Subagent.Limits.ReadCacheMaxValueBytes
+	case "subagent.read_cache_max_dependencies_per_entry":
+		return int64(config.Subagent.Limits.ReadCacheMaxDependenciesPerEntry)
+	case "subagent.max_role_name_bytes":
+		return config.Subagent.Limits.MaxRoleNameBytes
+	case "subagent.auto_background_after_ms":
+		return int64(config.Subagent.Limits.AutoBackgroundAfter / time.Millisecond)
+	case "subagent.max_task_duration_ms":
+		return int64(config.Subagent.Limits.MaxTaskDuration / time.Millisecond)
+	case "subagent.role_limits.max_files":
+		return int64(config.Subagent.RoleLimits.MaxFiles)
+	case "subagent.role_limits.max_entry_bytes":
+		return config.Subagent.RoleLimits.MaxEntryBytes
+	case "subagent.role_limits.max_frontmatter_bytes":
+		return config.Subagent.RoleLimits.MaxFrontmatterBytes
+	case "subagent.role_limits.max_body_bytes":
+		return config.Subagent.RoleLimits.MaxBodyBytes
+	case "subagent.role_limits.max_name_bytes":
+		return config.Subagent.RoleLimits.MaxNameBytes
+	case "subagent.role_limits.max_description_bytes":
+		return config.Subagent.RoleLimits.MaxDescriptionBytes
+	case "subagent.role_limits.max_instruction_bytes":
+		return config.Subagent.RoleLimits.MaxInstructionBytes
+	case "subagent.role_limits.max_tool_name_bytes":
+		return config.Subagent.RoleLimits.MaxToolNameBytes
+	case "subagent.role_limits.max_tool_list_bytes":
+		return config.Subagent.RoleLimits.MaxToolListBytes
+	case "subagent.role_limits.max_origin_bytes":
+		return config.Subagent.RoleLimits.MaxOriginBytes
+	case "subagent.role_limits.max_source_id_bytes":
+		return config.Subagent.RoleLimits.MaxSourceIDBytes
+	case "subagent.role_limits.max_provider_id_bytes":
+		return config.Subagent.RoleLimits.MaxProviderIDBytes
+	case "subagent.role_limits.max_root_bytes":
+		return config.Subagent.RoleLimits.MaxRootBytes
+	case "subagent.role_limits.max_model_bytes":
+		return config.Subagent.RoleLimits.MaxModelBytes
+	case "subagent.role_limits.max_total_bytes":
+		return config.Subagent.RoleLimits.MaxTotalBytes
+	case "subagent.role_limits.max_tool_names":
+		return int64(config.Subagent.RoleLimits.MaxToolNames)
+	case "subagent.role_limits.max_providers":
+		return int64(config.Subagent.RoleLimits.MaxProviders)
+	case "subagent.role_limits.max_candidates":
+		return int64(config.Subagent.RoleLimits.MaxCandidates)
+	case "subagent.role_limits.max_diagnostics":
+		return int64(config.Subagent.RoleLimits.MaxDiagnostics)
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0

@@ -2,12 +2,14 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"xagent/internal/command"
+	"xagent/internal/diagnostics"
 	"xagent/internal/memory"
 	"xagent/internal/orchestrator"
 	"xagent/internal/tui"
@@ -30,10 +32,22 @@ func (c *commandController) DisplayError(err error) {
 		c.model.status.Error = nil
 		return
 	}
-	safe := c.model.redactError(err)
+	var published error
+	var safeError *diagnostics.SafeError
+	if errors.As(err, &safeError) {
+		cloned := *safeError
+		published = &cloned
+	} else {
+		published = c.model.redactError(err)
+	}
 	c.model.status.Notice = ""
-	c.model.status.Error = safe
-	c.model.lastError = safe
+	c.model.status.Error = published
+	if safeError, ok := published.(*diagnostics.SafeError); ok {
+		cloned := *safeError
+		c.model.lastError = &cloned
+	} else {
+		c.model.lastError = published
+	}
 }
 
 func (c *commandController) SendUserMessage(text string) {

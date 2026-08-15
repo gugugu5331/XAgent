@@ -17,13 +17,11 @@ func TestOpenAIRequestUsesSafeDTO(t *testing.T) {
 			{Name: "fixed", Content: safeText("fixed rules"), Cacheable: true},
 			{Name: metadataCanary, Content: safeText("runtime rules")},
 		},
-		StableSystem:  []SystemBlock{{Name: "legacy", Content: safeText("legacy system must not win")}},
-		DynamicSystem: []SystemBlock{{Name: "legacy-dynamic", Content: safeText("legacy dynamic must not win")}},
 		Messages: []ModelMessage{
 			{Role: ModelMessageRoleUser, Content: safeText("user message")},
 			{Role: ModelMessageRoleAssistant, Content: safeText("assistant message")},
 			{Role: ModelMessageRoleToolCall, ToolCallID: "call-1", ToolName: "Read", ArgumentsJSON: safeText(`{"path":"go.mod"}`)},
-			{Role: ModelMessageRoleToolResult, ToolCallID: "call-1", ToolResult: safeText("tool result")},
+			{Role: ModelMessageRoleToolResult, ToolCallID: "call-1", ToolName: "Read", ToolResult: safeText("tool result"), ToolResultStatus: string(tool.StatusSuccess)},
 			{Role: ModelMessageRoleContextSummary, Content: safeText("summary")},
 			{Role: ModelMessageRoleContextBoundary, Content: safeText("boundary")},
 		},
@@ -34,7 +32,11 @@ func TestOpenAIRequestUsesSafeDTO(t *testing.T) {
 		},
 	}
 
-	wire, err := json.Marshal(newOpenAIRequest(req, "fallback-model"))
+	wireRequest, err := newOpenAIRequest(req, "fallback-model")
+	if err != nil {
+		t.Fatalf("build OpenAI request: %v", err)
+	}
+	wire, err := json.Marshal(wireRequest)
 	if err != nil {
 		t.Fatalf("marshal OpenAI request: %v", err)
 	}
@@ -91,7 +93,11 @@ func TestOpenAIRequestUsesSafeDTO(t *testing.T) {
 
 	withoutCache := req
 	withoutCache.Cache = CachePolicy{}
-	wireWithoutCache, err := json.Marshal(newOpenAIRequest(withoutCache, "fallback-model"))
+	wireRequestWithoutCache, err := newOpenAIRequest(withoutCache, "fallback-model")
+	if err != nil {
+		t.Fatalf("build request without cache policy: %v", err)
+	}
+	wireWithoutCache, err := json.Marshal(wireRequestWithoutCache)
 	if err != nil {
 		t.Fatalf("marshal request without cache policy: %v", err)
 	}
@@ -110,7 +116,11 @@ func TestOpenAIToolSchemaCompatibility(t *testing.T) {
 		)},
 	}}
 
-	wire, err := json.Marshal(newOpenAIRequest(req, "model"))
+	wireRequest, err := newOpenAIRequest(req, "model")
+	if err != nil {
+		t.Fatalf("build OpenAI request: %v", err)
+	}
+	wire, err := json.Marshal(wireRequest)
 	if err != nil {
 		t.Fatalf("marshal OpenAI request: %v", err)
 	}

@@ -292,7 +292,7 @@ func TestAnthropicToolsCacheControl(t *testing.T) {
 		{Name: "Read", Description: "read", Schema: tool.Schema{Type: "object"}},
 		{Name: "Write", Description: "write", Schema: tool.Schema{Type: "object"}},
 	}
-	tools := toAnthropicTools(ChatRequest{Tools: defs, Cache: CachePolicy{EnablePromptCache: true}})
+	tools := toAnthropicTools(ChatRequest{Tools: defs, Cache: CachePolicy{EnablePromptCache: true, CacheTools: true}})
 	if len(tools) != 2 {
 		t.Fatalf("unexpected tools: %#v", tools)
 	}

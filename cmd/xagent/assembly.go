@@ -131,6 +131,7 @@ type assemblyBuildState struct {
 	adapters      *assemblyAdapters
 	context       *assemblyContextServices
 	orchestration *assemblyOrchestration
+	subagents     *assemblySubagents
 	ui            *assemblyUI
 }
 
@@ -756,17 +757,22 @@ func newAssemblyExecutionStage(request assemblyExecutionRequest) assemblyStageBu
 		if err != nil {
 			return safeAssemblyExecutionError("load-skill tool")
 		}
+		agentTool, err := tool.NewAgentToolWithResultFactory(resultFactory)
+		if err != nil {
+			return safeAssemblyExecutionError("Agent tool")
+		}
 		for _, candidate := range []struct {
 			tool   tool.Tool
 			policy tool.ExecutionPolicy
 		}{
-			{tool: readTool, policy: tool.ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
+			{tool: readTool, policy: tool.ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
 			{tool: writeTool},
 			{tool: editTool},
 			{tool: bashTool},
-			{tool: globTool, policy: tool.ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
-			{tool: grepTool, policy: tool.ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
+			{tool: globTool, policy: tool.ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
+			{tool: grepTool, policy: tool.ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
 			{tool: loadSkillTool},
+			{tool: agentTool},
 		} {
 			if err := registry.RegisterWithOptions(candidate.tool, tool.RegistrationOptions{Policy: candidate.policy}); err != nil {
 				return safeAssemblyExecutionError("tool registry")
@@ -1061,6 +1067,9 @@ func newAssemblyAdaptersStage(request assemblyAdaptersRequest) assemblyStageBuil
 				return safeAssemblyAdaptersError("MCP tool registration")
 			}
 		}
+		if err := state.execution.registry.Seal(); err != nil {
+			return safeAssemblyAdaptersError("tool registry seal")
+		}
 
 		state.adapters = &assemblyAdapters{
 			provider:      providerService,
@@ -1113,6 +1122,18 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 		if err != nil || commandRegistry == nil {
 			return safeAssemblyOrchestrationError("command registry")
 		}
+		subagents, err := newAssemblySubagents(ctx, assemblySubagentRequest{
+			Paths: request.paths, Config: resolved, Provider: state.adapters.provider,
+			Registry: state.execution.registry, Executor: state.execution.executor,
+			ResultFactory: state.execution.resultFactory, Authorizer: state.execution.permissions.authorizer,
+			SessionContext: contextServices.sessionContext, ContextManager: contextServices.contextManager,
+			RequestBudgeter: contextServices.requestBudgeter, ContextPolicy: contextServices.skillHistoryPolicy,
+			Hooks: state.adapters.hooks, RuntimeRedactor: state.configuration.redactor,
+			CleanupTimeout: state.configuration.cleanupTimeout, LifecycleDiagnostics: state.configuration.diagnostics,
+		})
+		if err != nil || subagents == nil {
+			return safeAssemblyOrchestrationError("subagent services")
+		}
 
 		orchestration := &assemblyOrchestration{
 			contextManager:     contextServices.contextManager,
@@ -1122,6 +1143,12 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			requestBudgeter:    contextServices.requestBudgeter,
 			skillHistoryPolicy: contextServices.skillHistoryPolicy,
 			commandRegistry:    commandRegistry,
+		}
+		var memoryUpdater interface {
+			UpdateAsync(memory.UpdateInput)
+		}
+		if contextServices.memory != nil {
+			memoryUpdater = contextServices.memory
 		}
 		orchestration.orchestrator = orchestrator.NewWithOptions(orchestrator.OrchestratorOptions{
 			Provider:             state.adapters.provider,
@@ -1135,12 +1162,15 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			Authorizer:           state.execution.permissions.authorizer,
 			ContextManager:       contextServices.contextManager,
 			ResultFactory:        state.execution.resultFactory,
+			ResultProjector:      subagents.projector,
+			Subagents:            subagents.tasks,
+			SubagentLimits:       resolved.Subagent.Limits,
 			SkillHistoryPolicy:   contextServices.skillHistoryPolicy,
 			RequestBudgeter:      contextServices.requestBudgeter,
 			MaxRecordBytes:       resolved.Session.MaxRecordBytes,
 			MaxSessionBytes:      resolved.Session.MaxSessionBytes,
 			SessionContext:       contextServices.sessionContext,
-			Memory:               contextServices.memory,
+			Memory:               memoryUpdater,
 			Diagnostics:          state.adapters.diagnostics,
 			Agent:                resolved.Agent,
 			SkillManager:         state.execution.skills,
@@ -1151,6 +1181,8 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			Hooks:                state.adapters.hooks,
 		})
 		if orchestration.orchestrator == nil {
+			_ = subagents.shutdown(context.Background())
+			_ = subagents.closeResultInbox(context.Background())
 			return safeAssemblyOrchestrationError("orchestrator")
 		}
 		if err := register(func(cleanupCtx context.Context) error {
@@ -1158,10 +1190,26 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			defer cancel()
 			return orchestration.orchestrator.WaitIdle(waitCtx)
 		}); err != nil {
+			_ = subagents.shutdown(context.Background())
+			_ = subagents.closeResultInbox(context.Background())
 			return safeAssemblyOrchestrationError("ownership registration")
+		}
+		// Owners close in reverse registration order: TaskManager first stops
+		// admission and joins workers, then ResultInbox releases claim watchers,
+		// then the ordinary Orchestrator waits for its interactive stream.
+		if err := register(subagents.closeResultInbox); err != nil {
+			_ = subagents.shutdown(context.Background())
+			_ = subagents.closeResultInbox(context.Background())
+			return safeAssemblyOrchestrationError("subagent inbox ownership registration")
+		}
+		if err := register(subagents.shutdown); err != nil {
+			_ = subagents.shutdown(context.Background())
+			_ = subagents.closeResultInbox(context.Background())
+			return safeAssemblyOrchestrationError("subagent manager ownership registration")
 		}
 		state.context = contextServices
 		state.orchestration = orchestration
+		state.subagents = subagents
 		return nil
 	}
 }
@@ -1224,6 +1272,9 @@ func newAssemblyUIStage() assemblyStageBuilder {
 			}
 			closeApp = func(context.Context) error { return nil }
 		} else {
+			if state.subagents == nil || state.subagents.tasks == nil {
+				return errors.New("assembly UI subagent boundary is unavailable")
+			}
 			runtimeOptions := app.RuntimeOptions{}
 			runtimeOptions = app.RuntimeOptions{
 				CleanupTimeout: state.configuration.cleanupTimeout,
@@ -1252,6 +1303,8 @@ func newAssemblyUIStage() assemblyStageBuilder {
 				MCPStatus:            state.adapters.mcp,
 				CommandRegistry:      state.orchestration.commandRegistry,
 				ExistingOrchestrator: state.orchestration.orchestrator,
+				Tasks:                state.subagents.tasks,
+				TaskSubmitPreparer:   state.orchestration.orchestrator,
 			}
 			model := app.NewWithOptions(deps, runtimeOptions)
 			ui = &assemblyUI{
