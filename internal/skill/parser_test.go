@@ -1,6 +1,7 @@
 package skill
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -65,10 +66,100 @@ func TestValidateMetadata(t *testing.T) {
 	}
 }
 
+func TestSkillHistoryDefaultExplicitZeroAndIsolatedBoundaries(t *testing.T) {
+	defaulted, _, err := parseDefault(skillHistoryDocument(ModeIsolated, "", "default body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaulted.History != 0 || defaulted.historySet {
+		t.Fatalf("unset history did not retain default presence: %#v", defaulted)
+	}
+
+	explicitZero, _, err := parseDefault(skillHistoryDocument(ModeIsolated, "history: 0\n", "zero body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitZero.History != 0 || !explicitZero.historySet {
+		t.Fatalf("explicit zero history lost presence: %#v", explicitZero)
+	}
+
+	boundary, _, err := parseDefault(skillHistoryDocument(ModeIsolated, "history: 1000\n", "boundary body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary.History != maxSkillHistoryTurns || !boundary.historySet {
+		t.Fatalf("isolated history boundary changed: %#v", boundary)
+	}
+	validated, err := ValidateMetadata(Metadata{Name: "direct", Description: "direct", Mode: ModeIsolated, History: maxSkillHistoryTurns})
+	if err != nil || validated.History != maxSkillHistoryTurns {
+		t.Fatalf("ValidateMetadata rejected isolated boundary: %#v %v", validated, err)
+	}
+}
+
+func TestSharedSkillRejectsPositiveHistory(t *testing.T) {
+	const bodyCanary = "shared-history-body-canary"
+	_, _, err := parseDefault(skillHistoryDocument(ModeShared, "history: 1\n", bodyCanary))
+	assertSkillHistoryError(t, err, 0, "1", bodyCanary)
+
+	_, err = ValidateMetadata(Metadata{Name: "shared", Description: "shared", Mode: ModeShared, History: 1})
+	assertSkillHistoryError(t, err, 0, "1")
+
+	metadata, _, err := parseDefault(skillHistoryDocument(ModeShared, "history: 0\n", "shared zero"))
+	if err != nil || metadata.History != 0 || !metadata.historySet {
+		t.Fatalf("shared explicit zero was rejected: %#v %v", metadata, err)
+	}
+}
+
+func TestSkillHistoryRejectsNegativeCapPlusOneOverflowAndWrongTypeWithoutLeak(t *testing.T) {
+	const bodyCanary = "isolated-history-body-canary"
+	invalid := []struct {
+		name   string
+		scalar string
+	}{
+		{name: "negative", scalar: "-7"},
+		{name: "cap plus one", scalar: "1001"},
+		{name: "integer overflow", scalar: "9223372036854775808"},
+		{name: "string", scalar: `"history-wrong-type-canary"`},
+		{name: "boolean", scalar: "true"},
+		{name: "float", scalar: "1.5"},
+		{name: "sequence", scalar: "[1]"},
+		{name: "mapping", scalar: "{value: 1}"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			input := skillHistoryDocument(ModeIsolated, "history: "+test.scalar+"\n", bodyCanary)
+			_, _, err := parseDefault(input)
+			assertSkillHistoryError(t, err, maxSkillHistoryTurns, test.scalar, bodyCanary)
+		})
+	}
+
+	for _, value := range []int{-1, maxSkillHistoryTurns + 1} {
+		_, err := ValidateMetadata(Metadata{Name: "direct", Description: "direct", Mode: ModeIsolated, History: value})
+		assertSkillHistoryError(t, err, maxSkillHistoryTurns, fmt.Sprint(value))
+	}
+}
+
+func skillHistoryDocument(mode Mode, historyLine, body string) []byte {
+	return []byte(fmt.Sprintf("---\nname: history-test\ndescription: history test\nmode: %s\n%s---\n%s", mode, historyLine, body))
+}
+
+func assertSkillHistoryError(t *testing.T, err error, maximum int, forbidden ...string) {
+	t.Helper()
+	want := fmt.Sprintf("skill metadata field history must be an integer in range 0..%d", maximum)
+	if err == nil || err.Error() != want {
+		t.Fatalf("history error = %v, want %q", err, want)
+	}
+	for _, value := range forbidden {
+		if value != "" && strings.Contains(err.Error(), value) {
+			t.Fatalf("history error leaked rejected input %q: %v", value, err)
+		}
+	}
+}
+
 func TestParseRejectsUnknownFieldEmptyBodyAndLimitsWithoutLeakingBody(t *testing.T) {
-	secret := "sk-test-super-secret"
-	unknown := "---\nname: demo\ndescription: demo\nmode: shared\nunknown_field: true\n---\n" + secret
-	if _, _, err := parseDefault([]byte(unknown)); err == nil || strings.Contains(err.Error(), secret) {
+	bodyCanary := "parser-body-leak-canary"
+	unknown := "---\nname: demo\ndescription: demo\nmode: shared\nunknown_field: true\n---\n" + bodyCanary
+	if _, _, err := parseDefault([]byte(unknown)); err == nil || strings.Contains(err.Error(), bodyCanary) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	empty := "---\nname: demo\ndescription: demo\nmode: shared\n---\n  \n"

@@ -89,6 +89,7 @@ func (o *Orchestrator) handleSkillToolCalls(
 	state *executionState,
 	parentCheckpoint conversationCheckpoint,
 	iterationProfile skill.ExecutionProfile,
+	iteration int,
 	calls []tool.Call,
 	out chan<- events.Event,
 ) (terminal *RunResult, stopReason StopReason, unknownTools int, fatal error) {
@@ -103,8 +104,9 @@ func (o *Orchestrator) handleSkillToolCalls(
 	for index, call := range calls {
 		if call.Name != tool.LoadSkillToolName {
 			executions, reason, err := o.executeToolBatchesWithRegistryAndRef(execCtx, req.Mode, registry, []ToolBatch{{Calls: []indexedToolCall{{Call: call, Index: index}}}}, state.ref, out)
-			for _, execution := range executions {
-				o.appendToolMessages(conv, execution.Call, execution.Result)
+			executions, publishErr := o.publishToolExecutions(ctx, conv, state, iteration, executions, out)
+			if publishErr != nil {
+				return nil, StopReasonProviderError, unknownTools, publishErr
 			}
 			unknownTools += countUnknownToolResults(executions)
 			if err != nil {
@@ -116,8 +118,11 @@ func (o *Orchestrator) handleSkillToolCalls(
 		if execution.Err != nil {
 			return nil, execution.StopReason, unknownTools, execution.Err
 		}
-		if execution.Result.CallID != "" {
-			o.appendToolMessages(conv, call, execution.Result)
+		if execution.HasResult {
+			execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+			if err != nil {
+				return nil, StopReasonProviderError, unknownTools, err
+			}
 			unknownTools += countUnknownToolResults([]ToolExecution{execution})
 			continue
 		}
@@ -126,7 +131,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 		if err != nil {
 			result := o.loadSkillFailure(call, err)
 			execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
-			o.appendToolMessages(conv, call, result)
+			execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+			if err != nil {
+				return nil, StopReasonProviderError, unknownTools, err
+			}
 			if execution.Err != nil {
 				return nil, execution.StopReason, unknownTools, execution.Err
 			}
@@ -136,7 +144,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 		if err != nil {
 			result := o.loadSkillFailure(call, err)
 			execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
-			o.appendToolMessages(conv, call, result)
+			execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+			if err != nil {
+				return nil, StopReasonProviderError, unknownTools, err
+			}
 			if execution.Err != nil {
 				return nil, execution.StopReason, unknownTools, execution.Err
 			}
@@ -149,7 +160,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 				}
 				result := o.loadSkillFailure(call, fmt.Errorf("独立 Skill 必须作为本轮唯一工具调用"))
 				execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
-				o.appendToolMessages(conv, call, result)
+				execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+				if err != nil {
+					return nil, StopReasonProviderError, unknownTools, err
+				}
 				if execution.Err != nil {
 					return nil, execution.StopReason, unknownTools, execution.Err
 				}
@@ -161,7 +175,10 @@ func (o *Orchestrator) handleSkillToolCalls(
 				}
 				result := o.loadSkillFailure(call, fmt.Errorf("独立 Skill 内不能再次启动独立 Skill"))
 				execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
-				o.appendToolMessages(conv, call, result)
+				execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+				if err != nil {
+					return nil, StopReasonProviderError, unknownTools, err
+				}
 				if execution.Err != nil {
 					return nil, execution.StopReason, unknownTools, execution.Err
 				}
@@ -180,11 +197,16 @@ func (o *Orchestrator) handleSkillToolCalls(
 			result, err := o.runAgentTriggeredIndependent(ctx, conv, req, state, prepared, out)
 			if err != nil {
 				toolResult := o.loadSkillFailure(call, err)
-				o.completeSystemToolExecution(ctx, execution, toolResult, handlerStarted, out)
+				execution = o.completeSystemToolExecution(ctx, execution, toolResult, handlerStarted, out)
+				_, _ = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
 				return &result, result.Reason, unknownTools, err
 			}
-			toolResult := loadSkillSuccess(call, prepared.Activated.Name)
+			toolResult := o.loadSkillSuccess(call, prepared.Activated.Name)
 			execution = o.completeSystemToolExecution(ctx, execution, toolResult, handlerStarted, out)
+			execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+			if err != nil {
+				return &result, StopReasonProviderError, unknownTools, err
+			}
 			if execution.Err != nil {
 				return &result, StopReasonCancelled, unknownTools, execution.Err
 			}
@@ -195,9 +217,12 @@ func (o *Orchestrator) handleSkillToolCalls(
 			o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
 			return nil, StopReasonProviderError, unknownTools, err
 		}
-		result := loadSkillSuccess(call, prepared.Activated.Name)
+		result := o.loadSkillSuccess(call, prepared.Activated.Name)
 		execution = o.completeSystemToolExecution(ctx, execution, result, handlerStarted, out)
-		o.appendToolMessages(conv, call, result)
+		execution, err = o.publishToolExecution(ctx, conv, state, iteration, execution, out)
+		if err != nil {
+			return nil, StopReasonProviderError, unknownTools, err
+		}
 		if execution.Err != nil {
 			return nil, execution.StopReason, unknownTools, execution.Err
 		}
@@ -214,15 +239,8 @@ func containsLoadSkillCall(calls []tool.Call) bool {
 	return false
 }
 
-func loadSkillSuccess(call tool.Call, name string) tool.Result {
-	return tool.Result{
-		CallID:  call.ID,
-		Name:    call.Name,
-		Status:  tool.StatusSuccess,
-		Summary: fmt.Sprintf("Skill %s 已激活", name),
-		Content: fmt.Sprintf("Skill %s 已激活；完整指令将在下一轮系统上下文中生效。", name),
-		Data:    map[string]any{"skill": name, "activated": true},
-	}
+func (o *Orchestrator) loadSkillSuccess(call tool.Call, name string) tool.Result {
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Completed, Status: tool.StatusSuccess, Summary: fmt.Sprintf("Skill %s 已激活", name), Preview: fmt.Sprintf("Skill %s 已激活；完整指令将在下一轮系统上下文中生效。", name)})
 }
 
 func (o *Orchestrator) loadSkillFailure(call tool.Call, err error) tool.Result {
@@ -236,12 +254,9 @@ func (o *Orchestrator) loadSkillFailure(call tool.Call, err error) tool.Result {
 		status = tool.StatusTimeout
 		code = tool.ErrTimeout
 	}
-	return tool.Result{
-		CallID:  call.ID,
-		Name:    call.Name,
-		Status:  status,
-		Summary: "Skill 加载失败",
-		Content: message,
-		Error:   &tool.Error{Code: code, Message: message, Recoverable: true},
+	state := tool.Completed
+	if status == tool.StatusTimeout {
+		state = tool.CancelledAfterStart
 	}
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: state, Status: status, Summary: "Skill 加载失败", Preview: message, Error: &tool.Error{Code: code, Message: message, Recoverable: true}})
 }

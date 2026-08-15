@@ -8,8 +8,59 @@ import (
 	"testing"
 	"time"
 
+	"xagent/internal/artifact"
 	"xagent/internal/provider"
+	"xagent/internal/redact"
 )
+
+func TestMemoryStoresOnlySafeBoundedContentAndOpaqueRefs(t *testing.T) {
+	root := t.TempDir()
+	redactor := redact.NewRuntimeRedactor()
+	const secret = "memory-runtime-secret"
+	const artifactPath = "/private/artifacts/raw-output.log"
+	redactor.RegisterSecret(secret)
+	redactor.RegisterSecret(artifactPath)
+	manager := NewManager(ManagerOptions{
+		ProjectDir: root, Redactor: redactor, MaxNoteBytes: 512,
+	})
+	note := NewNote(NoteReference, ScopeProject, "title "+secret, "body "+secret+" "+artifactPath, "source "+secret, time.Unix(1, 0))
+	ref := artifact.Ref{ID: strings.Repeat("a", 64), Bytes: 17, CreatedAt: time.Unix(2, 0).UTC(), Available: true, Complete: false}
+	if err := manager.SaveNoteWithRefs(note, []artifact.Ref{ref}); err != nil {
+		t.Fatalf("save safe note with opaque ref: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, noteFileName(note.ID)))
+	if err != nil {
+		t.Fatalf("read persisted note: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, secret) || strings.Contains(text, artifactPath) {
+		t.Fatalf("memory persisted raw content or artifact path: %s", text)
+	}
+	if !strings.Contains(text, ref.ID) || strings.Contains(text, "raw-output.log") {
+		t.Fatalf("memory did not persist only the opaque ref identity: %s", text)
+	}
+	unsafeIndex := Index{Scope: ScopeProject, Entries: []IndexEntry{{
+		ID: "index", Title: "index " + secret, Body: "body " + secret, Path: artifactPath,
+	}}}
+	if err := manager.writer.WriteIndex(root, unsafeIndex, 200, 25*1024); err != nil {
+		t.Fatalf("write sanitized index: %v", err)
+	}
+	indexData, err := os.ReadFile(filepath.Join(root, IndexFileName))
+	if err != nil {
+		t.Fatalf("read sanitized index: %v", err)
+	}
+	if strings.Contains(string(indexData), secret) || strings.Contains(string(indexData), artifactPath) {
+		t.Fatalf("memory index persisted raw text or caller path: %s", indexData)
+	}
+
+	oversized := NewNote(NoteProjectKnowledge, ScopeProject, "large", strings.Repeat("z", 513), "test", time.Unix(3, 0))
+	if err := manager.SaveNote(oversized); err == nil {
+		t.Fatal("memory accepted content beyond the note byte budget")
+	}
+	if _, err := os.Stat(filepath.Join(root, noteFileName(oversized.ID))); !os.IsNotExist(err) {
+		t.Fatalf("oversized memory produced a file: %v", err)
+	}
+}
 
 func TestShouldUpdateMemoryFiltersOrdinaryChat(t *testing.T) {
 	cases := []struct {
@@ -50,7 +101,7 @@ func TestParseIndexKeepsEntrySummary(t *testing.T) {
 }
 
 func TestUpdateAsyncQueueLimitsAndTimeouts(t *testing.T) {
-	manager := NewManager(ManagerOptions{ProjectDir: t.TempDir(), UpdateQueueSize: 1, UpdateConcurrency: 1, UpdateTimeoutMS: 10, MaxCandidateBytes: 8, Provider: fakeMemoryProvider{response: `{"action":"ignore"}`}})
+	manager := NewManager(ManagerOptions{ProjectDir: t.TempDir(), UpdateQueueSize: 1, UpdateConcurrency: 1, UpdateTimeoutMS: 10, MaxCandidateBytes: 8, Provider: &fakeMemoryProvider{response: `{"action":"ignore"}`}})
 	manager.UpdateAsync(UpdateInput{Scope: ScopeProject, Candidate: strings.Repeat("x", 20), Now: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)})
 	if len(manager.Diagnostics()) == 0 || manager.Diagnostics()[0].Code != "memory_update_candidate_too_large" {
 		t.Fatalf("expected candidate limit diagnostic: %#v", manager.Diagnostics())
@@ -69,7 +120,7 @@ func TestUpdatePromptRejectsInstructionalCandidates(t *testing.T) {
 
 func TestUpdateAsyncDoesNotBlockAndAppliesDecisions(t *testing.T) {
 	root := t.TempDir()
-	provider := fakeMemoryProvider{response: `{"action":"add","title":"偏好","type":"user_preference","body":"用户喜欢中文简洁回答"}`}
+	provider := &fakeMemoryProvider{response: `{"action":"add","title":"偏好","type":"user_preference","body":"用户喜欢中文简洁回答"}`}
 	manager := NewManager(ManagerOptions{ProjectDir: root, UpdateQueueSize: 2, UpdateConcurrency: 1, UpdateTimeoutMS: 1000, MaxCandidateBytes: 1024, Provider: provider})
 	manager.UpdateAsync(UpdateInput{Scope: ScopeProject, Candidate: "用户说：以后回答简洁中文", Source: "test", Now: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)})
 	if !manager.WaitUpdates(time.Second) {
@@ -82,27 +133,52 @@ func TestUpdateAsyncDoesNotBlockAndAppliesDecisions(t *testing.T) {
 	if len(index.Entries) != 1 || index.Entries[0].Title != "偏好" {
 		t.Fatalf("index entries mismatch: %#v", index.Entries)
 	}
+	if provider.closed != 1 {
+		t.Fatalf("memory stream close calls = %d, want 1", provider.closed)
+	}
+	if len(provider.request.Messages) != 1 || !strings.Contains(provider.request.Messages[0].Content.Text(), "回答简洁中文") {
+		t.Fatalf("memory request did not use safe Provider DTO: %#v", provider.request.Messages)
+	}
 }
 
 type fakeMemoryProvider struct {
 	response string
 	err      error
+	request  provider.ChatRequest
+	closed   int
 }
 
-func (p fakeMemoryProvider) StreamChat(ctx context.Context, req provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+type fakeMemoryStream struct {
+	events <-chan provider.StreamEvent
+	close  func()
+}
+
+func (s *fakeMemoryStream) Events() <-chan provider.StreamEvent { return s.events }
+
+func (s *fakeMemoryStream) Close(context.Context) error {
+	if s.close != nil {
+		s.close()
+		s.close = nil
+	}
+	return nil
+}
+
+func (p *fakeMemoryProvider) StreamChat(ctx context.Context, req provider.ChatRequest) (provider.ChatStream, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
+	p.request = req
 	ch := make(chan provider.StreamEvent, 2)
+	redactor := redact.NewRuntimeRedactor()
 	go func() {
 		defer close(ch)
-		ch <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: p.response}
+		ch <- provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: redactor.Redact(p.response)}
 		ch <- provider.StreamEvent{Type: provider.StreamEventDone}
 	}()
-	return ch, nil
+	return &fakeMemoryStream{events: ch, close: func() { p.closed++ }}, nil
 }
 
-func (p fakeMemoryProvider) Name() string { return "fake-memory" }
+func (p *fakeMemoryProvider) Name() string { return "fake-memory" }
 
 func TestNoteFrontmatterRoundTrip(t *testing.T) {
 	now := time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)

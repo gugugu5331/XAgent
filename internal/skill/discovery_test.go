@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -130,6 +131,47 @@ func TestDiscoverLimitsAndDeterministicOrder(t *testing.T) {
 	}
 }
 
+func TestDiscoveryIsBoundedAndCrossPlatform(t *testing.T) {
+	root := t.TempDir()
+	writeSkillFile(t, filepath.Join(root, "alpha.md"), "alpha", ModeShared, "alpha", nil, 0, "")
+	writeSkillFile(t, filepath.Join(root, "review", "SKILL.md"), "review", ModeIsolated, "review", nil, 1, "")
+	writeSkillFile(t, filepath.Join(root, "review", "nested", "SKILL.md"), "nested", ModeShared, "nested", nil, 0, "")
+
+	definitions, diagnosticItems, err := discoverContext(context.Background(), SourceFS{Source: SourceProject, Root: root}, DefaultLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := definitionNames(definitions); !reflect.DeepEqual(got, []string{"alpha", "review"}) {
+		t.Fatalf("physical discovery changed Skill package semantics: %#v", got)
+	}
+	if len(diagnosticItems) != 0 {
+		t.Fatalf("bounded physical discovery returned diagnostics: %#v", diagnosticItems)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := discoverContext(canceled, SourceFS{Source: SourceProject, Root: root}, DefaultLimits(), nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("physical discovery ignored cancellation: %v", err)
+	}
+
+	boundedRoot := t.TempDir()
+	for index := 0; index < DefaultMaxFiles+2; index++ {
+		name := fmt.Sprintf("ignored-%03d.txt", index)
+		if err := os.WriteFile(filepath.Join(boundedRoot, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limits := DefaultLimits()
+	limits.MaxFiles = 1
+	definitions, diagnosticItems, err = discoverContext(context.Background(), SourceFS{Source: SourceUser, Root: boundedRoot}, limits, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(definitions) != 0 || len(diagnosticItems) != 1 || diagnosticItems[0].Code != "skill_source_scan_limit" {
+		t.Fatalf("physical discovery did not fail closed at its traversal bound: %#v %#v", definitions, diagnosticItems)
+	}
+}
+
 func TestDiscoverUnreadableAndOversizedEntriesDoNotBlockValidEntries(t *testing.T) {
 	valid := []byte("---\nname: valid\ndescription: valid description\nmode: shared\n---\nvalid body")
 	unreadable := []byte("---\nname: unreadable\ndescription: unreadable description\nmode: shared\n---\nunreadable body")
@@ -165,10 +207,11 @@ func TestPhysicalEntryOpenRejectsPackageSwappedToSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSkillFile(t, filepath.Join(packageRoot, "SKILL.md"), "demo", ModeShared, "inside", nil, 0, "")
-	entries, _, err := listPhysicalEntries(context.Background(), SourceFS{Source: SourceProject, Root: root}, DefaultLimits(), nil)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("unexpected listed entries: %#v %v", entries, err)
+	listing, err := listPhysicalEntries(context.Background(), SourceFS{Source: SourceProject, Root: root}, DefaultLimits(), nil)
+	if err != nil || len(listing.entries) != 1 {
+		t.Fatalf("unexpected listed entries: %#v %v", listing, err)
 	}
+	defer listing.close()
 	outside := t.TempDir()
 	writeSkillFile(t, filepath.Join(outside, "SKILL.md"), "demo", ModeShared, "outside secret", nil, 0, "")
 	if err := os.RemoveAll(packageRoot); err != nil {
@@ -177,7 +220,7 @@ func TestPhysicalEntryOpenRejectsPackageSwappedToSymlink(t *testing.T) {
 	if err := os.Symlink(outside, packageRoot); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	if data, err := readSourceEntry(entries[0], DefaultMaxEntryBytes); err == nil {
+	if data, err := readSourceEntry(context.Background(), listing.entries[0], DefaultMaxEntryBytes); err == nil {
 		t.Fatalf("entry open followed a package symlink swapped after listing: %q", data)
 	}
 }

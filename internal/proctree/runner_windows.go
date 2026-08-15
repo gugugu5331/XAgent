@@ -49,10 +49,12 @@ func newWindowsRunnerWithProtection(options Options, create windowsProcessCreato
 
 func (r *windowsRunner) Start(ctx context.Context, request Request) (Process, error) {
 	if r == nil || ctx == nil {
+		cleanupUnstartedPlan(request)
 		return nil, newStartError(startCodeProcessStartFailed)
 	}
 	select {
 	case <-ctx.Done():
+		cleanupUnstartedPlan(request)
 		return nil, ctx.Err()
 	default:
 	}

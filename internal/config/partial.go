@@ -72,9 +72,10 @@ type PartialToolConfig struct {
 }
 
 type PartialArtifactConfig struct {
-	MaxFileBytes  Optional[int64] `yaml:"max_file_bytes"`
-	MaxTotalBytes Optional[int64] `yaml:"max_total_bytes"`
-	RetentionDays Optional[int64] `yaml:"retention_days"`
+	Root          Optional[string] `yaml:"root"`
+	MaxFileBytes  Optional[int64]  `yaml:"max_file_bytes"`
+	MaxTotalBytes Optional[int64]  `yaml:"max_total_bytes"`
+	RetentionDays Optional[int64]  `yaml:"retention_days"`
 }
 
 type PartialFilesConfig struct {

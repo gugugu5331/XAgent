@@ -4,13 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"xagent/internal/artifact"
 	"xagent/internal/redact"
 )
 
-// ResultFactory is the only constructor for the three safe result views. It
+// ResultFactory is the only constructor for the four safe result views. It
 // retains the shared runtime redactor, never the preview or artifact payload.
 type ResultFactory struct {
 	redactor *redact.RuntimeRedactor
@@ -27,6 +26,7 @@ type ResultFactoryInput struct {
 	Summary          string
 	Preview          string
 	Artifact         *artifact.Ref
+	CapturedBytes    int64
 	Truncated        bool
 	TruncationReason string
 	Error            *Error
@@ -39,9 +39,9 @@ func NewResultFactory(runtimeRedactor *redact.RuntimeRedactor) (*ResultFactory, 
 	return &ResultFactory{redactor: runtimeRedactor}, nil
 }
 
-// Build creates the model, user, and persistence projections together. Calls
-// cancelled before their start boundary are intentionally not representable
-// as Result values.
+// Build creates the model, user, persistence, and output metadata projections
+// together. Calls cancelled before their start boundary are intentionally not
+// representable as Result values.
 func (f *ResultFactory) Build(input ResultFactoryInput) (Result, error) {
 	if f == nil || f.redactor == nil {
 		return Result{}, errors.New("result factory is unavailable")
@@ -52,12 +52,15 @@ func (f *ResultFactory) Build(input ResultFactoryInput) (Result, error) {
 	if !input.State.CanProduceResult() {
 		return Result{}, fmt.Errorf("execution state %q cannot produce a result", input.State)
 	}
-	ref := cloneArtifactRef(input.Artifact)
-	if ref != nil && (strings.TrimSpace(ref.ID) == "" || ref.Bytes < 0) {
-		return Result{}, errors.New("artifact reference is invalid")
+	if !input.Status.valid() {
+		return Result{}, fmt.Errorf("invalid result status %q", input.Status)
 	}
-	if input.Truncated && ref == nil {
-		return Result{}, errors.New("truncated output requires an artifact reference")
+	if input.CapturedBytes < 0 {
+		return Result{}, errors.New("captured byte count is invalid")
+	}
+	ref := cloneArtifactRef(input.Artifact)
+	if err := validateResultOutput(input, ref); err != nil {
+		return Result{}, err
 	}
 
 	safeSummary := f.redactor.Redact(input.Summary)
@@ -107,6 +110,7 @@ func (f *ResultFactory) Build(input ResultFactoryInput) (Result, error) {
 		Artifact:         cloneArtifactRef(ref),
 		Truncated:        input.Truncated,
 		TruncationReason: safeReason,
+		CapturedBytes:    input.CapturedBytes,
 	}
 	return Result{
 		CallID:           input.CallID,
@@ -122,6 +126,46 @@ func (f *ResultFactory) Build(input ResultFactoryInput) (Result, error) {
 		persistedContent: f.redactor.Redact(string(persistedJSON)),
 		outputMeta:       outputMeta,
 	}, nil
+}
+
+func (s ResultStatus) valid() bool {
+	switch s {
+	case StatusSuccess, StatusError, StatusDenied, StatusTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateResultOutput(input ResultFactoryInput, ref *artifact.Ref) error {
+	reason := CaptureTruncationReason(input.TruncationReason)
+	if ref == nil {
+		if input.Truncated {
+			return errors.New("truncated output requires an artifact reference")
+		}
+		if reason != CaptureNotTruncated {
+			return errors.New("untruncated output cannot have a truncation reason")
+		}
+		return nil
+	}
+	if err := validateOpaqueArtifactRef(ref, input.CapturedBytes); err != nil {
+		return err
+	}
+	if !input.Truncated {
+		return errors.New("artifact output must be truncated")
+	}
+	if ref.Complete {
+		if reason != CaptureTruncatedInline {
+			return errors.New("complete artifact requires inline preview truncation")
+		}
+		return nil
+	}
+	switch reason {
+	case CaptureTruncatedHardLimit, CaptureTruncatedArtifact, CaptureTruncatedWriteFailure, CaptureTruncatedCanceled:
+		return nil
+	default:
+		return errors.New("incomplete artifact has an invalid truncation reason")
+	}
 }
 
 func (f *ResultFactory) safeErrors(input *Error) (*SafeError, *Error) {

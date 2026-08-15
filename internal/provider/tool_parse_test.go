@@ -18,8 +18,12 @@ func TestEmitStreamEventStopsWhenConsumerDisappears(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan bool, 1)
 	out := make(chan StreamEvent)
+	stream, err := newChatStream(out, ChatStreamOptions{}, func(context.Context) error { return nil }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
-		done <- emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventTextDelta, Delta: "blocked"})
+		done <- stream.emit(ctx, StreamEvent{Type: StreamEventTextDelta, Delta: safeText("blocked")})
 	}()
 	cancel()
 	select {
@@ -45,25 +49,25 @@ func TestOpenAIProviderParsesToolCallDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{ToolDefs: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var call *tool.Call
-	for event := range stream {
+	var call *SafeToolCall
+	for event := range stream.Events() {
 		if event.Type == StreamEventToolCall {
 			call = event.ToolCall
 		}
 		if event.Type == StreamEventError {
-			t.Fatal(event.Err)
+			t.Fatal(event.Error)
 		}
 	}
 	if call == nil {
 		t.Fatal("expected tool call")
 	}
-	if call.ID != "call_1" || call.Name != "Read" || call.ArgumentsJSON != `{"path":"go.mod"}` {
+	if call.ID != "call_1" || call.Name != "Read" || call.ArgumentsJSON.Text() != `{"path":"go.mod"}` {
 		t.Fatalf("unexpected call: %#v", call)
 	}
 }
@@ -76,18 +80,18 @@ func TestOpenAIProviderEmitsMultipleToolCalls(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var calls []tool.Call
-	for event := range stream {
-		if event.Type == StreamEventToolCall {
-			calls = event.ToolCalls
+	var calls []SafeToolCall
+	for event := range stream.Events() {
+		if event.Type == StreamEventToolCall && event.ToolCall != nil {
+			calls = append(calls, *event.ToolCall)
 		}
 		if event.Type == StreamEventError {
-			t.Fatal(event.Err)
+			t.Fatal(event.Error)
 		}
 	}
 	if len(calls) != 2 {
@@ -114,18 +118,18 @@ func TestOpenAIProviderEmitsUsage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var usage *Usage
-	for event := range stream {
+	for event := range stream.Events() {
 		if event.Type == StreamEventUsage {
 			usage = event.Usage
 		}
 		if event.Type == StreamEventError {
-			t.Fatal(event.Err)
+			t.Fatal(event.Error)
 		}
 	}
 	if usage == nil || usage.InputTokens != 12 || usage.OutputTokens != 34 {
@@ -156,7 +160,7 @@ func TestRequestModelOverrideOpenAI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI(config.LLMConfig{Model: "configured-model", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "configured-model", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	requests := []ChatRequest{
 		{
 			Model: "  skill-model  ",
@@ -169,9 +173,9 @@ func TestRequestModelOverrideOpenAI(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for event := range stream {
+		for event := range stream.Events() {
 			if event.Type == StreamEventError {
-				t.Fatal(event.Err)
+				t.Fatal(event.Error)
 			}
 		}
 	}
@@ -201,7 +205,7 @@ func TestAnthropicToolCallsAreSorted(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected two calls, got %#v", calls)
 	}
-	if calls[0].ID != "a" || calls[0].Name != "Read" || calls[1].ID != "b" || calls[1].Name != "Glob" {
+	if calls[0].id != "a" || calls[0].name != "Read" || calls[1].id != "b" || calls[1].name != "Glob" {
 		t.Fatalf("unexpected calls: %#v", calls)
 	}
 }
@@ -221,18 +225,18 @@ func TestOpenAIProviderMergesSystemBlocksWithoutAnthropicFields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{
-		StableSystem:  []SystemBlock{{Name: "stable", Content: "stable rules", Cacheable: true}},
-		DynamicSystem: []SystemBlock{{Name: "dynamic", Content: "dynamic reminder"}},
+		StableSystem:  []SystemBlock{{Name: "stable", Content: safeText("stable rules"), Cacheable: true}},
+		DynamicSystem: []SystemBlock{{Name: "dynamic", Content: safeText("dynamic reminder")}},
 		Cache:         CachePolicy{EnablePromptCache: true},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for event := range stream {
+	for event := range stream.Events() {
 		if event.Type == StreamEventError {
-			t.Fatal(event.Err)
+			t.Fatal(event.Error)
 		}
 	}
 	data, err := json.Marshal(requestBody)
@@ -260,10 +264,10 @@ func TestOpenAIProviderMergesSystemBlocksWithoutAnthropicFields(t *testing.T) {
 func TestAnthropicSystemBlocksCacheControl(t *testing.T) {
 	blocks := toAnthropicSystemBlocks(ChatRequest{
 		StableSystem: []SystemBlock{
-			{Name: "stable-1", Content: "stable one", Cacheable: true},
-			{Name: "stable-2", Content: "stable two", Cacheable: true},
+			{Name: "stable-1", Content: safeText("stable one"), Cacheable: true},
+			{Name: "stable-2", Content: safeText("stable two"), Cacheable: true},
 		},
-		DynamicSystem: []SystemBlock{{Name: "dynamic", Content: "dynamic reminder"}},
+		DynamicSystem: []SystemBlock{{Name: "dynamic", Content: safeText("dynamic reminder")}},
 		Cache:         CachePolicy{EnablePromptCache: true},
 	})
 	if len(blocks) != 3 {
@@ -297,15 +301,5 @@ func TestAnthropicToolsCacheControl(t *testing.T) {
 	}
 	if tools[1].OfTool.CacheControl.Type == "" {
 		t.Fatalf("last tool missing cache control: %#v", tools[1].OfTool)
-	}
-}
-
-func TestSystemPromptCompatibilityDoesNotDuplicateBlocks(t *testing.T) {
-	content := joinedSystemBlocks(ChatRequest{
-		StableSystem: []SystemBlock{{Name: "stable", Content: "new stable", Cacheable: true}},
-		SystemPrompt: "legacy prompt",
-	})
-	if strings.Contains(content, "legacy prompt") || !strings.Contains(content, "new stable") {
-		t.Fatalf("unexpected compatibility content: %q", content)
 	}
 }

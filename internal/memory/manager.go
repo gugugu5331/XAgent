@@ -8,9 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"xagent/internal/artifact"
 	"xagent/internal/diagnostics"
 	"xagent/internal/redact"
 )
+
+const defaultMaxNoteBytes = 64 * 1024
 
 type ManagerOptions struct {
 	UserDir           string
@@ -21,7 +24,9 @@ type ManagerOptions struct {
 	UpdateConcurrency int
 	UpdateTimeoutMS   int
 	MaxCandidateBytes int
+	MaxNoteBytes      int
 	Provider          UpdateProvider
+	Redactor          *redact.RuntimeRedactor
 }
 
 type Manager struct {
@@ -54,6 +59,9 @@ type Status struct {
 }
 
 func NewManager(options ManagerOptions) *Manager {
+	if options.Redactor == nil {
+		options.Redactor = redact.NewRuntimeRedactor()
+	}
 	if options.MaxIndexLines <= 0 {
 		options.MaxIndexLines = 200
 	}
@@ -72,9 +80,12 @@ func NewManager(options ManagerOptions) *Manager {
 	if options.MaxCandidateBytes <= 0 {
 		options.MaxCandidateBytes = 64 * 1024
 	}
+	if options.MaxNoteBytes <= 0 {
+		options.MaxNoteBytes = defaultMaxNoteBytes
+	}
 	return &Manager{
 		options:    options,
-		writer:     &Writer{},
+		writer:     &Writer{redactor: options.Redactor, maxNoteBytes: options.MaxNoteBytes},
 		disabled:   map[Scope]bool{},
 		updates:    make(chan UpdateInput, options.UpdateQueueSize),
 		done:       make(chan struct{}, options.UpdateQueueSize),
@@ -123,7 +134,11 @@ func (m *Manager) LoadIndex(scope Scope) (Index, error) {
 }
 
 func (m *Manager) SaveNote(note Note) error {
-	note = sanitizeNote(note)
+	var err error
+	note, err = sanitizeBoundedNote(note, m.options.Redactor, m.options.MaxNoteBytes)
+	if err != nil {
+		return err
+	}
 	scope := normalizeScope(note.Scope)
 	note.Scope = scope
 	root := m.root(scope)
@@ -141,6 +156,50 @@ func (m *Manager) SaveNote(note Note) error {
 		return err
 	}
 	return nil
+}
+
+// SaveNoteWithRefs persists only the typed opaque artifact identity. The
+// artifact package deliberately exposes no filesystem path or payload here.
+func (m *Manager) SaveNoteWithRefs(note Note, refs []artifact.Ref) error {
+	if m == nil {
+		return fmt.Errorf("memory manager is nil")
+	}
+	if len(refs) > 0 {
+		var builder strings.Builder
+		builder.WriteString(strings.TrimSpace(note.Body))
+		for _, ref := range refs {
+			id := strings.TrimSpace(ref.ID)
+			if id == "" || safeID(id) != id || ref.Bytes < 0 {
+				return fmt.Errorf("invalid opaque artifact ref")
+			}
+			if builder.Len() > 0 {
+				builder.WriteByte('\n')
+			}
+			builder.WriteString("artifact-ref: id=")
+			builder.WriteString(id)
+			builder.WriteString(fmt.Sprintf(" bytes=%d created_at=%s available=%t complete=%t", ref.Bytes, ref.CreatedAt.UTC().Format(time.RFC3339), ref.Available, ref.Complete))
+		}
+		note.Body = builder.String()
+	}
+	return m.SaveNote(note)
+}
+
+func sanitizeBoundedNote(note Note, redactor *redact.RuntimeRedactor, maxBytes int) (Note, error) {
+	if redactor == nil {
+		redactor = redact.NewRuntimeRedactor()
+	}
+	note.ID = safeID(note.ID)
+	note.Title = strings.TrimSpace(redactor.Text(note.Title))
+	note.Source = strings.TrimSpace(redactor.Text(note.Source))
+	note.Body = strings.TrimSpace(redactor.Text(note.Body))
+	note = sanitizeNote(note)
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxNoteBytes
+	}
+	if len(MarshalNote(note)) > maxBytes {
+		return Note{}, fmt.Errorf("memory note exceeds %d bytes", maxBytes)
+	}
+	return note, nil
 }
 
 func (m *Manager) RebuildIndex(scope Scope) (Index, error) {

@@ -3,6 +3,8 @@ package hook
 import (
 	"context"
 	"time"
+
+	"xagent/internal/redact"
 )
 
 type Event string
@@ -108,21 +110,38 @@ type MessageToken struct {
 }
 
 type ToolInput struct {
-	CallID    string
-	Name      string
-	Arguments map[string]any
+	CallID string
+	Name   string
+
+	arguments map[string]any
 }
 
-type ToolError struct {
+// NewToolInput binds validated arguments to a Hook input without exposing a
+// writable map to Runtime implementations. The caller retains ownership of
+// arguments and must not mutate it while BeforeTool is running.
+func NewToolInput(callID, name string, arguments map[string]any) ToolInput {
+	return ToolInput{CallID: callID, Name: name, arguments: arguments}
+}
+
+// Arguments returns a defensive copy for read-only inspection. Mutating the
+// returned value cannot change the arguments bound to authorization or tool
+// execution.
+func (input ToolInput) Arguments() map[string]any {
+	return cloneMap(input.arguments)
+}
+
+// SafeError contains only stable error metadata and a message that has
+// already crossed the runtime redaction boundary.
+type SafeError struct {
 	Code        string
-	Message     string
+	Message     redact.SafeText
 	Recoverable bool
 }
 
 type ToolOutput struct {
 	Status  ToolStatus
-	Content string
-	Error   *ToolError
+	Content redact.SafeText
+	Error   *SafeError
 }
 
 type CompactBinding struct {
@@ -159,13 +178,17 @@ const (
 )
 
 type ToolDecision struct {
-	Kind   ToolDecisionKind
-	Reason string
+	kind   ToolDecisionKind
+	reason string
 }
 
-func Continue() ToolDecision          { return ToolDecision{Kind: DecisionContinue} }
-func Deny(reason string) ToolDecision { return ToolDecision{Kind: DecisionDeny, Reason: reason} }
-func (d ToolDecision) IsDeny() bool   { return d.Kind == DecisionDeny }
+func Continue() ToolDecision          { return ToolDecision{kind: DecisionContinue} }
+func Deny(reason string) ToolDecision { return ToolDecision{kind: DecisionDeny, reason: reason} }
+func (d ToolDecision) Kind() ToolDecisionKind {
+	return d.kind
+}
+func (d ToolDecision) Reason() string { return d.reason }
+func (d ToolDecision) IsDeny() bool   { return d.kind == DecisionDeny }
 
 type PromptBlock struct {
 	Name    string

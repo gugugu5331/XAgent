@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStatusAlwaysShowsKnownModeFirst(t *testing.T) {
@@ -53,6 +54,63 @@ func TestStatusDefaultOutputUnchangedWithoutSkills(t *testing.T) {
 	output := Status{Mode: "default", Provider: "fake", Model: "model"}.View()
 	if output != "[DEFAULT] | Provider: fake | Model: model" {
 		t.Fatalf("default status changed: %q", output)
+	}
+}
+
+func TestTimerAndUsageRespectResetAndConfig(t *testing.T) {
+	status := Status{
+		Mode: "default", Provider: "fake", Model: "model",
+		Duration: 1500 * time.Millisecond, InputTokens: 13, OutputTokens: 21,
+		CacheCreationInputTokens: 8, CacheReadInputTokens: 5,
+	}
+	withoutTimer := status.View()
+	if strings.Contains(withoutTimer, "耗时:") {
+		t.Fatalf("explicitly disabled timer was rendered: %q", withoutTimer)
+	}
+	for _, want := range []string{"Tokens: 13 in / 21 out", "Cache: 8 create / 5 read"} {
+		if !strings.Contains(withoutTimer, want) {
+			t.Fatalf("disabled timer removed %q: %q", want, withoutTimer)
+		}
+	}
+
+	status.ShowResponseTimer = true
+	if withTimer := status.View(); !strings.Contains(withTimer, "耗时: 1.5s") {
+		t.Fatalf("enabled timer was not rendered: %q", withTimer)
+	}
+
+	status.SetRegion(Region{Width: 200, Height: 1})
+	status.ShowResponseTimer = false
+	responsiveWithoutTimer := status.View()
+	if strings.Contains(responsiveWithoutTimer, "耗时:") {
+		t.Fatalf("responsive view rendered explicitly disabled timer: %q", responsiveWithoutTimer)
+	}
+	for _, want := range []string{"Tokens: 13 in / 21 out", "Cache: 8 create / 5 read"} {
+		if !strings.Contains(responsiveWithoutTimer, want) {
+			t.Fatalf("responsive disabled timer removed %q: %q", want, responsiveWithoutTimer)
+		}
+	}
+	status.ShowResponseTimer = true
+	if responsiveWithTimer := status.View(); !strings.Contains(responsiveWithTimer, "耗时: 1.5s") {
+		t.Fatalf("responsive view did not render enabled timer: %q", responsiveWithTimer)
+	}
+
+	status.Streaming = true
+	status.WaitingConfirmation = true
+	status.AgentIteration = 3
+	status.AgentMaxIterations = 5
+	status.StopReason = "completed"
+	status.StopMessage = "old stop"
+	status.RequestModel = "old-model"
+	status.Error = errStatusTest{}
+	status.ResetRequest()
+	if status.Duration != 0 || status.InputTokens != 0 || status.OutputTokens != 0 ||
+		status.CacheCreationInputTokens != 0 || status.CacheReadInputTokens != 0 ||
+		status.Streaming || status.WaitingConfirmation || status.AgentIteration != 0 || status.AgentMaxIterations != 0 ||
+		status.StopReason != "" || status.StopMessage != "" || status.RequestModel != "" || status.Error != nil {
+		t.Fatalf("request reset retained status values: %#v", status)
+	}
+	if !status.ShowResponseTimer {
+		t.Fatal("request reset changed resolved timer config")
 	}
 }
 

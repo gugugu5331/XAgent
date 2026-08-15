@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"xagent/internal/command"
 	"xagent/internal/config"
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
@@ -140,10 +141,10 @@ func TestNoHookSessionCompatibility(t *testing.T) {
 			got.statusError = model.status.Error.Error()
 		}
 		for _, message := range oldConversation.Messages {
-			got.oldMessages = append(got.oldMessages, string(message.Role)+":"+message.Content)
+			got.oldMessages = append(got.oldMessages, string(message.Role)+":"+message.Content.Text())
 		}
 		for _, message := range resumedConversation.Messages {
-			got.resumedMessages = append(got.resumedMessages, string(message.Role)+":"+message.Content)
+			got.resumedMessages = append(got.resumedMessages, string(message.Role)+":"+message.Content.Text())
 		}
 		got.oldJSON = conversationJSON(t, oldConversation)
 		got.resumedJSON = conversationJSON(t, resumedConversation)
@@ -154,10 +155,9 @@ func TestNoHookSessionCompatibility(t *testing.T) {
 			t.Fatalf("%s changed no-Hook session state:\nlegacy=%#v\nactual=%#v", item.name, *baseline, got)
 		}
 	}
-	if baseline == nil || strings.Join(baseline.storeEvents, ",") != "create:old,load:resumed,save:old,save:resumed" ||
+	if baseline == nil || strings.Join(baseline.storeEvents, ",") != "create:old,save:old,load:resumed,save:resumed" ||
 		strings.Join(baseline.oldMessages, ",") != "user:saved before switch" ||
 		strings.Join(baseline.resumedMessages, ",") != "assistant:restored answer,user:saved before close" ||
-		!strings.Contains(baseline.oldJSON, "saved before switch") || !strings.Contains(baseline.resumedJSON, "saved before close") ||
 		baseline.finalMode != orchestrator.RunModeDefault || baseline.finalStatusMode != "default" ||
 		!baseline.conversationNil || !baseline.requestNil || baseline.streaming || baseline.activeSkillCount != 0 ||
 		baseline.diagnostics != 0 || baseline.statusError != "" {
@@ -188,7 +188,7 @@ func TestNoHookVisibleCompatibility(t *testing.T) {
 		cfg := testAppConfig()
 		cfg.UI.StartMode = config.StartModeNew
 		model := New(Deps{
-			Config: cfg, Provider: providerImpl, Store: &fakeRecoveringStore{}, Resources: fakeResources{},
+			Config: cfg, Provider: providerImpl, Store: &fakeConversationStore{}, Resources: fakeResources{},
 			Diagnostics: collector, Hooks: item.runtime,
 		})
 		model = runCommandInput(t, model, "/plan")
@@ -202,7 +202,7 @@ func TestNoHookVisibleCompatibility(t *testing.T) {
 		got.messageView = model.messages.View()
 		got.diagnostics = collector.Count()
 		for _, message := range model.conversation.Messages {
-			got.messages = append(got.messages, string(message.Role)+":"+message.Content)
+			got.messages = append(got.messages, string(message.Role)+":"+message.Content.Text())
 		}
 		requests := providerImpl.Requests()
 		if len(requests) != 1 {
@@ -313,14 +313,13 @@ func TestSessionSwitchTransaction(t *testing.T) {
 			model.loadConversation("next")
 			close(switched)
 		}()
-		waitClosed(t, store.loadObserved, "candidate load")
 		select {
 		case <-switched:
 			t.Fatal("session switch completed before the old turn became idle")
 		case <-time.After(30 * time.Millisecond):
 		}
-		if got := countEventPrefix(sequence.snapshot(), "save:"); got != 0 {
-			t.Fatalf("old session saved before WaitIdle: %v", sequence.snapshot())
+		if got := countEventPrefix(sequence.snapshot(), "save:") + countEventPrefix(sequence.snapshot(), "load:"); got != 0 {
+			t.Fatalf("store was called before WaitIdle: %v", sequence.snapshot())
 		}
 
 		close(provider.release)
@@ -329,7 +328,7 @@ func TestSessionSwitchTransaction(t *testing.T) {
 		if model.conversation == nil || model.conversation.ID != "next" {
 			t.Fatalf("candidate not activated after idle: %#v", model.conversation)
 		}
-		assertOrderedPrefixes(t, sequence.snapshot(), "turn_end:", "save:old", "session_end:old:switch", "session_start:next:resumed")
+		assertOrderedPrefixes(t, sequence.snapshot(), "turn_end:", "save:old", "load:next", "session_end:old:switch", "session_start:next:resumed")
 	})
 
 	t.Run("candidate failure preserves old state", func(t *testing.T) {
@@ -352,12 +351,12 @@ func TestSessionSwitchTransaction(t *testing.T) {
 		if model.conversation != old || model.skillActivity != oldActivity || model.status.ActiveSkills != "keep" || model.mode != orchestrator.RunModePlan || !hooks.promptIsActive() {
 			t.Fatalf("candidate failure mutated old state: conversation=%p activity=%p skills=%q mode=%s prompt=%t", model.conversation, model.skillActivity, model.status.ActiveSkills, model.mode, hooks.promptIsActive())
 		}
-		if countEventPrefix(sequence.snapshot(), "save:") != 0 || countEventPrefix(sequence.snapshot(), "session_end:") != 0 {
-			t.Fatalf("candidate failure began old-session teardown: %v", sequence.snapshot())
+		if countEventPrefix(sequence.snapshot(), "save:") != 1 || countEventPrefix(sequence.snapshot(), "session_end:") != 0 {
+			t.Fatalf("candidate failure violated save-before-load or began teardown: %v", sequence.snapshot())
 		}
 	})
 
-	t.Run("save failure reports and continues", func(t *testing.T) {
+	t.Run("save failure reports and preserves old session", func(t *testing.T) {
 		sequence := &eventSequence{}
 		store := newLifecycleStore(sequence)
 		store.created = conversation.NewConversation("old", time.Unix(1, 0))
@@ -370,14 +369,290 @@ func TestSessionSwitchTransaction(t *testing.T) {
 		sequence.reset()
 
 		model.loadConversation("next")
-		if model.conversation == nil || model.conversation.ID != "next" || model.status.Error == nil {
-			t.Fatalf("save failure did not continue switch/report error: conversation=%#v err=%v", model.conversation, model.status.Error)
+		if model.conversation == nil || model.conversation.ID != "old" || model.status.Error == nil {
+			t.Fatalf("save failure changed old session or hid error: conversation=%#v err=%v", model.conversation, model.status.Error)
 		}
 		if strings.Contains(model.status.Error.Error(), "save-secret") {
 			t.Fatalf("save failure leaked sensitive detail: %v", model.status.Error)
 		}
-		assertOrderedEvents(t, sequence.snapshot(), "load:next", "save:old", "session_end:old:switch", "session_start:next:resumed")
+		assertOrderedEvents(t, sequence.snapshot(), "save:old")
 	})
+}
+
+func TestNavigationOrdersOldEndCommitAndNewStart(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+
+	t.Run("changed Load observes old end then complete reset then resumed start", func(t *testing.T) {
+		navigation, request := newHookNavigationRequest(t, redactor, command.IntentOpenConversation, "next")
+		trackedActive := &conversation.Conversation{ID: "next", Messages: []conversation.Message{{Content: redactor.Redact("restored")}}}
+		candidate := sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+			request:      request,
+			screen:       screenChat,
+			conversation: ConversationState{ActiveID: "next", Messages: []redact.SafeText{redactor.Redact("restored")}},
+			messages:     []redact.SafeText{redactor.Redact("restored")},
+			active:       trackedActive,
+		})
+		trackedActive.Messages[0].Content = redactor.Redact("mutated-after-seal")
+
+		runtimeState := RuntimeState{RequestSequence: 41}
+		screenState := screenChat
+		conversationState := ConversationState{
+			ActiveID: "old", Mode: "plan", Skills: []string{"review"}, SkillGeneration: 41,
+			Input: redactor.Redact("draft"), Messages: []redact.SafeText{redactor.Redact("old")}, Notice: redactor.Redact("notice"),
+		}
+		requestState := RequestState{
+			Generation: 41, Duration: time.Second, Tokens: Usage{InputTokens: 7, OutputTokens: 5},
+			Cache: CacheUsage{CacheCreationInputTokens: 3, CacheReadInputTokens: 2}, StopReason: "done",
+			LastError:    &diagnostics.SafeError{Code: "old", Message: redactor.Redact("old error")},
+			Confirmation: &ConfirmationState{CallID: "old-call"}, TransientIDs: []string{"old-transient"},
+		}
+		messageView := []redact.SafeText{redactor.Redact("old-visible")}
+		active := &conversation.Conversation{ID: "old"}
+		trace := []string{}
+		activity := &navigationCommitActivity{trace: &trace}
+		hooks := &navigationOrderHooks{
+			onEnd: func(id string, reason hook.SessionEndReason) {
+				trace = append(trace, "end:"+id+":"+string(reason))
+				if screenState != screenChat || conversationState.ActiveID != "old" || active.ID != "old" || requestState.Generation != 41 || activity.clears != 0 ||
+					trackedActive.Messages[0].Content.Text() != "mutated-after-seal" {
+					t.Fatalf("SessionEnd observed an early commit: screen=%q conversation=%#v active=%#v request=%#v", screenState, conversationState, active, requestState)
+				}
+			},
+			onStart: func(id string, state hook.SessionState) {
+				trace = append(trace, "start:"+id+":"+string(state))
+				if screenState != screenChat || conversationState.ActiveID != "next" || active != trackedActive || requestState.Generation != 42 || activity.clears != 1 ||
+					len(messageView) != 1 || messageView[0].Text() != "restored" || len(conversationState.Messages) != 1 || conversationState.Messages[0].Text() != "restored" {
+					t.Fatalf("SessionStart observed an incomplete commit: screen=%q conversation=%#v active=%#v request=%#v messages=%#v", screenState, conversationState, active, requestState, messageView)
+				}
+			},
+		}
+
+		if !navigation.commitNavigationCandidate(context.Background(), candidate, navigationCommitTarget{
+			runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
+			messages: &messageView, active: &active, activity: activity,
+		}, hooks) {
+			t.Fatal("valid Load candidate was not committed")
+		}
+		wantTrace := []string{"end:old:switch", "commit:clear", "start:next:resumed"}
+		if !reflect.DeepEqual(trace, wantTrace) {
+			t.Fatalf("lifecycle order = %#v, want %#v", trace, wantTrace)
+		}
+		if active != trackedActive || len(active.Messages) != 1 || active.Messages[0].Content.Text() != "restored" {
+			t.Fatalf("Load did not publish the restored Store-tracked pointer: active=%p tracked=%p value=%#v", active, trackedActive, active)
+		}
+		if conversationState.Mode != "" || len(conversationState.Skills) != 0 || conversationState.Input.Text() != "" || conversationState.Notice.Text() != "" || conversationState.SkillGeneration != 42 ||
+			requestState.Duration != 0 || requestState.Tokens != (Usage{}) || requestState.Cache != (CacheUsage{}) || requestState.StopReason != "" || requestState.LastError != nil || requestState.Confirmation != nil || len(requestState.TransientIDs) != 0 {
+			t.Fatalf("changed session retained scoped state: conversation=%#v request=%#v", conversationState, requestState)
+		}
+	})
+
+	t.Run("changed Create emits new start after one reset", func(t *testing.T) {
+		navigation, request := newHookNavigationRequest(t, redactor, command.IntentNewConversation, "")
+		trackedActive := &conversation.Conversation{ID: "created", Title: redactor.Redact("sealed")}
+		candidate := sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+			request: request, screen: screenChat, conversation: ConversationState{ActiveID: "created"},
+			active: trackedActive, created: true,
+		})
+		trackedActive.Title = redactor.Redact("mutated-after-seal")
+		runtimeState := RuntimeState{RequestSequence: 8}
+		screenState := screenList
+		conversationState := ConversationState{ActiveID: "old", Mode: "plan"}
+		requestState := RequestState{Generation: 8, StopReason: "old"}
+		messageView := []redact.SafeText{redactor.Redact("old")}
+		active := &conversation.Conversation{ID: "old"}
+		trace := []string{}
+		activity := &navigationCommitActivity{trace: &trace}
+		hooks := &navigationOrderHooks{
+			onEnd: func(id string, reason hook.SessionEndReason) {
+				if trackedActive.Title.Text() != "mutated-after-seal" {
+					t.Fatal("Create materialized the Store-tracked pointer before SessionEnd")
+				}
+				trace = append(trace, "end:"+id+":"+string(reason))
+			},
+			onStart: func(id string, state hook.SessionState) {
+				if conversationState.ActiveID != "created" || requestState.Generation != 9 || screenState != screenChat || active != trackedActive ||
+					active.Title.Text() != "sealed" || activity.clears != 1 {
+					t.Fatalf("new SessionStart preceded state publication: conversation=%#v request=%#v screen=%q active=%#v", conversationState, requestState, screenState, active)
+				}
+				trace = append(trace, "start:"+id+":"+string(state))
+			},
+		}
+		if !navigation.commitNavigationCandidate(nil, candidate, navigationCommitTarget{
+			runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
+			messages: &messageView, active: &active, activity: activity,
+		}, hooks) {
+			t.Fatal("valid Create candidate was not committed")
+		}
+		want := []string{"end:old:switch", "commit:clear", "start:created:new"}
+		if !reflect.DeepEqual(trace, want) || len(messageView) != 0 || active != trackedActive {
+			t.Fatalf("Create lifecycle = %#v messages=%#v, want %#v/empty", trace, messageView, want)
+		}
+	})
+
+	t.Run("Sessions changes only screen", func(t *testing.T) {
+		navigation, request := newHookNavigationRequest(t, redactor, command.IntentShowSessions, "")
+		candidate := sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{request: request, screen: screenList})
+		runtimeState := RuntimeState{RequestSequence: 12}
+		screenState := screenChat
+		conversationState := ConversationState{ActiveID: "active", Mode: "plan", Skills: []string{"review"}, Messages: []redact.SafeText{redactor.Redact("state")}}
+		requestState := RequestState{Generation: 12, StopReason: "kept"}
+		messageView := []redact.SafeText{redactor.Redact("visible")}
+		active := &conversation.Conversation{ID: "active"}
+		activity := &navigationCommitActivity{}
+		wantConversation := cloneNavigationConversationState(conversationState)
+		wantRequest := requestState
+		wantMessages := cloneNavigationSafeTexts(messageView)
+		wantActive := active
+		hooks := rejectingNavigationHooks(t, "Sessions")
+		if !navigation.commitNavigationCandidate(context.Background(), candidate, navigationCommitTarget{
+			runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
+			messages: &messageView, active: &active, activity: activity,
+		}, hooks) {
+			t.Fatal("Sessions candidate was not committed")
+		}
+		if screenState != screenList || !reflect.DeepEqual(conversationState, wantConversation) || !reflect.DeepEqual(requestState, wantRequest) ||
+			!reflect.DeepEqual(messageView, wantMessages) || active != wantActive || activity.clears != 0 {
+			t.Fatalf("Sessions changed non-screen state: screen=%q conversation=%#v request=%#v messages=%#v active=%p clears=%d", screenState, conversationState, requestState, messageView, active, activity.clears)
+		}
+	})
+
+	t.Run("same ActiveID refreshes content without lifecycle or reset", func(t *testing.T) {
+		navigation, request := newHookNavigationRequest(t, redactor, command.IntentOpenConversation, "same")
+		trackedActive := &conversation.Conversation{ID: "same", Messages: []conversation.Message{{Content: redactor.Redact("refreshed")}}}
+		candidate := sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+			request: request, screen: screenChat,
+			conversation: ConversationState{ActiveID: "same", Messages: []redact.SafeText{redactor.Redact("refreshed")}},
+			messages:     []redact.SafeText{redactor.Redact("refreshed")},
+			active:       trackedActive,
+		})
+		trackedActive.Messages[0].Content = redactor.Redact("mutated-after-seal")
+		runtimeState := RuntimeState{RequestSequence: 27}
+		screenState := screenList
+		conversationState := ConversationState{ActiveID: "same", Mode: "plan", Skills: []string{"review"}, SkillGeneration: 27, Input: redactor.Redact("draft"), Notice: redactor.Redact("notice")}
+		requestState := RequestState{Generation: 27, StopReason: "keep"}
+		messageView := []redact.SafeText{redactor.Redact("old")}
+		active := &conversation.Conversation{ID: "same"}
+		activity := &navigationCommitActivity{}
+		if !navigation.commitNavigationCandidate(context.Background(), candidate, navigationCommitTarget{
+			runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
+			messages: &messageView, active: &active, activity: activity,
+		}, rejectingNavigationHooks(t, "same-ID Load")) {
+			t.Fatal("same-ID Load candidate was not committed")
+		}
+		if screenState != screenChat || conversationState.Mode != "plan" || !reflect.DeepEqual(conversationState.Skills, []string{"review"}) || conversationState.SkillGeneration != 27 ||
+			conversationState.Input.Text() != "draft" || conversationState.Notice.Text() != "notice" || requestState.Generation != 27 || requestState.StopReason != "keep" || activity.clears != 0 ||
+			active != trackedActive || len(active.Messages) != 1 || active.Messages[0].Content.Text() != "refreshed" || len(messageView) != 1 || messageView[0].Text() != "refreshed" ||
+			len(conversationState.Messages) != 1 || conversationState.Messages[0].Text() != "refreshed" {
+			t.Fatalf("same-ID Load reset or incompletely refreshed state: screen=%q conversation=%#v request=%#v active=%#v messages=%#v", screenState, conversationState, requestState, active, messageView)
+		}
+	})
+
+	t.Run("failed canceled and stale candidates emit nothing", func(t *testing.T) {
+		for _, scenario := range []string{"failed", "canceled", "tracked-mismatch", "stale"} {
+			t.Run(scenario, func(t *testing.T) {
+				navigation, request := newHookNavigationRequest(t, redactor, command.IntentOpenConversation, "next")
+				var candidate *CommitCandidate
+				var trackedActive *conversation.Conversation
+				var newer NavigationRequest
+				if scenario == "failed" {
+					candidate = sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+						request: request, screen: screenChat, conversation: ConversationState{ActiveID: "next", Messages: []redact.SafeText{redactor.Redact("mismatch")}},
+						active: &conversation.Conversation{ID: "next"},
+					})
+				} else if scenario == "tracked-mismatch" {
+					trackedActive = &conversation.Conversation{ID: "next"}
+					candidate = sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+						request: request, screen: screenChat, conversation: ConversationState{ActiveID: "next"}, active: trackedActive,
+					})
+					trackedActive.ID = "forged"
+				} else if scenario == "stale" {
+					trackedActive = &conversation.Conversation{ID: "next", Title: redactor.Redact("sealed")}
+					candidate = sealHookCommitCandidate(t, navigation, request, navigationCandidateSnapshot{
+						request: request, screen: screenChat, conversation: ConversationState{ActiveID: "next"}, active: trackedActive,
+					})
+					trackedActive.Title = redactor.Redact("mutated-after-seal")
+					var err error
+					if newer, err = navigation.beginNavigation(command.IntentShowSessions, ""); err != nil {
+						t.Fatal(err)
+					}
+				}
+				runtimeState := RuntimeState{RequestSequence: 3}
+				screenState := screenChat
+				conversationState := ConversationState{ActiveID: "old"}
+				requestState := RequestState{Generation: 3, StopReason: "old"}
+				messageView := []redact.SafeText{redactor.Redact("old")}
+				active := &conversation.Conversation{ID: "old"}
+				activity := &navigationCommitActivity{}
+				committed := navigation.commitNavigationCandidate(context.Background(), candidate, navigationCommitTarget{
+					runtime: &runtimeState, screen: &screenState, conversation: &conversationState, request: &requestState,
+					messages: &messageView, active: &active, activity: activity,
+				}, rejectingNavigationHooks(t, scenario))
+				if committed || runtimeState.RequestSequence != 3 || screenState != screenChat || conversationState.ActiveID != "old" ||
+					requestState.Generation != 3 || requestState.StopReason != "old" || active.ID != "old" || messageView[0].Text() != "old" || activity.clears != 0 {
+					t.Fatalf("%s candidate changed state: committed=%t screen=%q conversation=%#v active=%#v messages=%#v", scenario, committed, screenState, conversationState, active, messageView)
+				}
+				if scenario == "stale" && (trackedActive.Title.Text() != "mutated-after-seal" || !navigation.isCurrentNavigation(newer)) {
+					t.Fatalf("stale candidate was materialized or consumed the newer request: tracked=%#v newer=%#v", trackedActive, newer)
+				}
+			})
+		}
+	})
+}
+
+func newHookNavigationRequest(t *testing.T, redactor *redact.RuntimeRedactor, intent command.IntentKind, sessionID string) (*navigationState, NavigationRequest) {
+	t.Helper()
+	navigation := newNavigationState(newNavigationTestSink(t, redactor), redactor)
+	request, err := navigation.beginNavigation(intent, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return navigation, request
+}
+
+func sealHookCommitCandidate(t *testing.T, navigation *navigationState, request NavigationRequest, snapshot navigationCandidateSnapshot) *CommitCandidate {
+	t.Helper()
+	candidate, ok := navigation.sealNavigationCandidate(request, cloneNavigationCandidateSnapshot(snapshot), snapshot.active)
+	if !ok || candidate == nil {
+		t.Fatal("could not seal navigation candidate")
+	}
+	return candidate
+}
+
+type navigationCommitActivity struct {
+	trace  *[]string
+	clears int
+}
+
+func (activity *navigationCommitActivity) Clear() {
+	activity.clears++
+	if activity.trace != nil {
+		*activity.trace = append(*activity.trace, "commit:clear")
+	}
+}
+
+type navigationOrderHooks struct {
+	onEnd   func(string, hook.SessionEndReason)
+	onStart func(string, hook.SessionState)
+}
+
+func (hooks *navigationOrderHooks) SessionEnd(_ context.Context, id string, reason hook.SessionEndReason) {
+	if hooks.onEnd != nil {
+		hooks.onEnd(id, reason)
+	}
+}
+
+func (hooks *navigationOrderHooks) SessionStart(_ context.Context, id string, state hook.SessionState) {
+	if hooks.onStart != nil {
+		hooks.onStart(id, state)
+	}
+}
+
+func rejectingNavigationHooks(t *testing.T, scenario string) *navigationOrderHooks {
+	t.Helper()
+	return &navigationOrderHooks{
+		onEnd:   func(string, hook.SessionEndReason) { t.Fatalf("%s emitted SessionEnd", scenario) },
+		onStart: func(string, hook.SessionState) { t.Fatalf("%s emitted SessionStart", scenario) },
+	}
 }
 
 func TestAppCloseOrder(t *testing.T) {
@@ -535,7 +810,7 @@ func TestHookDiagnosticIsolation(t *testing.T) {
 		t.Fatalf("Hook diagnostic leaked into next Provider request: %q", wire)
 	}
 	for _, message := range model.conversation.Messages {
-		if strings.Contains(message.Content, "hook_action_failed") || strings.Contains(message.Content, "hook-secret") {
+		if strings.Contains(message.Content.Text(), "hook_action_failed") || strings.Contains(message.Content.Text(), "hook-secret") {
 			t.Fatalf("Hook diagnostic leaked into Conversation: %#v", model.conversation.Messages)
 		}
 	}
@@ -575,10 +850,10 @@ func TestRuntimeRedactorCoversEveryAppStatusBoundary(t *testing.T) {
 		t.Fatalf("recovery notice leaked runtime secret: %q", recovery)
 	}
 
-	updated, _ := model.Update(eventMsg{
-		event:  Event{Type: EventError, Err: errors.New("provider failure " + secret)},
-		events: make(chan Event),
-	})
+	updated, _ := model.Update(testEventMessage(t, &model,
+		Event{Type: EventError, Err: appSafeError("provider_failed", "provider failure "+secret)},
+		make(chan Event),
+	))
 	model = updated.(Model)
 	if model.status.Error == nil || strings.Contains(model.status.Error.Error(), secret) || model.lastError == nil || strings.Contains(model.lastError.Error(), secret) {
 		t.Fatalf("stream error leaked runtime secret: status=%v last=%v", model.status.Error, model.lastError)
@@ -595,12 +870,12 @@ func newHookCommandModel(t *testing.T, collector *diagnostics.Collector) (Model,
 	store := newLifecycleStore(sequence)
 	store.created = conversation.NewConversation("commands", time.Unix(1, 0))
 	provider := &recordingCommandProvider{}
-	enabled := true
-	manager := contextmgr.New(provider, t.TempDir(), config.ContextConfig{
-		Enabled:             &enabled,
-		RecentKeepMessages:  100,
-		SummaryFailureLimit: 3,
-	})
+	managerOptions := appTestContextManagerOptions(true)
+	managerOptions.Context.RecentKeepMessages = 100
+	manager, err := contextmgr.New(provider, managerOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := testAppConfig()
 	cfg.UI.StartMode = config.StartModeNew
 	model := New(Deps{
@@ -609,6 +884,25 @@ func newHookCommandModel(t *testing.T, collector *diagnostics.Collector) (Model,
 	})
 	hooks.resetEvents()
 	return model, hooks, provider
+}
+
+func appTestContextManagerOptions(enabled bool) contextmgr.ManagerOptions {
+	return contextmgr.ManagerOptions{
+		Context: config.ContextConfig{
+			Enabled:                   &enabled,
+			ToolResultThresholdChars:  32 << 10,
+			ToolResultsThresholdChars: 64 << 10,
+			ModelWindowTokens:         200_000,
+			AutoMarginTokens:          13_000,
+			ManualMarginTokens:        3_000,
+			RecentKeepTokens:          10_000,
+			RecentKeepMessages:        5,
+			SummaryFailureLimit:       3,
+			PreviewChars:              2_000,
+		},
+		InlineOutputBytes: 32 << 10,
+		RuntimeRedactor:   redact.NewRuntimeRedactor(),
+	}
 }
 
 type eventSequence struct {
@@ -652,24 +946,26 @@ func newLifecycleStore(sequence *eventSequence) *lifecycleStore {
 	}
 }
 
-func (s *lifecycleStore) List(context.Context) ([]conversation.Conversation, error) { return nil, nil }
+func (s *lifecycleStore) List(context.Context) (conversation.ListResult, error) {
+	return conversation.ListResult{}, nil
+}
 
-func (s *lifecycleStore) Load(_ context.Context, id string) (*conversation.Conversation, error) {
+func (s *lifecycleStore) Load(_ context.Context, id string) (conversation.LoadResult, error) {
 	s.sequence.add("load:" + id)
 	s.loadOnce.Do(func() { close(s.loadObserved) })
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadErrors[id]; err != nil {
-		return nil, err
+		return conversation.LoadResult{}, err
 	}
 	conv := s.loaded[id]
 	if conv == nil {
-		return nil, fmt.Errorf("conversation %s not found", id)
+		return conversation.LoadResult{}, fmt.Errorf("conversation %s not found", id)
 	}
-	return conv, nil
+	return conversation.LoadResult{Conversation: conv, Available: true, Recovery: conversation.RecoveryReport{Status: conversation.RecoveryClean}}, nil
 }
 
-func (s *lifecycleStore) Save(_ context.Context, conv *conversation.Conversation) error {
+func (s *lifecycleStore) Save(_ context.Context, conv *conversation.Conversation) (conversation.SaveResult, error) {
 	id := "<nil>"
 	if conv != nil {
 		id = conv.ID
@@ -677,7 +973,7 @@ func (s *lifecycleStore) Save(_ context.Context, conv *conversation.Conversation
 	s.sequence.add("save:" + id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.saveErr
+	return conversation.SaveResult{Kind: conversation.SaveNoop}, s.saveErr
 }
 
 func (s *lifecycleStore) Create(context.Context) (*conversation.Conversation, error) {
@@ -688,6 +984,10 @@ func (s *lifecycleStore) Create(context.Context) (*conversation.Conversation, er
 	}
 	s.sequence.add("create:" + s.created.ID)
 	return s.created, nil
+}
+
+func (s *lifecycleStore) Maintain(context.Context) (conversation.MaintenanceResult, error) {
+	return conversation.MaintenanceResult{}, nil
 }
 
 type recordingHook struct {
@@ -813,6 +1113,7 @@ type blockingLifecycleProvider struct {
 	started     chan struct{}
 	release     chan struct{}
 	startedOnce sync.Once
+	tracker     appTestStreamTracker
 }
 
 func newBlockingLifecycleProvider() *blockingLifecycleProvider {
@@ -821,7 +1122,7 @@ func newBlockingLifecycleProvider() *blockingLifecycleProvider {
 
 func (*blockingLifecycleProvider) Name() string { return "blocking" }
 
-func (p *blockingLifecycleProvider) StreamChat(ctx context.Context, request provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (p *blockingLifecycleProvider) StreamChat(ctx context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
 	p.startedOnce.Do(func() { close(p.started) })
 	if request.Observer != nil {
 		request.Observer.MarkSent()
@@ -842,7 +1143,7 @@ func (p *blockingLifecycleProvider) StreamChat(ctx context.Context, request prov
 		case out <- provider.StreamEvent{Type: provider.StreamEventDone}:
 		}
 	}()
-	return out, nil
+	return newAppTestChatStreamChannel(out, &p.tracker), nil
 }
 
 func waitClosed(t *testing.T, channel <-chan struct{}, label string) {
@@ -891,18 +1192,18 @@ func countEventPrefix(events []string, prefix string) int {
 }
 
 func visibleRequestText(request provider.ChatRequest) string {
-	parts := []string{request.SystemPrompt}
+	parts := []string{}
 	for _, block := range request.System {
-		parts = append(parts, block.Name, block.Content)
+		parts = append(parts, block.Name, block.Content.Text())
 	}
 	for _, block := range request.StableSystem {
-		parts = append(parts, block.Name, block.Content)
+		parts = append(parts, block.Name, block.Content.Text())
 	}
 	for _, block := range request.DynamicSystem {
-		parts = append(parts, block.Name, block.Content)
+		parts = append(parts, block.Name, block.Content.Text())
 	}
 	for _, message := range request.Messages {
-		parts = append(parts, message.Content, message.ToolResultContent)
+		parts = append(parts, message.Content.Text(), message.ArgumentsJSON.Text(), message.ToolResult.Text())
 	}
 	return strings.Join(parts, "\n")
 }

@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"xagent/internal/command"
 	"xagent/internal/diagnostics"
 	"xagent/internal/events"
 	"xagent/internal/memory"
@@ -15,7 +17,18 @@ import (
 )
 
 func (m *Model) sendConfirmation(action events.PermissionAction, allowed bool) {
-	m.confirmation.Confirmation.Decision <- events.ToolConfirmationDecision{CallID: m.confirmation.Confirmation.CallID, Allowed: allowed, Action: action}
+	if m == nil || m.confirmation == nil || m.confirmation.Confirmation == nil || m.confirmationResolver == nil {
+		return
+	}
+	request := m.confirmation.Confirmation
+	if !m.confirmationResolver.ResolveToolConfirmation(events.ToolConfirmationDecision{
+		ConfirmationID: request.ConfirmationID,
+		CallID:         request.CallID,
+		Allowed:        allowed,
+		Action:         action,
+	}) {
+		return
+	}
 	m.confirmation = nil
 	m.status.WaitingConfirmation = false
 }
@@ -34,6 +47,63 @@ func (m *Model) cancelRequest(notice string) {
 	m.status.Error = nil
 	m.status.Streaming = true
 	m.input.SetEnabled(false)
+}
+
+// navigationIntentMsg is the capability-free handoff from command/key input to
+// the staged navigation transaction. T4.7 and later tasks own its side effects.
+type navigationIntentMsg struct {
+	Intent    command.IntentKind
+	SessionID string
+}
+
+func navigationIntentCmd(intent command.IntentKind, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		return navigationIntentMsg{Intent: intent, SessionID: sessionID}
+	}
+}
+
+// HandleIntent lets slash commands use the same value-only handoff as
+// shortcuts. It deliberately performs no Store, Orchestrator, or screen work.
+func (c *commandController) HandleIntent(intent command.IntentKind) error {
+	if _, err := navigationKind(intent, ""); err != nil {
+		return err
+	}
+	c.cmd = navigationIntentCmd(intent, "")
+	return nil
+}
+
+// handleEscape resolves Esc from the command metadata for the current request
+// context. Cancellation never emits a navigation intent; only an idle chat can
+// request the sessions screen.
+func (m *Model) handleEscape() (bool, tea.Cmd) {
+	waitingConfirmation := m.confirmation != nil && m.confirmation.Confirmation != nil
+	shortcutContext := command.ShortcutChatIdle
+	switch {
+	case waitingConfirmation:
+		shortcutContext = command.ShortcutChatConfirmation
+	case m.streaming:
+		shortcutContext = command.ShortcutChatStreaming
+	case m.screen != screenChat:
+		return false, nil
+	}
+
+	intent, ok := m.ensureCommandRegistry().IntentForShortcut(shortcutContext, "esc")
+	if !ok {
+		return false, nil
+	}
+	switch intent {
+	case command.IntentCancel:
+		if m.request != nil || m.streaming {
+			m.cancelRequest("正在取消请求，等待当前轮次收尾")
+		} else if waitingConfirmation {
+			m.sendConfirmation(events.PermissionCancel, false)
+		}
+		return true, nil
+	case command.IntentShowSessions:
+		return true, navigationIntentCmd(intent, "")
+	default:
+		return false, nil
+	}
 }
 
 func parseMemoryScope(value string) (memory.Scope, error) {
@@ -95,6 +165,126 @@ func enabledText(enabled bool) string {
 	return "off"
 }
 
+// artifactViewMsg is the only artifact load result allowed across Bubble Tea.
+// ArtifactView contains redacted SafeText and bounded metadata, never a reader
+// or raw artifact bytes.
+type artifactViewMsg struct {
+	RequestID  string
+	Offset     int64
+	Generation uint64
+	View       tui.ArtifactView
+}
+
+func artifactOpenCmd(
+	ctx context.Context,
+	artifacts ArtifactUserReader,
+	intent tui.ArtifactOpenIntent,
+	runtimeRedactor *redact.RuntimeRedactor,
+	lease *artifactReadLease,
+	generation uint64,
+) tea.Cmd {
+	return func() tea.Msg {
+		view, err := openArtifactForUser(ctx, artifacts, intent, runtimeRedactor, lease)
+		if errors.Is(err, errArtifactOpenCanceled) {
+			return nil
+		}
+		return artifactViewMsg{
+			RequestID: intent.ID(), Offset: intent.Offset(), Generation: generation, View: view,
+		}
+	}
+}
+
+func (m *Model) beginArtifactOpen(intent tui.ArtifactOpenIntent) tea.Cmd {
+	if m.artifactCancel != nil {
+		m.artifactCancel()
+	}
+	generation := m.advanceArtifactGeneration()
+	ctx, cancel := context.WithCancel(context.Background())
+	lease := newArtifactReadLease()
+	m.artifactCancel = func() {
+		cancel()
+		lease.Cancel()
+	}
+	m.artifactExpectedID = intent.ID()
+	m.artifactExpectedPage = intent.Offset()
+	return artifactOpenCmd(ctx, m.deps.Artifacts, intent, m.deps.RuntimeRedactor, lease, generation)
+}
+
+func (m *Model) closeArtifactView() {
+	m.advanceArtifactGeneration()
+	if m.artifactCancel != nil {
+		m.artifactCancel()
+	}
+	m.artifactCancel = nil
+	m.artifactExpectedID = ""
+	m.artifactExpectedPage = 0
+	m.artifactView = nil
+}
+
+func (m *Model) advanceArtifactGeneration() uint64 {
+	m.artifactGeneration++
+	if m.artifactGeneration == 0 {
+		m.artifactGeneration = 1
+	}
+	return m.artifactGeneration
+}
+
+func (m *Model) applyWindowSize(size tea.WindowSizeMsg) {
+	screen := tui.ScreenChat
+	if m.screen == screenList {
+		screen = tui.ScreenList
+	}
+	input := tui.LayoutInput{
+		Terminal:         tui.Size{Width: size.Width, Height: size.Height},
+		InputLines:       1,
+		ShowConfirmation: m.confirmation != nil && m.confirmation.Confirmation != nil,
+		ShowCommandMenu:  m.commandMenu.Visible,
+		Screen:           string(screen),
+	}
+	preliminary := tui.ComputeLayout(input)
+	input.InputLines = m.input.VisualLineCount(preliminary.Input.Width)
+	layout := tui.ComputeLayout(input)
+
+	m.status.SetRegion(layout.Status)
+	if m.screen == screenList {
+		tui.ApplyConversationListLayout(&m.list, layout)
+		return
+	}
+	m.messages.SetRegion(layout.Main)
+	m.input.SetRegion(layout.Input)
+	m.commandMenu.SetRegion(layout.CommandMenu)
+	m.applyConfirmationLayout(layout.Confirmation)
+}
+
+func (m *Model) applyConfirmationLayout(region tui.Region) {
+	if m.confirmation == nil || m.confirmation.Confirmation == nil {
+		return
+	}
+	request := m.confirmation.Confirmation
+	scopes := make([]ConfirmationScopeState, len(request.Scopes))
+	for index, scope := range request.Scopes {
+		scopes[index] = ConfirmationScopeState{
+			Scope: scope.Scope, Available: scope.Available, Description: scope.Description,
+		}
+	}
+	viewModel := newViewModel(RuntimeState{}, ConversationState{}, RequestState{Confirmation: &ConfirmationState{
+		CallID: request.CallID, Name: request.Name, Prompt: request.Prompt, Target: request.Target,
+		Risk: request.Risk, PermissionMode: request.PermissionMode, ScopePreview: request.ScopePreview,
+		RuleLocation: request.RuleLocation, Scopes: scopes, Warning: request.Warning,
+		RevokeHint: request.RevokeHint, AllowPermanent: request.AllowPermanent,
+	}}, ConversationListState{}, screenChat)
+	confirmation, present := viewModel.Request().Confirmation()
+	if !present {
+		return
+	}
+	panel := tui.NewConfirmationPanel(confirmation)
+	panel.SetRegion(region)
+
+	clonedEvent := events.Clone(*m.confirmation)
+	clonedEvent.Confirmation.Prompt = redact.NewRuntimeRedactor().Redact(panel.View())
+	m.confirmation = &clonedEvent
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.lifecycle == nil {
 		m.lifecycle = newLifecycleState()
@@ -102,11 +292,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lifecycle.begin(m.request)
 		}
 	}
+	if !m.lifecycle.isAccepting() {
+		return m, nil
+	}
 	request, _, _ := m.lifecycle.active()
 	m.request = request
+	if size, ok := msg.(tea.WindowSizeMsg); ok {
+		m.applyWindowSize(size)
+		return m, nil
+	}
+	if intent, ok := msg.(tui.ArtifactOpenIntent); ok {
+		return m, m.beginArtifactOpen(intent)
+	}
+	if loaded, ok := msg.(artifactViewMsg); ok {
+		if loaded.Generation == 0 || loaded.Generation != m.artifactGeneration ||
+			loaded.RequestID != m.artifactExpectedID || loaded.Offset != m.artifactExpectedPage {
+			return m, nil
+		}
+		if m.artifactCancel != nil {
+			m.artifactCancel()
+		}
+		m.artifactCancel = nil
+		view := loaded.View
+		m.artifactView = &view
+		return m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if m.streaming && (msg.String() == "esc" || msg.String() == "ctrl+c" || msg.String() == "q") {
+		if msg.String() == "esc" && (m.artifactView != nil || m.artifactCancel != nil) {
+			m.closeArtifactView()
+			return m, nil
+		}
+		if (msg.String() == "q" || msg.String() == "ctrl+c") && (m.artifactView != nil || m.artifactCancel != nil) {
+			m.closeArtifactView()
+			return m, tea.Quit
+		}
+		if m.artifactView != nil {
+			switch msg.String() {
+			case "pgdown", " ":
+				if intent, ok := m.artifactView.NextIntent(); ok {
+					return m, m.beginArtifactOpen(intent)
+				}
+				return m, nil
+			case "pgup":
+				if intent, ok := m.artifactView.PreviousIntent(); ok {
+					return m, m.beginArtifactOpen(intent)
+				}
+				return m, nil
+			}
+		}
+		if m.streaming && (msg.String() == "ctrl+c" || msg.String() == "q") {
 			m.cancelRequest("正在取消请求，等待当前轮次收尾")
 			return m, nil
 		}
@@ -126,6 +361,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			default:
 				m.commandMenu.Close()
+			}
+		}
+		if msg.String() == "esc" {
+			if handled, cmd := m.handleEscape(); handled {
+				return m, cmd
 			}
 		}
 		if m.confirmation == nil && m.screen == screenChat && !m.streaming && msg.String() == "tab" {
@@ -158,11 +398,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sendConfirmation(events.PermissionDeny, false)
 				return m, nil
 			}
-		case "esc":
-			if m.confirmation != nil && m.confirmation.Confirmation != nil {
-				m.sendConfirmation(events.PermissionCancel, false)
-				return m, nil
-			}
 		case "enter":
 			if m.confirmation != nil && m.confirmation.Confirmation != nil {
 				m.sendConfirmation(events.PermissionDeny, false)
@@ -175,6 +410,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if item.ID == tui.NewConversationID {
 					m.startNewConversation()
+				} else if !item.Available {
+					m.status.Error = m.redactError(fmt.Errorf("该会话当前不可用，已保留当前页面"))
 				} else {
 					m.loadConversation(item.ID)
 				}
@@ -187,40 +424,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.screen == screenList {
-		var cmd tea.Cmd
-		m.list, cmd = m.list.Update(msg)
-		return m, cmd
-	}
-
-	if _, ok := msg.(eventStreamClosedMsg); ok {
+	if closed, ok := msg.(eventStreamClosedMsg); ok {
+		if !m.finishEventEnvelope(closed.envelope) {
+			return m, nil
+		}
 		m.finishRequestAfterStream()
 		return m, nil
 	}
 
 	if eventMsg, ok := msg.(eventMsg); ok {
+		if !m.acceptsEventEnvelope(eventMsg.envelope) {
+			return m, nil
+		}
 		if eventMsg.event.Transient {
 			m.trackTransientID(eventMsg.event.IndependentID)
 		}
 		switch eventMsg.event.Type {
 		case EventUserSubmitted:
 			if !eventMsg.event.Transient {
-				m.messages.AppendUser(eventMsg.event.Text)
+				if m.pendingUserProjection {
+					m.pendingUserProjection = false
+				} else {
+					m.messages.AppendUser(eventMsg.event.Text.Text())
+				}
 			}
 		case EventTextDelta:
 			if eventMsg.event.Transient {
-				m.messages.AppendTransientAssistantDelta(eventMsg.event.IndependentID, eventMsg.event.Text)
+				m.messages.AppendTransientAssistantDelta(eventMsg.event.IndependentID, eventMsg.event.Text.Text())
 			} else {
 				if m.request != nil && m.request.Independent {
 					m.clearRequestTransient()
 				}
-				m.messages.AppendAssistantDelta(eventMsg.event.Text)
+				m.messages.AppendAssistantDelta(eventMsg.event.Text.Text())
 			}
 		case EventThinkingDelta:
 			if eventMsg.event.Transient {
-				m.messages.AppendTransientThinkingDelta(eventMsg.event.IndependentID, eventMsg.event.Text)
+				m.messages.AppendTransientThinkingDelta(eventMsg.event.IndependentID, eventMsg.event.Text.Text())
 			} else {
-				m.messages.AppendThinkingDelta(eventMsg.event.Text)
+				m.messages.AppendThinkingDelta(eventMsg.event.Text.Text())
 			}
 		case EventToolPending, EventToolRunning, EventToolSuccess, EventToolError, EventToolDenied:
 			if eventMsg.event.Tool != nil {
@@ -245,7 +486,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.AgentIteration = eventMsg.event.Progress.Iteration
 				m.status.AgentMaxIterations = eventMsg.event.Progress.Max
 				m.status.StopReason = eventMsg.event.Progress.StopReason
-				m.status.StopMessage = m.redactText(eventMsg.event.Progress.Message)
+				m.status.StopMessage = eventMsg.event.Progress.Message.Text()
 			}
 		case EventUsageUpdated:
 			if eventMsg.event.Usage != nil {
@@ -255,23 +496,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.CacheReadInputTokens += eventMsg.event.Usage.CacheReadInputTokens
 			}
 		case EventMainTraceReset:
-			if m.conversation != nil {
+			if m.conversation != nil && !m.messagesCleared {
 				m.messages.SetMessages(m.conversation.Messages)
 			}
 		case EventDone:
 			m.messages.CommitAssistant()
-			m.status.Duration = formatDuration(eventMsg.event.Duration)
+			if m.status.ShowResponseTimer {
+				m.status.Duration = formatDuration(eventMsg.event.Duration)
+			} else {
+				m.status.Duration = 0
+			}
 			m.lifecycle.markTerminal()
-			return m, listen(eventMsg.events)
+			return m, listen(eventMsg.events, eventMsg.envelope)
 		case EventError:
 			m.messages.CommitAssistant()
 			safe := m.redactError(eventMsg.event.Err)
 			m.status.Error = safe
 			m.lastError = safe
 			m.lifecycle.markTerminal()
-			return m, listen(eventMsg.events)
+			return m, listen(eventMsg.events, eventMsg.envelope)
 		}
-		return m, listen(eventMsg.events)
+		return m, listen(eventMsg.events, eventMsg.envelope)
+	}
+
+	if m.screen == screenList {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
 	}
 
 	if m.confirmation != nil {
@@ -333,6 +584,7 @@ func (m *Model) finishRequestAfterStream() {
 	m.syncSkillStatus()
 	m.input.SetEnabled(true)
 	m.confirmation = nil
+	m.pendingUserProjection = false
 }
 
 func compactNotice(changed bool, externalized int, summarized bool) string {

@@ -24,8 +24,8 @@ type fileWriter struct {
 	store       *fileStore
 	file        *os.File
 	id          string
-	stagingPath string
-	finalPath   string
+	stagingName string
+	finalName   string
 	metadata    Metadata
 	createdAt   time.Time
 	bytes       int64
@@ -98,18 +98,18 @@ func (w *fileWriter) Commit(ctx context.Context) (Ref, error) {
 		return ref, errors.New("artifact commit failed")
 	}
 	w.file = nil
-	if err := os.Rename(w.stagingPath, w.finalPath); err != nil {
+	if err := w.store.renameArtifact(w.stagingName, w.finalName); err != nil {
 		w.failCommit()
 		return ref, errors.New("artifact commit failed")
 	}
 	ref.Available = true
 	if err := w.store.commitWriter(w, ref); err != nil {
-		_ = os.Remove(w.finalPath)
+		_ = w.store.removeArtifact(w.finalName)
 		w.store.abortWriter(w.id, w.bytes)
 		return Ref{ID: ref.ID, Bytes: ref.Bytes, CreatedAt: ref.CreatedAt, Complete: false}, errors.New("artifact commit failed")
 	}
-	w.stagingPath = ""
-	w.finalPath = ""
+	w.stagingName = ""
+	w.finalName = ""
 	return ref, nil
 }
 
@@ -118,10 +118,10 @@ func (w *fileWriter) failCommit() {
 		_ = w.file.Close()
 		w.file = nil
 	}
-	_ = os.Remove(w.stagingPath)
+	_ = w.store.removeArtifact(w.stagingName)
 	w.store.abortWriter(w.id, w.bytes)
-	w.stagingPath = ""
-	w.finalPath = ""
+	w.stagingName = ""
+	w.finalName = ""
 }
 
 func (w *fileWriter) Abort() error {
@@ -136,10 +136,10 @@ func (w *fileWriter) Abort() error {
 	w.state = writerAborted
 	closeErr := w.file.Close()
 	w.file = nil
-	removeErr := os.Remove(w.stagingPath)
+	removeErr := w.store.removeArtifact(w.stagingName)
 	w.store.abortWriter(w.id, w.bytes)
-	w.stagingPath = ""
-	w.finalPath = ""
+	w.stagingName = ""
+	w.finalName = ""
 	if closeErr != nil || (removeErr != nil && !errors.Is(removeErr, os.ErrNotExist)) {
 		return errors.New("artifact abort failed")
 	}

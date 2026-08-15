@@ -43,37 +43,3 @@ func TestSanitizeMetadataRemovesControlCharsAndLimitsLength(t *testing.T) {
 		t.Fatalf("metadata not sanitized: %q", got)
 	}
 }
-
-func TestRedactArgumentsRedactsSecretsInNonSensitiveStringValues(t *testing.T) {
-	redacted := RedactArguments(map[string]any{
-		"query": "find token=secret-token",
-		"items": []any{"authorization:Bearer-secret"},
-	})
-	data := redacted["query"].(string) + " " + redacted["items"].([]any)[0].(string)
-	if strings.Contains(data, "secret-token") || strings.Contains(data, "Bearer-secret") {
-		t.Fatalf("non-sensitive string value leaked secret: %#v", redacted)
-	}
-}
-
-func TestRedactTextRemovesInlineSecrets(t *testing.T) {
-	redacted := RedactText("authorization=Bearer-secret api_key:secret-token ok")
-	if strings.Contains(redacted, "Bearer-secret") || strings.Contains(redacted, "secret-token") {
-		t.Fatalf("text secret not redacted: %q", redacted)
-	}
-}
-
-func TestRedactArgumentsRecursivelyRedactsSensitiveKeys(t *testing.T) {
-	redacted := RedactArguments(map[string]any{
-		"api_key": "secret",
-		"nested": map[string]any{
-			"Authorization": "Bearer secret",
-		},
-	})
-	if redacted["api_key"] != "[redacted]" {
-		t.Fatalf("api_key not redacted: %#v", redacted)
-	}
-	nested := redacted["nested"].(map[string]any)
-	if nested["Authorization"] != "[redacted]" {
-		t.Fatalf("authorization not redacted: %#v", redacted)
-	}
-}

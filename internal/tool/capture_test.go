@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -97,7 +98,183 @@ func TestCaptureStreamsToBoundedPreviewAndArtifact(t *testing.T) {
 	})
 }
 
+func TestCaptureTerminalFailuresPublishNoUsableRef(t *testing.T) {
+	zeroWriteErr := errors.New("zero-byte staging write failed")
+	zeroWriter := &captureTestWriter{writeErr: zeroWriteErr}
+	zeroStore := &captureTestStore{next: zeroWriter}
+	zeroCapture := newTestCapture(t, zeroStore, 8, 64)
+	if written, writeErr := zeroCapture.Write([]byte("payload")); written != 0 || !errors.Is(writeErr, zeroWriteErr) {
+		t.Fatalf("zero-byte write = %d, %v", written, writeErr)
+	}
+	zeroResult, zeroFinishErr := zeroCapture.Finish(context.Background())
+	if !errors.Is(zeroFinishErr, zeroWriteErr) || !reflect.DeepEqual(zeroResult, CaptureResult{}) {
+		t.Fatalf("zero-byte terminal result = %#v, %v", zeroResult, zeroFinishErr)
+	}
+	if zeroWriter.aborts != 1 || zeroWriter.commits != 0 {
+		t.Fatalf("zero-byte failure finalization: aborts=%d commits=%d", zeroWriter.aborts, zeroWriter.commits)
+	}
+
+	commitErr := errors.New("staging commit failed")
+	failedRef := &artifact.Ref{
+		ID:        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		Bytes:     9,
+		CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
+		Available: false,
+		Complete:  false,
+	}
+	commitWriter := &captureTestWriter{commitErr: commitErr, commitRef: failedRef}
+	commitStore := &captureTestStore{next: commitWriter}
+	commitCapture := newTestCapture(t, commitStore, 8, 64)
+	if written, writeErr := commitCapture.Write([]byte("123456789")); writeErr != nil || written != 9 {
+		t.Fatalf("commit-failure staging write = %d, %v", written, writeErr)
+	}
+	commitResult, commitFinishErr := commitCapture.Finish(context.Background())
+	if commitFinishErr == nil || !reflect.DeepEqual(commitResult, CaptureResult{}) {
+		t.Fatalf("commit failure published metadata: %#v, %v", commitResult, commitFinishErr)
+	}
+	if commitWriter.commits != 1 || commitWriter.aborts != 0 {
+		t.Fatalf("commit failure finalization: aborts=%d commits=%d", commitWriter.aborts, commitWriter.commits)
+	}
+
+	unavailableWriter := &captureTestWriter{commitRef: failedRef}
+	unavailableStore := &captureTestStore{next: unavailableWriter}
+	unavailableCapture := newTestCapture(t, unavailableStore, 8, 64)
+	if written, writeErr := unavailableCapture.Write([]byte("123456789")); writeErr != nil || written != 9 {
+		t.Fatalf("unavailable-ref staging write = %d, %v", written, writeErr)
+	}
+	unavailableResult, unavailableErr := unavailableCapture.Finish(context.Background())
+	if unavailableErr == nil || !reflect.DeepEqual(unavailableResult, CaptureResult{}) {
+		t.Fatalf("unavailable ref was published: %#v, %v", unavailableResult, unavailableErr)
+	}
+}
+
+func TestCaptureAbortCommitAndUTF8ThresholdMatrix(t *testing.T) {
+	expected := []string{
+		"ascii_below_cap_abort",
+		"ascii_at_cap_abort",
+		"ascii_cap_plus_one_commit",
+		"utf8_at_cap_abort",
+		"utf8_over_cap_commit",
+		"capture_hard_limit_incomplete_commit",
+		"artifact_hard_limit_incomplete_commit",
+		"write_failure_after_bytes_incomplete_commit",
+		"canceled_after_bytes_incomplete_commit",
+		"zero_byte_write_failure_no_ref",
+		"commit_failure_no_ref",
+	}
+	seen := make(map[string]bool, len(expected))
+	run := func(name string, test func(*testing.T)) {
+		t.Run(name, func(t *testing.T) {
+			seen[name] = true
+			test(t)
+		})
+	}
+	assertTerminal := func(t *testing.T, input string, wantCommit bool) {
+		t.Helper()
+		store := &captureTestStore{}
+		capture := newTestCapture(t, store, 8, 64)
+		if written, err := capture.Write([]byte(input)); err != nil || written != len(input) {
+			t.Fatalf("capture write = %d, %v", written, err)
+		}
+		result, err := capture.Finish(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !utf8.ValidString(result.Preview) || len(result.Preview) > 8 {
+			t.Fatalf("invalid bounded preview %q", result.Preview)
+		}
+		if wantCommit {
+			if store.last.commits != 1 || store.last.aborts != 0 || result.Artifact == nil || !result.Artifact.Complete || !result.Truncated || result.TruncationReason != CaptureTruncatedInline {
+				t.Fatalf("complete commit result = %#v writer=%#v", result, store.last)
+			}
+		} else if store.last.aborts != 1 || store.last.commits != 0 || result.Artifact != nil || result.Truncated || result.TruncationReason != CaptureNotTruncated {
+			t.Fatalf("inline abort result = %#v writer=%#v", result, store.last)
+		}
+	}
+
+	run("ascii_below_cap_abort", func(t *testing.T) { assertTerminal(t, "1234567", false) })
+	run("ascii_at_cap_abort", func(t *testing.T) { assertTerminal(t, "12345678", false) })
+	run("ascii_cap_plus_one_commit", func(t *testing.T) { assertTerminal(t, "123456789", true) })
+	run("utf8_at_cap_abort", func(t *testing.T) { assertTerminal(t, "你a🙂", false) })
+	run("utf8_over_cap_commit", func(t *testing.T) { assertTerminal(t, "你ab🙂", true) })
+	run("capture_hard_limit_incomplete_commit", func(t *testing.T) {
+		store := &captureTestStore{}
+		capture := newTestCapture(t, store, 4, 5)
+		written, writeErr := capture.Write([]byte("123456789"))
+		result, finishErr := capture.Finish(context.Background())
+		var limitErr *budget.LimitError
+		if written != 5 || !errors.As(writeErr, &limitErr) || !errors.As(finishErr, &limitErr) || result.Artifact == nil || result.Artifact.Complete || result.TruncationReason != CaptureTruncatedHardLimit || store.last.commits != 1 || store.last.aborts != 0 {
+			t.Fatalf("hard-limit terminal = %#v write=%v finish=%v", result, writeErr, finishErr)
+		}
+	})
+	run("artifact_hard_limit_incomplete_commit", func(t *testing.T) {
+		artifactErr := &budget.LimitError{Scope: "artifact", Dimension: budget.Bytes, Limit: 3, Observed: 9}
+		writer := &captureTestWriter{maxWrite: 3, writeErr: artifactErr}
+		store := &captureTestStore{next: writer}
+		capture := newTestCapture(t, store, 8, 64)
+		_, writeErr := capture.Write([]byte("123456789"))
+		result, finishErr := capture.Finish(context.Background())
+		if !errors.Is(writeErr, artifactErr) || !errors.Is(finishErr, artifactErr) || result.Artifact == nil || result.Artifact.Complete || result.TruncationReason != CaptureTruncatedArtifact || writer.commits != 1 || writer.aborts != 0 {
+			t.Fatalf("artifact-limit terminal = %#v write=%v finish=%v", result, writeErr, finishErr)
+		}
+	})
+	run("write_failure_after_bytes_incomplete_commit", func(t *testing.T) {
+		writeFailure := errors.New("partial write failed")
+		writer := &captureTestWriter{maxWrite: 3, writeErr: writeFailure}
+		capture := newTestCapture(t, &captureTestStore{next: writer}, 8, 64)
+		_, writeErr := capture.Write([]byte("123456789"))
+		result, finishErr := capture.Finish(context.Background())
+		if !errors.Is(writeErr, writeFailure) || !errors.Is(finishErr, writeFailure) || result.Artifact == nil || result.Artifact.Complete || result.TruncationReason != CaptureTruncatedWriteFailure || writer.commits != 1 || writer.aborts != 0 {
+			t.Fatalf("partial-write terminal = %#v write=%v finish=%v", result, writeErr, finishErr)
+		}
+	})
+	run("canceled_after_bytes_incomplete_commit", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		store := &captureTestStore{}
+		capture := newTestCaptureWithContext(t, ctx, store, 8, 64)
+		if _, err := capture.Write([]byte("abc")); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		_, writeErr := capture.Write([]byte("later"))
+		result, finishErr := capture.Finish(context.Background())
+		if !errors.Is(writeErr, context.Canceled) || !errors.Is(finishErr, context.Canceled) || result.Artifact == nil || result.Artifact.Complete || result.TruncationReason != CaptureTruncatedCanceled || store.last.commits != 1 || store.last.aborts != 0 {
+			t.Fatalf("cancel terminal = %#v write=%v finish=%v", result, writeErr, finishErr)
+		}
+	})
+	run("zero_byte_write_failure_no_ref", func(t *testing.T) {
+		writer := &captureTestWriter{writeErr: errors.New("zero write failed")}
+		capture := newTestCapture(t, &captureTestStore{next: writer}, 8, 64)
+		_, _ = capture.Write([]byte("payload"))
+		result, finishErr := capture.Finish(context.Background())
+		if finishErr == nil || !reflect.DeepEqual(result, CaptureResult{}) || writer.aborts != 1 || writer.commits != 0 {
+			t.Fatalf("zero-write terminal = %#v err=%v", result, finishErr)
+		}
+	})
+	run("commit_failure_no_ref", func(t *testing.T) {
+		writer := &captureTestWriter{commitErr: errors.New("commit failed")}
+		capture := newTestCapture(t, &captureTestStore{next: writer}, 8, 64)
+		_, _ = capture.Write([]byte("123456789"))
+		result, finishErr := capture.Finish(context.Background())
+		if finishErr == nil || !reflect.DeepEqual(result, CaptureResult{}) || writer.commits != 1 || writer.aborts != 0 {
+			t.Fatalf("commit failure terminal = %#v err=%v", result, finishErr)
+		}
+	})
+	if len(seen) != len(expected) {
+		t.Fatalf("seen %v, want %v", seen, expected)
+	}
+	for _, name := range expected {
+		if !seen[name] {
+			t.Fatalf("missing canonical subtest %q", name)
+		}
+	}
+}
+
 func newTestCapture(t *testing.T, store artifact.Store, inlineBytes, captureBytes int64) *Capture {
+	return newTestCaptureWithContext(t, context.Background(), store, inlineBytes, captureBytes)
+}
+
+func newTestCaptureWithContext(t *testing.T, ctx context.Context, store artifact.Store, inlineBytes, captureBytes int64) *Capture {
 	t.Helper()
 	effective, err := budget.NewLimits(budget.Limit{Dimension: budget.Bytes, Value: captureBytes})
 	if err != nil {
@@ -107,7 +284,7 @@ func newTestCapture(t *testing.T, store artifact.Store, inlineBytes, captureByte
 	if err != nil {
 		t.Fatal(err)
 	}
-	capture, err := NewCapture(context.Background(), CaptureOptions{
+	capture, err := NewCapture(ctx, CaptureOptions{
 		Store:       store,
 		Counter:     counter,
 		InlineBytes: inlineBytes,
@@ -159,10 +336,14 @@ func newBenchmarkCapture(t testing.TB, captureBytes int64) *Capture {
 
 type captureTestStore struct {
 	last *captureTestWriter
+	next *captureTestWriter
 }
 
 func (s *captureTestStore) Begin(context.Context, artifact.Metadata) (artifact.Writer, error) {
-	s.last = &captureTestWriter{}
+	s.last = s.next
+	if s.last == nil {
+		s.last = &captureTestWriter{}
+	}
 	return s.last, nil
 }
 
@@ -177,18 +358,38 @@ func (*captureTestStore) Cleanup(context.Context) (artifact.CleanupResult, error
 func (*captureTestStore) Close() error { return nil }
 
 type captureTestWriter struct {
-	data    []byte
-	commits int
-	aborts  int
+	data       []byte
+	writeCalls int
+	commits    int
+	aborts     int
+	writeErr   error
+	commitErr  error
+	commitRef  *artifact.Ref
+	abortErr   error
+	maxWrite   int
 }
 
 func (w *captureTestWriter) Write(input []byte) (int, error) {
+	w.writeCalls++
+	if w.maxWrite > 0 && len(input) > w.maxWrite {
+		w.data = append(w.data, input[:w.maxWrite]...)
+		return w.maxWrite, w.writeErr
+	}
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
 	w.data = append(w.data, input...)
 	return len(input), nil
 }
 
 func (w *captureTestWriter) Commit(context.Context) (artifact.Ref, error) {
 	w.commits++
+	if w.commitRef != nil {
+		return *w.commitRef, w.commitErr
+	}
+	if w.commitErr != nil {
+		return artifact.Ref{}, w.commitErr
+	}
 	return artifact.Ref{
 		ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		Bytes:     int64(len(w.data)),
@@ -200,7 +401,7 @@ func (w *captureTestWriter) Commit(context.Context) (artifact.Ref, error) {
 
 func (w *captureTestWriter) Abort() error {
 	w.aborts++
-	return nil
+	return w.abortErr
 }
 
 type discardCaptureStore struct{}
@@ -232,6 +433,7 @@ func (w *discardCaptureWriter) Commit(context.Context) (artifact.Ref, error) {
 	return artifact.Ref{
 		ID:        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		Bytes:     w.bytes,
+		CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
 		Available: true,
 		Complete:  true,
 	}, nil

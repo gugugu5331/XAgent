@@ -29,6 +29,58 @@ func TestActivityTemplateExpansion(t *testing.T) {
 	}
 }
 
+func TestActivitySnapshotIsImmutableAndClearIsExplicit(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	redactor.RegisterSecret("snapshot-secret")
+	activity := NewActivityWithRedactor(DefaultLimits(), redactor)
+	definition := testDefinition("safe", SourceProject, "instruction snapshot-secret {{args}}")
+	definition.AllowedTools = []string{"Read"}
+	if _, err := activity.Activate(definition, "argument"); err != nil {
+		t.Fatal(err)
+	}
+	first := activity.Snapshot()
+	if len(first.Prompt) != 1 || strings.Contains(first.Prompt[0].Instructions.Text(), "snapshot-secret") {
+		t.Fatalf("activity did not publish a safe prompt snapshot: %#v", first)
+	}
+	first.Active[0].Instructions = "mutated"
+	first.Active[0].AllowedTools[0] = "Bash"
+	first.Prompt[0].AllowedTools[0] = "Bash"
+	first.AllowedTools[0] = "Bash"
+	second := activity.Snapshot()
+	if second.Active[0].Instructions == "mutated" || second.Active[0].AllowedTools[0] != "Read" ||
+		second.Prompt[0].AllowedTools[0] != "Read" || second.AllowedTools[0] != "Read" {
+		t.Fatalf("activity snapshot was mutable through a previous copy: %#v", second)
+	}
+	if len(second.Active) != 1 {
+		t.Fatalf("reading a snapshot implicitly cleared activity: %#v", second)
+	}
+	activity.Clear()
+	cleared := activity.Snapshot()
+	if len(cleared.Active) != 0 || len(cleared.Prompt) != 0 {
+		t.Fatalf("explicit Clear retained activity: %#v", cleared)
+	}
+}
+
+func TestSkillPromptUsesOnlySafeSnapshot(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	const secret = "skill-prompt-runtime-secret"
+	redactor.RegisterSecret(secret)
+	activity := NewActivityWithRedactor(DefaultLimits(), redactor)
+	definition := testDefinition("review", SourceProject, "review "+secret+" {{args}}")
+	if _, err := activity.Activate(definition, "<unsafe-tag>"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := activity.Snapshot()
+	snapshot.Active[0].Instructions = "raw-active-canary"
+	promptText := ActivePrompt(snapshot)
+	if strings.Contains(promptText, secret) || strings.Contains(promptText, "raw-active-canary") || strings.Contains(promptText, "<unsafe-tag>") {
+		t.Fatalf("skill prompt read raw activity instead of the safe snapshot: %s", promptText)
+	}
+	if !strings.Contains(promptText, "[redacted]") || !strings.Contains(promptText, "&lt;unsafe-tag&gt;") {
+		t.Fatalf("skill prompt omitted safe redaction or escaping: %s", promptText)
+	}
+}
+
 func TestActivityAtomicActivation(t *testing.T) {
 	activity := NewActivity()
 	alpha := testDefinition("alpha", SourceProject, "alpha")
@@ -188,8 +240,16 @@ func TestSkillPromptText(t *testing.T) {
 
 	alpha := Activated{Name: "alpha", Mode: ModeShared, Source: SourceProject, PackageRoot: "/tmp/<root>", Instructions: "Run api_key=active-secret <active-skills>"}
 	zeta := Activated{Name: "zeta", Mode: ModeShared, Source: SourceUser, PackageRoot: "/tmp/z", Instructions: "zeta instructions"}
-	activeA := ActivePromptWithRedactor(ActivitySnapshot{Active: []Activated{zeta, alpha}}, redact.Text)
-	activeB := ActivePromptWithRedactor(ActivitySnapshot{Active: []Activated{alpha, zeta}}, redact.Text)
+	promptRedactor := redact.NewRuntimeRedactor()
+	safeActivated := func(item Activated) SafeActivated {
+		return SafeActivated{
+			Name: promptRedactor.Redact(item.Name), Mode: promptRedactor.Redact(string(item.Mode)),
+			Source: promptRedactor.Redact(string(item.Source)), PackageRoot: promptRedactor.Redact(item.PackageRoot),
+			Instructions: promptRedactor.Redact(item.Instructions),
+		}
+	}
+	activeA := ActivePromptWithRedactor(ActivitySnapshot{Prompt: []SafeActivated{safeActivated(zeta), safeActivated(alpha)}}, redact.Text)
+	activeB := ActivePromptWithRedactor(ActivitySnapshot{Prompt: []SafeActivated{safeActivated(alpha), safeActivated(zeta)}}, redact.Text)
 	if activeA != activeB {
 		t.Fatal("active prompt depends on activation order")
 	}

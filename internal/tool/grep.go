@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 
+	"xagent/internal/artifact"
 	"xagent/internal/budget"
 	"xagent/internal/safefs"
 )
@@ -28,9 +29,11 @@ var (
 type grepOpenFile func(context.Context, *safefs.Root, string) (io.ReadCloser, error)
 
 type GrepTool struct {
-	projectRoot string
-	limits      grepLimits
-	openFile    grepOpenFile
+	projectRoot   string
+	limits        grepLimits
+	openFile      grepOpenFile
+	resultFactory *ResultFactory
+	capture       func(context.Context, artifact.Metadata) (*Capture, error)
 }
 
 type grepLimits struct {
@@ -52,10 +55,21 @@ type grepState struct {
 	scanErrors    []string
 	truncated     bool
 	reason        string
+	resultFactory *ResultFactory
+	capture       *Capture
+	captureErr    error
+	matchCount    int
 }
 
 func NewGrepTool(projectRoot string) Tool {
 	return &GrepTool{projectRoot: projectRoot, limits: defaultGrepLimits()}
+}
+
+func NewGrepToolWithResultBoundary(projectRoot string, factory *ResultFactory, capture func(context.Context, artifact.Metadata) (*Capture, error)) (Tool, error) {
+	if factory == nil || capture == nil {
+		return nil, errors.New("safe Grep result dependencies are unavailable")
+	}
+	return &GrepTool{projectRoot: projectRoot, limits: defaultGrepLimits(), resultFactory: factory, capture: capture}, nil
 }
 
 func (t *GrepTool) Name() string { return "Grep" }
@@ -66,6 +80,10 @@ func (t *GrepTool) Description() string {
 
 func (t *GrepTool) Risk() Risk { return RiskSafe }
 
+func (t *GrepTool) UsesSafeResultBoundary() bool {
+	return t != nil && t.resultFactory != nil && t.capture != nil
+}
+
 func (t *GrepTool) Schema() Schema {
 	return ObjectSchema([]string{"pattern"}, map[string]SchemaProperty{
 		"pattern": StringProperty("Text or regex pattern to search for."),
@@ -75,12 +93,30 @@ func (t *GrepTool) Schema() Schema {
 }
 
 func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
+	return t.executeLegacy(ctx, input)
+}
+
+func (t *GrepTool) failure(input Input, code, message string) Result {
+	if t != nil && t.resultFactory != nil && t.capture != nil {
+		status := StatusError
+		if code == ErrTimeout {
+			status = StatusTimeout
+		}
+		return buildSyntheticResult(t.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: Completed, Status: status, Summary: message, Error: &Error{Code: code, Message: message, Recoverable: true}})
+	}
+	return grepFailure(input, code, message)
+}
+
+func (t *GrepTool) executeLegacy(ctx context.Context, input Input) Result {
 	if ctx == nil || ctx.Err() != nil {
+		if t != nil && t.resultFactory != nil && t.capture != nil {
+			return Result{}
+		}
 		return grepFailure(input, ErrTimeout, "搜索已取消")
 	}
 	pattern, ok := stringArg(input.Arguments, "pattern")
 	if !ok {
-		return Failure(input, ErrInvalidArguments, "pattern 参数不能为空", true)
+		return t.failure(input, ErrInvalidArguments, "pattern 参数不能为空")
 	}
 	searchPath := optionalStringArg(input.Arguments, "path")
 	if searchPath == "" {
@@ -92,25 +128,28 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 	if useRegex {
 		re, err = regexp.Compile(pattern)
 		if err != nil {
-			return Failure(input, ErrInvalidArguments, "正则表达式无效", true)
+			return t.failure(input, ErrInvalidArguments, "正则表达式无效")
 		}
 	}
 
 	scope, err := effectiveReadScope(ctx, t.projectRoot)
 	if err != nil {
-		return grepFailure(input, errorCode(err), "搜索范围无效")
+		return t.failure(input, errorCode(err), "搜索范围无效")
 	}
 	target, root, closeRoot, err := readRootInScope(ctx, scope, searchPath)
 	if err != nil {
 		if ctx.Err() != nil {
+			if t.resultFactory != nil && t.capture != nil {
+				return Result{}
+			}
 			return grepFailure(input, ErrTimeout, "搜索已取消")
 		}
-		return grepFailure(input, errorCode(err), "无法打开搜索范围")
+		return t.failure(input, errorCode(err), "无法打开搜索范围")
 	}
 	defer closeRoot()
 	relative, err := relativeReadTarget(target, true)
 	if err != nil {
-		return grepFailure(input, errorCode(err), "搜索范围无效")
+		return t.failure(input, errorCode(err), "搜索范围无效")
 	}
 
 	limits := t.limits
@@ -131,11 +170,14 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 		lines:       limits.lines,
 	})
 	if err != nil {
-		return grepFailure(input, ErrNotFound, "搜索预算无效")
+		return t.failure(input, ErrNotFound, "搜索预算无效")
 	}
-	outputCounter, err := newReadCounter(budget.ToolInlineOutputBytes, budget.Bytes, limits.outputBytes)
-	if err != nil {
-		return grepFailure(input, ErrNotFound, "搜索输出预算无效")
+	var outputCounter *budget.Counter
+	if t.resultFactory == nil || t.capture == nil {
+		outputCounter, err = newReadCounter(budget.ToolInlineOutputBytes, budget.Bytes, limits.outputBytes)
+		if err != nil {
+			return t.failure(input, ErrNotFound, "搜索输出预算无效")
+		}
 	}
 	state := &grepState{
 		pattern:       pattern,
@@ -145,6 +187,13 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 		outputCounter: outputCounter,
 		lineMaxBytes:  limits.outputBytes,
 		matches:       make([]string, 0, 16),
+	}
+	if t.resultFactory != nil && t.capture != nil {
+		state.resultFactory = t.resultFactory
+		state.capture, err = t.capture(ctx, artifact.Metadata{MediaType: "text/plain"})
+		if err != nil || state.capture == nil {
+			return t.failure(input, ErrCommandFailed, "搜索输出采集不可用")
+		}
 	}
 
 	info, statErr := os.Lstat(target.absolute)
@@ -186,7 +235,7 @@ func (t *GrepTool) Execute(ctx context.Context, input Input) Result {
 			}
 		}
 	}
-	if len(state.matches) == 0 {
+	if state.count() == 0 {
 		return state.result(input, pattern, StatusError, &Error{Code: ErrNoResults, Message: "没有搜索到匹配内容", Recoverable: true})
 	}
 	return state.result(input, pattern, StatusSuccess, nil)
@@ -354,6 +403,25 @@ func (s *grepState) matchesLine(line []byte) bool {
 
 func (s *grepState) addMatch(display string, lineNumber int64, line []byte) error {
 	match := fmt.Sprintf("%s:%d:%s", display, lineNumber, strings.TrimSpace(string(line)))
+	if s.capture != nil {
+		if s.matchCount > 0 {
+			if _, err := io.WriteString(s.capture, "\n"); err != nil {
+				s.captureErr = err
+				return errGrepOutputLimit
+			}
+		}
+		if _, err := io.WriteString(s.capture, match); err != nil {
+			s.captureErr = err
+			return errGrepOutputLimit
+		}
+		s.matchCount++
+		if s.matchCount >= maxGrepMatches {
+			s.truncated = true
+			s.reason = "grep.max_matches"
+			return errGrepMatchLimit
+		}
+		return nil
+	}
 	separator := int64(0)
 	if len(s.matches) > 0 {
 		separator = 1
@@ -386,6 +454,13 @@ func (s *grepState) addMatch(display string, lineNumber int64, line []byte) erro
 	return nil
 }
 
+func (s *grepState) count() int {
+	if s.capture != nil {
+		return s.matchCount
+	}
+	return len(s.matches)
+}
+
 func (s *grepState) addScanError(display, code string) {
 	s.truncated = true
 	if s.reason == "" {
@@ -398,6 +473,30 @@ func (s *grepState) addScanError(display, code string) {
 }
 
 func (s *grepState) result(input Input, pattern string, status ResultStatus, resultErr *Error) Result {
+	if s.capture != nil && s.resultFactory != nil {
+		if s.captureErr == nil && (s.truncated || resultErr != nil) {
+			reason := CaptureTruncatedWriteFailure
+			marker := errors.New("grep producer stopped before complete output")
+			if resultErr != nil && resultErr.Code == ErrTimeout {
+				reason = CaptureTruncatedCanceled
+				marker = context.Canceled
+			} else if s.reason != "" && s.reason != "files.scan_errors" {
+				reason = CaptureTruncatedHardLimit
+			}
+			_ = s.capture.MarkIncomplete(marker, reason)
+		}
+		captured, finishErr := s.capture.Finish(context.Background())
+		state := Completed
+		if resultErr != nil && resultErr.Code == ErrTimeout {
+			state = CancelledAfterStart
+			status = StatusTimeout
+		}
+		if s.captureErr != nil || finishErr != nil {
+			status = StatusError
+			resultErr = &Error{Code: ErrCommandFailed, Message: "搜索输出未完整采集", Recoverable: true}
+		}
+		return buildCapturedResult(s.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: state, Status: status, Summary: fmt.Sprintf("Found %d matches", s.matchCount), Error: resultErr}, captured, finishErr)
+	}
 	snapshot := s.counter.Snapshot()
 	data := map[string]any{
 		"pattern":     pattern,

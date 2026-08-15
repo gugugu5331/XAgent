@@ -2,13 +2,12 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"xagent/internal/contextmgr"
 	"xagent/internal/events"
 	"xagent/internal/hook"
 	"xagent/internal/permission"
@@ -22,12 +21,17 @@ type ToolBatch struct {
 
 type ToolExecution struct {
 	Call        tool.Call
+	State       tool.ExecutionState
 	Validated   tool.ValidatedCall
 	Normalized  permission.NormalizedCall
 	HookInput   hook.ToolInput
 	Ref         hook.ExecutionRef
 	SystemRoute bool
 	Result      tool.Result
+	HasResult   bool
+	Projection  contextmgr.ToolResultProjection
+	Projected   bool
+	Duration    time.Duration
 	Index       int
 	Ticket      permission.ExecutionTicket
 	Scope       permission.GrantScope
@@ -47,13 +51,7 @@ func (o *Orchestrator) filterToolCall(mode RunMode, call tool.Call) (tool.Result
 
 func (o *Orchestrator) filterToolCallWithRegistry(mode RunMode, registry *tool.Registry, call tool.Call) (tool.Result, bool) {
 	if registry == nil {
-		return tool.Result{
-			CallID:  call.ID,
-			Name:    call.Name,
-			Status:  tool.StatusError,
-			Summary: "工具注册中心不可用",
-			Error:   &tool.Error{Code: tool.ErrToolNotFound, Message: "工具注册中心不可用", Recoverable: true},
-		}, true
+		return o.unavailableToolRegistryResult(call), true
 	}
 	registeredTool, ok := registry.Get(call.Name)
 	if !ok {
@@ -65,45 +63,13 @@ func (o *Orchestrator) filterToolCallWithRegistry(mode RunMode, registry *tool.R
 				return tool.Result{}, false
 			}
 		}
-		return tool.Result{
-			CallID:  call.ID,
-			Name:    call.Name,
-			Status:  tool.StatusError,
-			Summary: fmt.Sprintf("未知工具: %s", call.Name),
-			Error:   &tool.Error{Code: tool.ErrToolNotFound, Message: fmt.Sprintf("工具 %q 未注册", call.Name), Recoverable: true},
-		}, true
+		return o.unknownToolResult(call), true
 	}
 	if mode == RunModePlan && !isReadOnlyTool(call.Name) {
 		return tool.Result{}, false
 	}
 	_ = registeredTool
 	return tool.Result{}, false
-}
-
-func makeToolBatches(calls []tool.Call, registry *tool.Registry) []ToolBatch {
-	batches := []ToolBatch{}
-	currentSafe := ToolBatch{Concurrent: true}
-	flushSafe := func() {
-		if len(currentSafe.Calls) > 0 {
-			batches = append(batches, currentSafe)
-			currentSafe = ToolBatch{Concurrent: true}
-		}
-	}
-	for index, call := range calls {
-		var registeredTool tool.Tool
-		var ok bool
-		if registry != nil {
-			registeredTool, ok = registry.Get(call.Name)
-		}
-		if ok && registeredTool.Risk() == tool.RiskSafe {
-			currentSafe.Calls = append(currentSafe.Calls, indexedToolCall{Call: call, Index: index})
-			continue
-		}
-		flushSafe()
-		batches = append(batches, ToolBatch{Calls: []indexedToolCall{{Call: call, Index: index}}, Concurrent: false})
-	}
-	flushSafe()
-	return batches
 }
 
 func (o *Orchestrator) executeToolBatches(ctx context.Context, mode RunMode, batches []ToolBatch, out chan<- events.Event) ([]ToolExecution, StopReason, error) {
@@ -131,8 +97,18 @@ func (o *Orchestrator) executeToolBatchesWithRegistryAndRef(ctx context.Context,
 				return executions, execution.StopReason, execution.Err
 			}
 		}
+		if batch.Concurrent {
+			prepared = o.executeConcurrentPreparedTools(ctx, prepared, out)
+			for _, execution := range prepared {
+				executions = append(executions, execution)
+				if execution.Err != nil {
+					return executions, execution.StopReason, execution.Err
+				}
+			}
+			continue
+		}
 		for _, execution := range prepared {
-			if execution.Result.CallID != "" {
+			if execution.HasResult {
 				executions = append(executions, execution)
 				continue
 			}
@@ -147,153 +123,41 @@ func (o *Orchestrator) executeToolBatchesWithRegistryAndRef(ctx context.Context,
 	return executions, "", nil
 }
 
-func (o *Orchestrator) prepareToolExecution(ctx context.Context, mode RunMode, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
-	return o.prepareToolExecutionWithRegistryAndRef(ctx, mode, o.registry, indexed, hook.ExecutionRef{}, out)
-}
-
-func (o *Orchestrator) prepareToolExecutionWithRegistry(ctx context.Context, mode RunMode, registry *tool.Registry, indexed indexedToolCall, out chan<- events.Event) ToolExecution {
-	return o.prepareToolExecutionWithRegistryAndRef(ctx, mode, registry, indexed, hook.ExecutionRef{}, out)
-}
-
-func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Context, mode RunMode, registry *tool.Registry, indexed indexedToolCall, ref hook.ExecutionRef, out chan<- events.Event) ToolExecution {
-	call := indexed.Call
-	if call.Name != tool.LoadSkillToolName && !emitEvent(ctx, out, events.Event{Type: events.ToolPending, Tool: o.safeToolDisplay(call, events.ToolDisplayPending, "")}) {
-		return ToolExecution{Call: call, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-	}
-	if registry == nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailableToolRegistryResult(call), out)
-	}
-	if _, ok := registry.Get(call.Name); !ok {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unknownToolResult(call), out)
-	}
-	validated, err := registry.ValidateCall(call)
-	if err != nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, invalidToolArgumentsResult(call, err), out)
-	}
-	if call.Name != tool.LoadSkillToolName && o.executor != nil {
-		validated, err = o.executor.PrepareCall(ctx, call)
-		if err != nil {
-			return o.rejectPreparedTool(ctx, call, indexed.Index, invalidToolArgumentsResult(call, err), out)
-		}
-	}
-	if mode == RunModePlan && call.Name != tool.LoadSkillToolName && !isReadOnlyTool(call.Name) {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, planModeDecision(call)), out)
-	}
-	permissionContext := o.permissionContextWithReadScope(ctx, mode)
-	normalized, err := permission.NormalizeArguments(permissionCall(call), validated.Arguments, permissionContext)
-	if err != nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
-	}
-	canonicalArguments, err := json.Marshal(normalized.Arguments)
-	if err != nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
-	}
-	identity, err := permission.NewCallIdentity(permission.CallIdentityInput{ToolName: call.Name, CanonicalArguments: canonicalArguments})
-	if call.Name != tool.LoadSkillToolName && o.executor != nil {
-		identity, err = o.executor.CallIdentity(validated)
-	}
-	if err != nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, normalizationFailureDecision(call)), out)
-	}
-	permissionContext.Identity = identity
-	if o.authorizer != nil {
-		if hard := o.authorizer.CheckHard(normalized, permissionContext); hard != nil {
-			return o.rejectPreparedTool(ctx, call, indexed.Index, permissionDeniedResult(call, *hard), out)
-		}
-	}
-	hookInput := hook.ToolInput{CallID: call.ID, Name: call.Name, Arguments: validated.Arguments}
-	if hookDecision := o.hookRuntime().BeforeTool(requestCtxOrBackground(ctx), ref, hookInput); hookDecision.IsDeny() {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, o.hookDeniedResult(call, hookDecision.Reason), out)
-	}
-	execution := ToolExecution{
-		Call:        call,
-		Validated:   validated,
-		Normalized:  normalized,
-		HookInput:   hookInput,
-		Ref:         ref,
-		SystemRoute: call.Name == tool.LoadSkillToolName,
-		Index:       indexed.Index,
-	}
-	if execution.SystemRoute {
-		return execution
-	}
-	if o.executor == nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailableToolExecutorResult(call), out)
-	}
-	if o.authorizer == nil {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailablePermissionResult(call), out)
-	}
-	decision := o.authorizer.DecideOrdinary(normalized, permissionContext)
-	switch decision.Kind {
-	case permission.DecisionDeny:
-		result := permissionDeniedResult(call, decision)
-		if !emitEvent(ctx, out, events.Event{Type: events.ToolDenied, Tool: o.safeResultDisplay(result)}) {
-			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-		}
-		return ToolExecution{Call: call, Result: result, Index: indexed.Index}
-	case permission.DecisionAsk:
-		decisionCh := make(chan events.ToolConfirmationDecision, 1)
-		confirmation := o.safeConfirmationRequest(call, decision, decisionCh)
-		if !emitEvent(ctx, out, events.Event{Type: events.ToolWaitingConfirmation, Tool: o.safeToolDisplay(call, events.ToolDisplayWaitingConfirmation, "等待确认"), Confirmation: confirmation}) {
-			return ToolExecution{Call: call, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-		}
-		select {
-		case <-ctx.Done():
-			result := tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具执行已取消", Error: &tool.Error{Code: tool.ErrTimeout, Message: ctx.Err().Error(), Recoverable: true}}
-			emitEvent(ctx, out, o.safeToolResultEvent(result))
-			return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-		case userDecision := <-decisionCh:
-			decision = o.authorizer.ResolveNormalizedUserDecision(normalized, permissionContext, permissionAction(userDecision))
-			if decision.Kind == permission.DecisionDeny {
-				result := permissionDeniedResult(call, decision)
-				if !emitEvent(ctx, out, events.Event{Type: events.ToolDenied, Tool: o.safeResultDisplay(result)}) {
-					return ToolExecution{Call: call, Result: result, Index: indexed.Index, StopReason: StopReasonCancelled, Err: ctx.Err()}
-				}
-				return ToolExecution{Call: call, Result: result, Index: indexed.Index}
-			}
-		}
-	}
-	if !decision.Ticket.Issued() {
-		return o.rejectPreparedTool(ctx, call, indexed.Index, unavailablePermissionTicketResult(call), out)
-	}
-	execution.Ticket = decision.Ticket
-	execution.Scope = decision.Scope
-	execution.Source = decision.Source
-	return execution
-}
-
 func (o *Orchestrator) executePreparedTool(ctx context.Context, execution ToolExecution, out chan<- events.Event) ToolExecution {
 	call := execution.Call
 	if !execution.SystemRoute && !emitEvent(ctx, out, events.Event{Type: events.ToolRunning, Tool: o.safeToolDisplay(call, events.ToolDisplayRunning, "执行中")}) {
-		execution.StopReason = StopReasonCancelled
-		execution.Err = ctx.Err()
-		return execution
+		return cancelToolExecutionBeforeStart(execution, ctx.Err())
 	}
+	execution.State = tool.Running
 	started := time.Now()
 	var result tool.Result
 	if execution.SystemRoute {
-		result = execution.Validated.Tool.Execute(ctx, tool.Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: execution.Validated.Arguments})
+		result = o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Completed, Status: tool.StatusError, Summary: "load_skill 必须由 Orchestrator 系统路由处理", Error: &tool.Error{Code: tool.ErrInternalRoutingRequired, Message: "load_skill 必须由 Orchestrator 系统路由处理", Recoverable: true}})
 	} else if o.executor == nil || !execution.Ticket.Issued() {
-		result = unavailableToolExecutorResult(call)
+		result = o.unavailableToolExecutorResult(call)
 	} else {
 		result = o.executor.ExecuteValidatedAuthorized(ctx, execution.Validated, execution.Ticket)
 	}
-	duration := lifecycleDuration(started)
-	o.dispatchToolAfter(ctx, execution, result, duration)
-	if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-		execution.Result = result
-		execution.StopReason = StopReasonCancelled
-		execution.Err = ctx.Err()
+	if result.CallID == "" && ctx.Err() != nil {
+		return cancelToolExecutionBeforeStart(execution, ctx.Err())
+	}
+	execution = recordToolExecutionResult(execution, result, lifecycleDuration(started))
+	if !execution.HasResult {
 		return execution
 	}
-	execution.Result = result
+	if !o.candidateResultsEnabled() && !o.publishLegacyToolResult(ctx, execution, out) {
+		execution.StopReason = StopReasonCancelled
+		execution.Err = ctx.Err()
+	}
 	return execution
 }
 
 func (o *Orchestrator) completeSystemToolExecution(ctx context.Context, execution ToolExecution, result tool.Result, started time.Time, out chan<- events.Event) ToolExecution {
-	o.dispatchToolAfter(ctx, execution, result, lifecycleDuration(started))
-	execution.Result = result
-	if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
+	execution = recordToolExecutionResult(execution, result, lifecycleDuration(started))
+	if !execution.HasResult {
+		return execution
+	}
+	if !o.candidateResultsEnabled() && !o.publishLegacyToolResult(ctx, execution, out) {
 		execution.StopReason = StopReasonCancelled
 		execution.Err = ctx.Err()
 	}
@@ -301,10 +165,17 @@ func (o *Orchestrator) completeSystemToolExecution(ctx context.Context, executio
 }
 
 func (o *Orchestrator) rejectPreparedTool(ctx context.Context, call tool.Call, index int, result tool.Result, out chan<- events.Event) ToolExecution {
-	if !emitEvent(ctx, out, o.safeToolResultEvent(result)) {
-		return ToolExecution{Call: call, Result: result, Index: index, StopReason: StopReasonCancelled, Err: ctx.Err()}
+	execution := ToolExecution{Call: call, State: tool.Prepared, Result: result, HasResult: result.CallID != "", Index: index}
+	if execution.HasResult {
+		execution.State = tool.Rejected
+	} else {
+		return execution
 	}
-	return ToolExecution{Call: call, Result: result, Index: index}
+	if !o.candidateResultsEnabled() && !o.publishLegacyToolResult(ctx, execution, out) {
+		execution.StopReason = StopReasonCancelled
+		execution.Err = ctx.Err()
+	}
+	return execution
 }
 
 func (o *Orchestrator) hookDeniedResult(call tool.Call, reason string) tool.Result {
@@ -312,181 +183,87 @@ func (o *Orchestrator) hookDeniedResult(call tool.Call, reason string) tool.Resu
 	if reason == "" {
 		reason = "This tool call was denied by an automation hook. Choose a safer alternative."
 	}
-	return tool.Result{
-		CallID:  call.ID,
-		Name:    call.Name,
-		Status:  tool.StatusDenied,
-		Summary: "Tool call denied by automation hook",
-		Content: reason,
-		Data:    map[string]any{"reason": tool.ErrHookDenied},
-		Error:   &tool.Error{Code: tool.ErrHookDenied, Message: reason, Recoverable: true},
-	}
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusDenied, Summary: "Tool call denied by automation hook", Preview: reason, Error: &tool.Error{Code: tool.ErrHookDenied, Message: reason, Recoverable: true}})
 }
 
-func (o *Orchestrator) dispatchToolAfter(ctx context.Context, execution ToolExecution, result tool.Result, duration time.Duration) {
-	content, resultError := o.boundedHookToolOutput(result)
-	output := hook.ToolOutput{Status: hookToolStatus(string(result.Status)), Content: content, Error: resultError}
-	o.hookRuntime().AfterTool(hookLifecycleContext(ctx), execution.Ref, execution.HookInput, output, duration)
-}
-
-func (o *Orchestrator) boundedHookToolOutput(result tool.Result) (string, *hook.ToolError) {
-	// Keep ToolAfter comfortably below the Hook event envelope even when a
-	// custom executor limit is very large. The final clamp also covers JSON
-	// escaping and redactors that expand text.
-	const hardLimit = 128 << 10
-	totalLimit := 32 << 10
-	if o != nil && o.executor != nil && o.executor.MaxOutputBytes > 0 {
-		totalLimit = o.executor.MaxOutputBytes
-	}
-	if totalLimit > hardLimit {
-		totalLimit = hardLimit
-	}
-	if totalLimit < 1<<10 {
-		totalLimit = 1 << 10
-	}
-	errorLimit := totalLimit / 4
-	contentLimit := totalLimit - errorLimit
-	fieldLimit := contentLimit / 3
-
-	bounded := result
-	var truncated bool
-	bounded.Summary, truncated = truncateHookText(o.redactText(result.Summary), fieldLimit)
-	bounded.Truncated = bounded.Truncated || truncated
-	bounded.Content, truncated = truncateHookText(o.redactText(result.Content), fieldLimit)
-	bounded.Truncated = bounded.Truncated || truncated
-	var outputError *hook.ToolError
+func (o *Orchestrator) publishLegacyToolResult(ctx context.Context, execution ToolExecution, out chan<- events.Event) bool {
+	result := execution.Result
+	content := o.safeText(resultContent(result))
+	var resultError *hook.SafeError
 	if result.Error != nil {
-		cloned := *result.Error
-		cloned.Code, _ = truncateHookText(o.redactText(cloned.Code), 256)
-		cloned.Message, truncated = truncateHookText(o.redactText(cloned.Message), errorLimit)
-		bounded.Truncated = bounded.Truncated || truncated
-		bounded.Error = &cloned
-		outputError = &hook.ToolError{Code: cloned.Code, Message: cloned.Message, Recoverable: cloned.Recoverable}
+		resultError = &hook.SafeError{Code: result.Error.Code, Message: o.safeText(result.Error.Message), Recoverable: result.Error.Recoverable}
 	}
-	content, _ := truncateHookText(o.redactText(resultContent(bounded)), contentLimit)
-	return content, outputError
+	if execution.HookInput.CallID != "" {
+		o.hookRuntime().AfterTool(hookLifecycleContext(ctx), execution.Ref, execution.HookInput, hook.ToolOutput{Status: hookToolStatus(string(result.Status)), Content: content, Error: resultError}, execution.Duration)
+	}
+	return emitEvent(ctx, out, o.safeToolResultEvent(result))
 }
 
-func truncateHookText(value string, maxBytes int) (string, bool) {
-	if maxBytes <= 0 || len(value) <= maxBytes {
-		return value, false
+// dispatchToolAfter remains a Hook-only migration adapter for direct callers.
+// It neither projects nor writes Conversation or executionState.
+func (o *Orchestrator) dispatchToolAfter(ctx context.Context, execution ToolExecution, result tool.Result, duration time.Duration) {
+	content := o.safeText(resultContent(result))
+	var resultError *hook.SafeError
+	if result.Error != nil {
+		resultError = &hook.SafeError{Code: result.Error.Code, Message: o.safeText(result.Error.Message), Recoverable: result.Error.Recoverable}
 	}
-	const marker = "\n...[truncated]"
-	if maxBytes <= len(marker) {
-		return marker[:maxBytes], true
+	input := execution.HookInput
+	if input.CallID == "" {
+		input = hook.NewToolInput(execution.Call.ID, execution.Call.Name, nil)
 	}
-	prefix := value[:maxBytes-len(marker)]
-	for !utf8.ValidString(prefix) && len(prefix) > 0 {
-		prefix = prefix[:len(prefix)-1]
-	}
-	return prefix + marker, true
+	o.hookRuntime().AfterTool(hookLifecycleContext(ctx), execution.Ref, input, hook.ToolOutput{Status: hookToolStatus(string(result.Status)), Content: content, Error: resultError}, duration)
 }
 
-func unavailableToolRegistryResult(call tool.Call) tool.Result {
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具注册中心不可用", Error: &tool.Error{Code: tool.ErrToolNotFound, Message: "工具注册中心不可用", Recoverable: true}}
+func (o *Orchestrator) unavailableToolRegistryResult(call tool.Call) tool.Result {
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusError, Summary: "工具注册中心不可用", Error: &tool.Error{Code: tool.ErrToolNotFound, Message: "工具注册中心不可用", Recoverable: true}})
 }
 
-func unknownToolResult(call tool.Call) tool.Result {
+func (o *Orchestrator) unknownToolResult(call tool.Call) tool.Result {
 	message := fmt.Sprintf("工具 %q 未注册或在当前 Skill 中不可见", call.Name)
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: fmt.Sprintf("未知工具: %s", call.Name), Content: message, Error: &tool.Error{Code: tool.ErrToolNotFound, Message: message, Recoverable: true}}
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusError, Summary: fmt.Sprintf("未知工具: %s", call.Name), Preview: message, Error: &tool.Error{Code: tool.ErrToolNotFound, Message: message, Recoverable: true}})
 }
 
-func invalidToolArgumentsResult(call tool.Call, err error) tool.Result {
+func (o *Orchestrator) invalidToolArgumentsResult(call tool.Call, err error) tool.Result {
 	message := "工具参数必须是单个 JSON object"
 	if err != nil {
 		message = err.Error()
 	}
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具参数不是有效 JSON object", Content: message, Error: &tool.Error{Code: tool.ErrInvalidArguments, Message: message, Recoverable: true}}
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusError, Summary: "工具参数不是有效 JSON object", Preview: message, Error: &tool.Error{Code: tool.ErrInvalidArguments, Message: message, Recoverable: true}})
 }
 
-func unavailableToolExecutorResult(call tool.Call) tool.Result {
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "工具执行器不可用", Error: &tool.Error{Code: tool.ErrToolNotFound, Message: "工具执行器不可用", Recoverable: true}}
+func (o *Orchestrator) unavailableToolExecutorResult(call tool.Call) tool.Result {
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusError, Summary: "工具执行器不可用", Error: &tool.Error{Code: tool.ErrToolNotFound, Message: "工具执行器不可用", Recoverable: true}})
 }
 
-func unavailablePermissionResult(call tool.Call) tool.Result {
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusError, Summary: "权限系统不可用", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true}}
+func (o *Orchestrator) unavailablePermissionResult(call tool.Call) tool.Result {
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusError, Summary: "权限系统不可用", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "权限系统不可用", Recoverable: true}})
 }
 
-func unavailablePermissionTicketResult(call tool.Call) tool.Result {
-	return tool.Result{CallID: call.ID, Name: call.Name, Status: tool.StatusDenied, Summary: "权限授权结果无效", Content: "Permission authorization did not produce a valid execution ticket.", Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: "Permission authorization did not produce a valid execution ticket.", Recoverable: true}}
+func (o *Orchestrator) unavailablePermissionTicketResult(call tool.Call) tool.Result {
+	message := "Permission authorization did not produce a valid execution ticket."
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusDenied, Summary: "权限授权结果无效", Preview: message, Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: message, Recoverable: true}})
 }
 
-func planModeDecision(call tool.Call) permission.Decision {
-	return permission.Decision{
-		Kind:         permission.DecisionDeny,
-		Reason:       permission.ReasonPlanMode,
-		Source:       permission.Source{Kind: permission.SourceHardConstraint, Description: "plan mode"},
-		UserMessage:  "Plan Mode 下不允许执行写工具或 Bash",
-		ModelMessage: "Plan Mode allows only read-only tools.",
-		Recoverable:  true,
-	}
-}
-
-func normalizationFailureDecision(call tool.Call) permission.Decision {
-	return permission.Decision{
-		Kind:         permission.DecisionDeny,
-		Reason:       permission.ReasonConfigError,
-		Source:       permission.Source{Kind: permission.SourceHardConstraint, Description: "invalid tool arguments"},
-		UserMessage:  "工具参数无法用于权限判断",
-		ModelMessage: "Tool arguments are invalid for permission checking.",
-		Recoverable:  true,
-	}
-}
-
-func permissionAction(decision events.ToolConfirmationDecision) permission.UserAction {
-	switch decision.Action {
-	case events.PermissionAllowOnce:
-		return permission.ActionAllowOnce
-	case events.PermissionAllowSession:
-		return permission.ActionAllowSession
-	case events.PermissionAllowPermanent:
-		return permission.ActionAllowPermanent
-	case events.PermissionCancel:
-		return permission.ActionCancel
-	case events.PermissionDeny:
-		return permission.ActionDeny
-	}
-	if decision.Allowed {
-		return permission.ActionAllowOnce
-	}
-	return permission.ActionDeny
-}
-
-func (o *Orchestrator) permissionContext(mode RunMode) permission.Context {
-	permissionMode := o.permissionMode
-	if permissionMode == "" {
-		permissionMode = permission.ModeDefault
-	}
-	return permission.Context{ProjectRoot: o.projectRoot(), Mode: permissionMode, PlanMode: mode == RunModePlan}
-}
-
-func (o *Orchestrator) permissionContextWithReadScope(ctx context.Context, mode RunMode) permission.Context {
-	result := o.permissionContext(mode)
-	if scope, ok := tool.ReadScopeFromContext(ctx); ok {
-		result.ReadRoots = append([]string(nil), scope.ExtraRoots...)
-	}
-	return result
-}
-
-func permissionCall(call tool.Call) permission.Call {
-	return permission.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.ArgumentsJSON}
-}
-
-func permissionDeniedResult(call tool.Call, decision permission.Decision) tool.Result {
+func (o *Orchestrator) permissionDeniedResult(call tool.Call, decision permission.Decision) tool.Result {
 	message := permission.DeniedModelMessage(decision)
 	summary := "Permission denied before executing " + call.Name
 	if decision.UserMessage != "" {
 		summary = decision.UserMessage
 	}
-	return tool.Result{
-		CallID:  call.ID,
-		Name:    call.Name,
-		Status:  tool.StatusDenied,
-		Summary: summary,
-		Content: message,
-		Data:    permission.DeniedResultData(decision),
-		Error:   &tool.Error{Code: tool.ErrPermissionDenied, Message: message, Recoverable: true},
+	return o.syntheticToolResult(tool.ResultFactoryInput{CallID: call.ID, Name: call.Name, State: tool.Rejected, Status: tool.StatusDenied, Summary: summary, Preview: message, Error: &tool.Error{Code: tool.ErrPermissionDenied, Message: message, Recoverable: true}})
+}
+
+func (o *Orchestrator) syntheticToolResult(input tool.ResultFactoryInput) tool.Result {
+	if o != nil && o.resultFactory != nil {
+		result, err := o.resultFactory.Build(input)
+		if err == nil {
+			return result
+		}
+		// Candidate construction failures remain invalid and must fail closed at
+		// the single projection boundary; never fall back to a legacy Result.
+		return tool.Result{}
 	}
+	return tool.Result{CallID: input.CallID, Name: input.Name, Status: input.Status, Summary: input.Summary, Content: input.Preview, Error: input.Error, Truncated: input.Truncated}
 }
 
 func isReadOnlyTool(name string) bool {

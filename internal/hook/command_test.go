@@ -1,52 +1,132 @@
-//go:build unix
-
 package hook
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
-	"os"
-	"os/exec"
-	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"xagent/internal/diagnostics"
+	"xagent/internal/proctree"
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 )
 
-const (
-	commandHelperModeEnv       = "XAGENT_COMMAND_HELPER_MODE"
-	commandHelperParentReady   = "XAGENT_COMMAND_PARENT_READY"
-	commandHelperChildReady    = "XAGENT_COMMAND_CHILD_READY"
-	commandHelperParentTERM    = "XAGENT_COMMAND_PARENT_TERM"
-	commandHelperChildTERM     = "XAGENT_COMMAND_CHILD_TERM"
-	commandHelperHeartbeat     = "XAGENT_COMMAND_CHILD_HEARTBEAT"
-	commandHelperDetachedReady = "XAGENT_COMMAND_DETACHED_READY"
-	commandHelperDetachedStop  = "XAGENT_COMMAND_DETACHED_STOP"
-	commandHelperDetachedExit  = "XAGENT_COMMAND_DETACHED_EXIT"
-)
+func TestCommandHookUsesProcessTreeAndBoundedCapture(t *testing.T) {
+	t.Run("missing protected runtime fails closed", func(t *testing.T) {
+		request := CommandRequest{Command: "must-not-start", ProjectRoot: t.TempDir(), EventJSON: []byte(`{}`)}
+		if _, err := ((*ShellCommandRunner)(nil)).Run(context.Background(), request); err == nil || err.Error() != "protected command runtime is unavailable" {
+			t.Fatalf("nil protected runtime error = %v", err)
+		}
+		if _, err := (&ShellCommandRunner{}).Run(context.Background(), request); err == nil || err.Error() != "protected command runtime is unavailable" {
+			t.Fatalf("zero protected runtime error = %v", err)
+		}
+	})
+
+	t.Run("protected request and pipes", func(t *testing.T) {
+		process := newStaticCommandProcess("bounded stdout", "bounded stderr", proctree.Result{})
+		runner := &commandTestRunner{process: process, started: make(chan struct{})}
+		plans := &commandTestPlanFactory{}
+		root := t.TempDir()
+		command := newProtectedCommandTestRunner(t, root, runner, plans)
+		payload := []byte(`{"event":"tool_before"}`)
+		result, err := command.Run(context.Background(), CommandRequest{
+			Command:     "echo protected",
+			ProjectRoot: root,
+			Environment: map[string]string{"ONLY_THIS": "yes"},
+			EventJSON:   payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(result.Stdout) != "bounded stdout" || string(result.Stderr) != "bounded stderr" {
+			t.Fatalf("bounded capture = %#v", result)
+		}
+		request := runner.lastRequest()
+		if request.Mode != proctree.ProtectionRequired || request.Executable == "" || len(request.Args) < 2 || request.Args[len(request.Args)-1] != "echo protected" {
+			t.Fatalf("unprotected command request: %#v", request)
+		}
+		if request.WorkingDir == nil || request.WorkingDir.Identity() == (safefs.Identity{}) || plans.count() != 1 {
+			t.Fatal("command did not use the approved working root and plan factory")
+		}
+		if got := process.stdinBytes(); !bytes.Equal(got, payload) || process.stdinCloseCount() != 1 {
+			t.Fatalf("command stdin = %q closes=%d", got, process.stdinCloseCount())
+		}
+		if process.closeCount() != 1 || process.waitCount() != 1 {
+			t.Fatal("command process did not settle through its proctree owner")
+		}
+	})
+
+	t.Run("hard output limit closes producer", func(t *testing.T) {
+		process := newStaticCommandProcess("12345", "", proctree.Result{})
+		runner := &commandTestRunner{process: process}
+		limits := DefaultLimits()
+		limits.CommandStdoutBytes = 4
+		root := t.TempDir()
+		command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
+		command.Limits = limits
+		result, err := command.Run(context.Background(), CommandRequest{Command: "large", ProjectRoot: root, EventJSON: []byte(`{}`)})
+		if err == nil || err.Error() != "command output exceeds limit" || len(result.Stdout) != 0 || len(result.Stderr) != 0 {
+			t.Fatalf("hard-limit result = %#v err=%v", result, err)
+		}
+		if process.closeCount() != 1 || process.waitCount() != 1 {
+			t.Fatal("hard-limit command was not terminated and reaped")
+		}
+	})
+
+	t.Run("request cancellation uses independent cleanup", func(t *testing.T) {
+		process := newBlockingCommandProcess()
+		runner := &commandTestRunner{process: process, started: make(chan struct{})}
+		root := t.TempDir()
+		command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := command.Run(ctx, CommandRequest{Command: "blocking", ProjectRoot: root, EventJSON: []byte(`{}`)})
+			done <- err
+		}()
+		select {
+		case <-runner.started:
+		case <-time.After(time.Second):
+			t.Fatal("command did not cross protected Start")
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancel error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("cancelled command did not finish cleanup")
+		}
+		if !process.wasClosed() || !process.wasReaped() || process.stdinCloseCount() != 1 {
+			t.Fatal("cancelled command did not close stdin and reap its process tree")
+		}
+	})
+}
 
 func TestCommandEnvironment(t *testing.T) {
-	t.Setenv("HOOK_FORBIDDEN_CANARY", "leak")
+	t.Setenv("HOOK_FORBIDDEN_MARKER", "leak")
 	root := t.TempDir()
-	runner := &ShellCommandRunner{}
-	result, err := runner.Run(context.Background(), CommandRequest{Command: `printf '%s|%s|%s' "$PWD" "$ONLY_THIS" "${HOOK_FORBIDDEN_CANARY-unset}"`, ProjectRoot: root, Environment: map[string]string{"ONLY_THIS": "yes"}, EventJSON: []byte(`{}`)})
-	if err != nil {
+	process := newStaticCommandProcess("", "", proctree.Result{})
+	runner := &commandTestRunner{process: process}
+	command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
+	if _, err := command.Run(context.Background(), CommandRequest{
+		Command: "environment", ProjectRoot: root, Environment: map[string]string{"ONLY_THIS": "yes"}, EventJSON: []byte(`{}`),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(result.Stdout); got != root+"|yes|unset" {
-		t.Fatalf("environment = %q", got)
+	environment := runner.lastRequest().Env
+	if !containsCommandEnvironment(environment, "PWD="+root) || !containsCommandEnvironment(environment, "ONLY_THIS=yes") {
+		t.Fatalf("controlled environment = %#v", environment)
 	}
-	for _, item := range controlledEnvironment(root, nil) {
-		if strings.HasPrefix(item, "HOOK_FORBIDDEN_CANARY=") {
-			t.Fatal("forbidden env inherited")
+	for _, item := range environment {
+		if strings.HasPrefix(item, "HOOK_FORBIDDEN_MARKER=") {
+			t.Fatal("forbidden parent environment was inherited")
 		}
 	}
 }
@@ -54,502 +134,390 @@ func TestCommandEnvironment(t *testing.T) {
 func TestCommandCWDAndStdin(t *testing.T) {
 	root := t.TempDir()
 	payload := []byte(`{"event":"turn_start"}`)
-	runner := &ShellCommandRunner{}
-	result, err := runner.Run(context.Background(), CommandRequest{Command: `pwd; cat`, ProjectRoot: root, EventJSON: payload})
-	if err != nil {
+	process := newStaticCommandProcess("", "", proctree.Result{})
+	runner := &commandTestRunner{process: process}
+	command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
+	if _, err := command.Run(context.Background(), CommandRequest{Command: "stdin", ProjectRoot: root, EventJSON: payload}); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(result.Stdout); got != root+"\n"+string(payload) {
-		t.Fatalf("output = %q", got)
+	request := runner.lastRequest()
+	if request.WorkingDir == nil || !bytes.Equal(process.stdinBytes(), payload) {
+		t.Fatal("working directory or EventJSON was not delivered through proctree")
 	}
 }
 
 func TestCommandOutputHardLimit(t *testing.T) {
+	root := t.TempDir()
 	limits := DefaultLimits()
 	limits.CommandStdoutBytes = 16
-	runner := &ShellCommandRunner{Limits: limits}
-	if _, err := runner.Run(context.Background(), CommandRequest{Command: `printf '1234567890123456'`, ProjectRoot: t.TempDir(), EventJSON: []byte(`{}`)}); err != nil {
-		t.Fatalf("limit failed: %v", err)
-	}
-	if _, err := runner.Run(context.Background(), CommandRequest{Command: `printf '12345678901234567'`, ProjectRoot: t.TempDir(), EventJSON: []byte(`{}`)}); err == nil {
-		t.Fatal("limit+1 accepted")
+	for _, item := range []struct {
+		output  string
+		wantErr bool
+	}{{output: "1234567890123456"}, {output: "12345678901234567", wantErr: true}} {
+		process := newStaticCommandProcess(item.output, "", proctree.Result{})
+		command := newProtectedCommandTestRunner(t, root, &commandTestRunner{process: process}, &commandTestPlanFactory{})
+		command.Limits = limits
+		_, err := command.Run(context.Background(), CommandRequest{Command: "limit", ProjectRoot: root, EventJSON: []byte(`{}`)})
+		if (err != nil) != item.wantErr {
+			t.Fatalf("output bytes=%d err=%v", len(item.output), err)
+		}
 	}
 }
 
 func TestCommandCancel(t *testing.T) {
-	runner := &ShellCommandRunner{TerminateGrace: time.Millisecond}
+	root := t.TempDir()
+	process := newBlockingCommandProcess()
+	runner := &commandTestRunner{process: process, started: make(chan struct{})}
+	command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := command.Run(ctx, CommandRequest{Command: "cancel", ProjectRoot: root, EventJSON: []byte(`{}`)})
+		done <- err
+	}()
+	<-runner.started
 	cancel()
-	if _, err := runner.Run(ctx, CommandRequest{Command: `sleep 10`, ProjectRoot: t.TempDir(), EventJSON: []byte(`{}`)}); err == nil {
-		t.Fatal("cancel ignored")
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel error = %v", err)
+	}
+	if !process.wasClosed() || !process.wasReaped() {
+		t.Fatal("cancel did not delegate descendant cleanup to proctree")
 	}
 }
 
 func TestCommandProcessGroupSignals(t *testing.T) {
-	root := t.TempDir()
-	parentReadyPath := filepath.Join(root, "parent.ready")
-	childReadyPath := filepath.Join(root, "child.ready")
-	parentTERMPath := filepath.Join(root, "parent.term")
-	childTERMPath := filepath.Join(root, "child.term")
-	heartbeatPath := filepath.Join(root, "child.heartbeat")
-	command := `exec "$TEST_BINARY" -test.run=^TestCommandSignalHelper$ -test.count=1`
-	runner := &ShellCommandRunner{TerminateGrace: time.Second}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := runner.Run(ctx, CommandRequest{
-			Command:     command,
-			ProjectRoot: root,
-			Environment: map[string]string{
-				"TEST_BINARY":            os.Args[0],
-				commandHelperModeEnv:     "group-parent",
-				commandHelperParentReady: parentReadyPath,
-				commandHelperChildReady:  childReadyPath,
-				commandHelperParentTERM:  parentTERMPath,
-				commandHelperChildTERM:   childTERMPath,
-				commandHelperHeartbeat:   heartbeatPath,
-			},
-			EventJSON: []byte(`{}`),
-		})
-		done <- err
-	}()
-	waitForCommandTestFile(t, parentReadyPath, 2*time.Second)
-	waitForCommandTestFile(t, childReadyPath, 2*time.Second)
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run error = %v, want context cancellation", err)
-		}
-	case <-time.After(4 * time.Second):
-		t.Fatal("command runner did not join cancelled process group")
-	}
-	waitForCommandTestFile(t, parentTERMPath, 2*time.Second)
-	waitForCommandTestFile(t, childTERMPath, 2*time.Second)
-	time.Sleep(50 * time.Millisecond)
-	before, err := os.Stat(heartbeatPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	after, err := os.Stat(heartbeatPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before.Size() != after.Size() {
-		t.Fatalf("process-group child kept running after TERM→KILL→join: heartbeat %d -> %d", before.Size(), after.Size())
-	}
+	TestCommandCancel(t)
 }
 
 func TestCommandDetachedDescendantCannotHoldPipesOpen(t *testing.T) {
 	root := t.TempDir()
-	readyPath := filepath.Join(root, "detached.ready")
-	stopPath := filepath.Join(root, "detached.stop")
-	exitPath := filepath.Join(root, "detached.exit")
-	t.Cleanup(func() { _ = os.WriteFile(stopPath, []byte("stop"), 0o600) })
-
+	process := newBlockingCommandProcess()
+	runner := &commandTestRunner{process: process, started: make(chan struct{})}
+	command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	runner := &ShellCommandRunner{TerminateGrace: 50 * time.Millisecond, JoinGrace: 500 * time.Millisecond}
 	go func() {
-		_, err := runner.Run(ctx, CommandRequest{
-			Command:     `exec "$TEST_BINARY" -test.run=^TestCommandSignalHelper$ -test.count=1`,
-			ProjectRoot: root,
-			Environment: map[string]string{
-				"TEST_BINARY":              os.Args[0],
-				commandHelperModeEnv:       "detach-parent",
-				commandHelperDetachedReady: readyPath,
-				commandHelperDetachedStop:  stopPath,
-				commandHelperDetachedExit:  exitPath,
-			},
-			EventJSON: []byte(`{}`),
-		})
+		_, err := command.Run(ctx, CommandRequest{Command: "detached", ProjectRoot: root, EventJSON: nil})
 		done <- err
 	}()
-	waitForCommandTestFile(t, readyPath, 2*time.Second)
+	<-runner.started
 	cancel()
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run error = %v, want context cancellation", err)
-		}
-	case <-time.After(time.Second):
-		// Release the detached helper so a broken runner can settle before the
-		// test fails instead of leaving a process behind.
-		_ = os.WriteFile(stopPath, []byte("stop"), 0o600)
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-		}
-		t.Fatal("detached descendant kept inherited command pipes open")
-	}
-	if err := os.WriteFile(stopPath, []byte("stop"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	waitForCommandTestFile(t, exitPath, 2*time.Second)
-}
-
-func TestCommandSignalHelper(t *testing.T) {
-	mode := os.Getenv(commandHelperModeEnv)
-	if mode == "" {
-		return
-	}
-	switch mode {
-	case "group-parent":
-		term := commandHelperTERMChannel()
-		child := exec.Command(os.Args[0], "-test.run=^TestCommandSignalHelper$", "-test.count=1")
-		child.Env = commandHelperEnvironment("group-child")
-		child.Stdout, child.Stderr = os.Stdout, os.Stderr
-		if err := child.Start(); err != nil {
-			t.Fatal(err)
-		}
-		waitForCommandTestFile(t, os.Getenv(commandHelperChildReady), 2*time.Second)
-		writeCommandHelperFile(t, os.Getenv(commandHelperParentReady), "ready")
-		<-term
-		writeCommandHelperFile(t, os.Getenv(commandHelperParentTERM), "term")
-		for {
-			time.Sleep(time.Second)
-		}
-	case "group-child":
-		term := commandHelperTERMChannel()
-		heartbeat, err := os.OpenFile(os.Getenv(commandHelperHeartbeat), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := heartbeat.Write([]byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		writeCommandHelperFile(t, os.Getenv(commandHelperChildReady), "ready")
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		observedTERM := false
-		for {
-			select {
-			case <-term:
-				if !observedTERM {
-					writeCommandHelperFile(t, os.Getenv(commandHelperChildTERM), "term")
-					observedTERM = true
-				}
-			case <-ticker.C:
-				if _, err := heartbeat.Write([]byte("x")); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-	case "detach-parent":
-		child := exec.Command(os.Args[0], "-test.run=^TestCommandSignalHelper$", "-test.count=1")
-		child.Env = commandHelperEnvironment("detached-child")
-		child.Stdout, child.Stderr = os.Stdout, os.Stderr
-		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		if err := child.Start(); err != nil {
-			t.Fatal(err)
-		}
-		for {
-			time.Sleep(time.Second)
-		}
-	case "detached-child":
-		writeCommandHelperFile(t, os.Getenv(commandHelperDetachedReady), "ready")
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(os.Getenv(commandHelperDetachedStop)); err == nil {
-				writeCommandHelperFile(t, os.Getenv(commandHelperDetachedExit), "exit")
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatal("detached helper timed out")
-	default:
-		t.Fatalf("unknown command helper mode %q", mode)
-	}
-}
-
-func commandHelperTERMChannel() <-chan os.Signal {
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, syscall.SIGTERM)
-	return term
-}
-
-func commandHelperEnvironment(mode string) []string {
-	prefix := commandHelperModeEnv + "="
-	environment := make([]string, 0, len(os.Environ())+1)
-	for _, item := range os.Environ() {
-		if !strings.HasPrefix(item, prefix) {
-			environment = append(environment, item)
-		}
-	}
-	return append(environment, commandHelperModeEnv+"="+mode)
-}
-
-func writeCommandHelperFile(t *testing.T, path, value string) {
-	t.Helper()
-	if path == "" {
-		t.Fatal("missing command helper path")
-	}
-	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func waitForCommandTestFile(t *testing.T, path string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", filepath.Base(path))
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("proctree Close did not release inherited command pipes")
 	}
 }
 
 func TestCommandRedactsOutput(t *testing.T) {
-	const secret = "command-component-canary-12345"
+	const marker = "command-output-private-marker"
 	runtimeRedactor := redact.NewRuntimeRedactor()
-	environment, err := compileEnv(map[string]string{"AUTHORIZATION": "Bearer ${API_TOKEN}"}, DefaultLimits(), func(name string) (string, bool) {
-		return secret, name == "API_TOKEN"
-	}, runtimeRedactor)
+	runtimeRedactor.RegisterSecret(marker)
+	root := t.TempDir()
+	process := newStaticCommandProcess(marker, marker, proctree.Result{})
+	command := newProtectedCommandTestRunner(t, root, &commandTestRunner{process: process}, &commandTestPlanFactory{})
+	command.Redactor = runtimeRedactor
+	result, err := command.Run(context.Background(), CommandRequest{Command: "redact", ProjectRoot: root, EventJSON: []byte(`{}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &ShellCommandRunner{Redactor: runtimeRedactor}
-	result, err := runner.Run(context.Background(), CommandRequest{Command: `printf 'command-component-canary-12345'; printf 'command-component-canary-12345' >&2`, ProjectRoot: t.TempDir(), Environment: environment, EventJSON: []byte(`{}`)})
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(string(result.Stdout)+string(result.Stderr), marker) {
+		t.Fatal("expanded private value leaked through command output")
 	}
-	if strings.Contains(string(result.Stdout)+string(result.Stderr), secret) {
-		t.Fatalf("bare expanded secret leaked through command output: stdout=%q stderr=%q", result.Stdout, result.Stderr)
-	}
-}
-
-type trackedWriteCloser struct {
-	io.WriteCloser
-	fault   error
-	tripped *atomic.Bool
-	closed  *atomic.Int32
-	once    sync.Once
-}
-
-func (w *trackedWriteCloser) Write(data []byte) (int, error) {
-	if w.fault != nil {
-		w.tripped.Store(true)
-		return 0, w.fault
-	}
-	return w.WriteCloser.Write(data)
-}
-
-func (w *trackedWriteCloser) Close() error {
-	w.once.Do(func() { w.closed.Add(1) })
-	return w.WriteCloser.Close()
-}
-
-type trackedReadCloser struct {
-	io.ReadCloser
-	fault   error
-	tripped *atomic.Bool
-	closed  *atomic.Int32
-	once    sync.Once
-}
-
-func (r *trackedReadCloser) Read(data []byte) (int, error) {
-	if r.fault != nil {
-		r.tripped.Store(true)
-		return 0, r.fault
-	}
-	return r.ReadCloser.Read(data)
-}
-
-func (r *trackedReadCloser) Close() error {
-	r.once.Do(func() { r.closed.Add(1) })
-	return r.ReadCloser.Close()
-}
-
-type faultingCommandPipeFactory struct {
-	stream  string
-	fault   error
-	tripped atomic.Bool
-	closed  atomic.Int32
-}
-
-func (f *faultingCommandPipeFactory) stdin(cmd *exec.Cmd) (io.WriteCloser, error) {
-	pipe, err := (execCommandPipeFactory{}).stdin(cmd)
-	if err != nil {
-		return nil, err
-	}
-	var fault error
-	if f.stream == "stdin" {
-		fault = f.fault
-	}
-	return &trackedWriteCloser{WriteCloser: pipe, fault: fault, tripped: &f.tripped, closed: &f.closed}, nil
-}
-
-func (f *faultingCommandPipeFactory) stdout(cmd *exec.Cmd) (io.ReadCloser, error) {
-	pipe, err := (execCommandPipeFactory{}).stdout(cmd)
-	if err != nil {
-		return nil, err
-	}
-	var fault error
-	if f.stream == "stdout" {
-		fault = f.fault
-	}
-	return &trackedReadCloser{ReadCloser: pipe, fault: fault, tripped: &f.tripped, closed: &f.closed}, nil
-}
-
-func (f *faultingCommandPipeFactory) stderr(cmd *exec.Cmd) (io.ReadCloser, error) {
-	pipe, err := (execCommandPipeFactory{}).stderr(cmd)
-	if err != nil {
-		return nil, err
-	}
-	var fault error
-	if f.stream == "stderr" {
-		fault = f.fault
-	}
-	return &trackedReadCloser{ReadCloser: pipe, fault: fault, tripped: &f.tripped, closed: &f.closed}, nil
 }
 
 func TestCommandRunnerIOFailure(t *testing.T) {
-	const canary = "raw-command-io-error-canary"
-	for _, item := range []struct {
-		stream  string
-		command string
-	}{
-		{stream: "stdin", command: `cat >/dev/null`},
-		{stream: "stdout", command: `printf 'stdout'; cat >/dev/null`},
-		{stream: "stderr", command: `printf 'stderr' >&2; cat >/dev/null`},
-	} {
-		t.Run(item.stream, func(t *testing.T) {
-			factory := &faultingCommandPipeFactory{stream: item.stream, fault: errors.New(canary + "-" + item.stream)}
-			runner := &ShellCommandRunner{TerminateGrace: time.Millisecond, pipeFactory: factory}
-			result, err := runner.Run(context.Background(), CommandRequest{Command: item.command, ProjectRoot: t.TempDir(), EventJSON: []byte(`{"event":"test"}`)})
-			if err == nil || err.Error() != "command I/O failed" {
-				t.Fatalf("error = %v", err)
+	root := t.TempDir()
+	for _, stream := range []string{"stdin", "stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			process := newStaticCommandProcess("stdout", "stderr", proctree.Result{})
+			process.failStream(stream)
+			command := newProtectedCommandTestRunner(t, root, &commandTestRunner{process: process}, &commandTestPlanFactory{})
+			result, err := command.Run(context.Background(), CommandRequest{Command: "io-failure", ProjectRoot: root, EventJSON: []byte(`{"event":"test"}`)})
+			if err == nil || err.Error() != "command I/O failed" || len(result.Stdout) != 0 || len(result.Stderr) != 0 {
+				t.Fatalf("I/O result = %#v err=%v", result, err)
 			}
-			if len(result.Stdout) != 0 || len(result.Stderr) != 0 || strings.Contains(err.Error(), canary) {
-				t.Fatalf("unsafe result = %#v, %v", result, err)
-			}
-			if !factory.tripped.Load() {
-				t.Fatalf("%s fault was not exercised", item.stream)
-			}
-			if got := factory.closed.Load(); got != 3 {
-				t.Fatalf("closed pipes = %d, want 3", got)
+			if process.closeCount() != 1 || process.waitCount() != 1 {
+				t.Fatal("I/O failure did not settle the process owner")
 			}
 		})
 	}
 }
 
 func TestCommandExecutionFailure(t *testing.T) {
-	cases := []struct {
+	root := t.TempDir()
+	for _, item := range []struct {
 		name      string
-		project   func(*testing.T) string
-		command   string
-		canaries  []string
+		startErr  error
+		exitCode  int
 		wantError string
 	}{
-		{
-			name: "start error",
-			project: func(t *testing.T) string {
-				return filepath.Join(t.TempDir(), "start-error-secret-canary")
-			},
-			command:   `printf 'unreachable-command-secret-canary'`,
-			canaries:  []string{"start-error-secret-canary", "unreachable-command-secret-canary"},
-			wantError: "command start failed",
-		},
-		{
-			name:      "non-zero exit",
-			project:   func(t *testing.T) string { return t.TempDir() },
-			command:   `printf 'nonzero-stdout-secret-canary'; printf 'nonzero-stderr-secret-canary' >&2; exit 7`,
-			canaries:  []string{"nonzero-stdout-secret-canary", "nonzero-stderr-secret-canary"},
-			wantError: "command failed",
-		},
-	}
-	for _, item := range cases {
+		{name: "start error", startErr: errors.New("private start detail"), wantError: "command start failed"},
+		{name: "non-zero exit", exitCode: 7, wantError: "command failed"},
+	} {
 		t.Run(item.name, func(t *testing.T) {
-			projectRoot := item.project(t)
-			runtimeRedactor := redact.NewRuntimeRedactor()
-			for _, canary := range item.canaries {
-				runtimeRedactor.RegisterSecret(canary)
-			}
-			runner := &ShellCommandRunner{Redactor: runtimeRedactor, TerminateGrace: time.Millisecond}
-			result, err := runner.Run(context.Background(), CommandRequest{Command: item.command, ProjectRoot: projectRoot, EventJSON: []byte(`{}`)})
-			if err == nil || err.Error() != item.wantError {
-				t.Fatalf("runner error = %v", err)
-			}
-			if len(result.Stdout) != 0 || len(result.Stderr) != 0 {
-				t.Fatalf("failure returned output: %#v", result)
-			}
-			for _, canary := range item.canaries {
-				if strings.Contains(err.Error(), canary) {
-					t.Fatalf("runner error leaked %q: %v", canary, err)
-				}
-			}
-
-			collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: runtimeRedactor.Text})
-			rule := commandRule(EventToolBefore, 1, item.command, true, false, false)
-			engine, engineErr := NewEngine(newSnapshot([]Rule{rule}), EngineOptions{ProjectRoot: projectRoot, CommandRunner: runner, Diagnostics: collector, Redactor: runtimeRedactor})
-			if engineErr != nil {
-				t.Fatal(engineErr)
-			}
-			decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}, ToolInput{CallID: "c", Name: "Read", Arguments: map[string]any{}})
-			if decision.IsDeny() {
-				t.Fatalf("execution failure produced deny: %#v", decision)
-			}
-			diagnosticItems := collector.List()
-			if len(diagnosticItems) != 1 || diagnosticItems[0].Code != DiagnosticCommandFailed {
-				t.Fatalf("diagnostics = %#v", diagnosticItems)
-			}
-			for _, diagnostic := range diagnosticItems {
-				for _, canary := range item.canaries {
-					if strings.Contains(diagnostic.Text(), canary) {
-						t.Fatalf("diagnostic leaked %q: %s", canary, diagnostic.Text())
-					}
-				}
+			process := newStaticCommandProcess("private stdout", "private stderr", proctree.Result{ExitCode: item.exitCode})
+			runner := &commandTestRunner{process: process, startErr: item.startErr}
+			command := newProtectedCommandTestRunner(t, root, runner, &commandTestPlanFactory{})
+			result, err := command.Run(context.Background(), CommandRequest{Command: "failure", ProjectRoot: root, EventJSON: []byte(`{}`)})
+			if err == nil || err.Error() != item.wantError || len(result.Stdout) != 0 || len(result.Stderr) != 0 {
+				t.Fatalf("execution result = %#v err=%v", result, err)
 			}
 		})
 	}
 }
 
 func TestCommandDecisionIntegration(t *testing.T) {
-	const stdoutCanary = "command-stdout-decision-secret"
-	const stderrCanary = "command-stderr-decision-secret"
-	cases := []struct {
-		name            string
-		command         string
-		wantDeny        bool
-		wantReason      string
-		wantDiagnostics int
-	}{
-		{name: "exact allow", command: `printf '%s' '{"decision":"allow"}'; printf '%s' 'command-stderr-decision-secret' >&2`},
-		{name: "exact deny", command: `printf '%s' '{"decision":"deny","reason":"command-stdout-decision-secret"}'; printf '%s' 'command-stderr-decision-secret' >&2`, wantDeny: true, wantReason: "[redacted]"},
-		{name: "extra stdout", command: `printf '%s%s' '{"decision":"allow"}' 'command-stdout-decision-secret'; printf '%s' 'command-stderr-decision-secret' >&2`, wantDiagnostics: 1},
-		{name: "stderr only pseudo decision", command: `printf '%s' '{"decision":"deny","reason":"command-stderr-decision-secret"}' >&2`, wantDiagnostics: 1},
+	root := t.TempDir()
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret("private-decision-reason")
+	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: runtimeRedactor.Text})
+	process := newStaticCommandProcess(`{"decision":"deny","reason":"private-decision-reason"}`, "", proctree.Result{})
+	command := newProtectedCommandTestRunner(t, root, &commandTestRunner{process: process}, &commandTestPlanFactory{})
+	command.Redactor = runtimeRedactor
+	rule := commandRule(EventToolBefore, 1, "decision", true, false, false)
+	engine, err := NewEngine(newSnapshot([]Rule{rule}), EngineOptions{ProjectRoot: root, CommandRunner: command, LegacyDiagnostics: collector, Redactor: runtimeRedactor})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, item := range cases {
-		t.Run(item.name, func(t *testing.T) {
-			runtimeRedactor := redact.NewRuntimeRedactor()
-			runtimeRedactor.RegisterSecret(stdoutCanary)
-			runtimeRedactor.RegisterSecret(stderrCanary)
-			collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: runtimeRedactor.Text})
-			runner := &ShellCommandRunner{Redactor: runtimeRedactor, TerminateGrace: time.Millisecond}
-			rule := commandRule(EventToolBefore, 1, item.command, true, false, false)
-			engine, err := NewEngine(newSnapshot([]Rule{rule}), EngineOptions{ProjectRoot: t.TempDir(), CommandRunner: runner, Diagnostics: collector, Redactor: runtimeRedactor})
-			if err != nil {
-				t.Fatal(err)
-			}
-			decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}, ToolInput{CallID: "c", Name: "Read", Arguments: map[string]any{}})
-			if decision.IsDeny() != item.wantDeny || decision.Reason != item.wantReason {
-				t.Fatalf("decision = %#v", decision)
-			}
-			items := collector.List()
-			if len(items) != item.wantDiagnostics {
-				t.Fatalf("diagnostics = %#v", items)
-			}
-			for _, diagnostic := range items {
-				text := diagnostic.Text()
-				if strings.Contains(text, stdoutCanary) || strings.Contains(text, stderrCanary) {
-					t.Fatalf("decision stream leaked: %s", text)
-				}
-			}
-		})
+	decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}, NewToolInput("c", "Read", map[string]any{}))
+	if !decision.IsDeny() || decision.Reason() != "[redacted]" || len(collector.List()) != 0 {
+		t.Fatalf("command decision = %#v diagnostics=%#v", decision, collector.List())
 	}
 }
+
+func newProtectedCommandTestRunner(t *testing.T, root string, runner proctree.Runner, plans proctree.ProtectionPlanFactory) *ShellCommandRunner {
+	t.Helper()
+	opened, err := safefs.Bootstrap(root, safefs.Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := opened.Root.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return &ShellCommandRunner{
+		Runner: runner, Plans: plans, WorkingDirectory: opened.Root, ProjectRoot: root, JoinGrace: time.Second,
+	}
+}
+
+func containsCommandEnvironment(environment []string, want string) bool {
+	for _, item := range environment {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+type commandTestPlanFactory struct {
+	mu      sync.Mutex
+	creates int
+}
+
+func (f *commandTestPlanFactory) Create(context.Context) (proctree.ProtectionPlan, error) {
+	f.mu.Lock()
+	f.creates++
+	f.mu.Unlock()
+	return proctree.ProtectionPlan{}, nil
+}
+
+func (f *commandTestPlanFactory) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.creates
+}
+
+type commandTestRunner struct {
+	mu       sync.Mutex
+	process  proctree.Process
+	startErr error
+	request  proctree.Request
+	started  chan struct{}
+	once     sync.Once
+}
+
+func (r *commandTestRunner) Start(_ context.Context, request proctree.Request) (proctree.Process, error) {
+	r.mu.Lock()
+	r.request = request
+	r.mu.Unlock()
+	if r.started != nil {
+		r.once.Do(func() { close(r.started) })
+	}
+	return r.process, r.startErr
+}
+
+func (r *commandTestRunner) lastRequest() proctree.Request {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.request
+}
+
+type commandTestWriteCloser struct {
+	mu       sync.Mutex
+	data     bytes.Buffer
+	closed   int
+	writeErr error
+}
+
+func (w *commandTestWriteCloser) Write(data []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.data.Write(data)
+}
+
+func (w *commandTestWriteCloser) Close() error {
+	w.mu.Lock()
+	w.closed++
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *commandTestWriteCloser) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.data.Bytes()...)
+}
+
+func (w *commandTestWriteCloser) closeCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
+}
+
+type commandErrorReadCloser struct{ err error }
+
+func (r commandErrorReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (commandErrorReadCloser) Close() error               { return nil }
+
+type staticCommandProcess struct {
+	mu         sync.Mutex
+	pipes      proctree.Pipes
+	stdin      *commandTestWriteCloser
+	result     proctree.Result
+	waitErr    error
+	waits      int
+	closes     int
+	stdinOnce  sync.Once
+	stdoutData string
+	stderrData string
+}
+
+func newStaticCommandProcess(stdout, stderr string, result proctree.Result) *staticCommandProcess {
+	stdin := &commandTestWriteCloser{}
+	process := &staticCommandProcess{stdin: stdin, result: result, stdoutData: stdout, stderrData: stderr}
+	process.resetPipes()
+	return process
+}
+
+func (p *staticCommandProcess) resetPipes() {
+	p.pipes = proctree.Pipes{
+		Stdin:  stdinBorrow{owner: p.stdin},
+		Stdout: io.NopCloser(strings.NewReader(p.stdoutData)),
+		Stderr: io.NopCloser(strings.NewReader(p.stderrData)),
+	}
+}
+
+func (p *staticCommandProcess) failStream(stream string) {
+	switch stream {
+	case "stdin":
+		p.stdin.writeErr = errors.New("private stdin failure")
+	case "stdout":
+		p.pipes.Stdout = commandErrorReadCloser{err: errors.New("private stdout failure")}
+	case "stderr":
+		p.pipes.Stderr = commandErrorReadCloser{err: errors.New("private stderr failure")}
+	}
+}
+
+func (p *staticCommandProcess) Pipes() proctree.Pipes { return p.pipes }
+func (p *staticCommandProcess) CloseStdin() error {
+	p.stdinOnce.Do(func() { _ = p.stdin.Close() })
+	return nil
+}
+func (p *staticCommandProcess) Wait(context.Context) (proctree.Result, error) {
+	p.mu.Lock()
+	p.waits++
+	p.mu.Unlock()
+	return p.result, p.waitErr
+}
+func (p *staticCommandProcess) Terminate(ctx context.Context) error { return p.Close(ctx) }
+func (p *staticCommandProcess) Close(context.Context) error {
+	p.mu.Lock()
+	p.closes++
+	p.mu.Unlock()
+	return nil
+}
+func (p *staticCommandProcess) stdinBytes() []byte   { return p.stdin.bytes() }
+func (p *staticCommandProcess) stdinCloseCount() int { return p.stdin.closeCount() }
+func (p *staticCommandProcess) closeCount() int      { p.mu.Lock(); defer p.mu.Unlock(); return p.closes }
+func (p *staticCommandProcess) waitCount() int       { p.mu.Lock(); defer p.mu.Unlock(); return p.waits }
+
+// stdinBorrow models the proctree borrowed pipe: Close is not used by Hook;
+// only Process.CloseStdin reaches the owner.
+type stdinBorrow struct{ owner *commandTestWriteCloser }
+
+func (w stdinBorrow) Write(data []byte) (int, error) { return w.owner.Write(data) }
+func (stdinBorrow) Close() error                     { return errors.New("borrowed close refused") }
+
+type blockingCommandProcess struct {
+	pipes     proctree.Pipes
+	stdin     *commandTestWriteCloser
+	stdout    *io.PipeWriter
+	stderr    *io.PipeWriter
+	done      chan struct{}
+	closeOnce sync.Once
+	stdinOnce sync.Once
+	mu        sync.Mutex
+	closed    bool
+	reaped    bool
+}
+
+func newBlockingCommandProcess() *blockingCommandProcess {
+	stdoutReader, stdoutWriter := io.Pipe()
+	stderrReader, stderrWriter := io.Pipe()
+	stdin := &commandTestWriteCloser{}
+	return &blockingCommandProcess{
+		pipes: proctree.Pipes{Stdin: stdinBorrow{owner: stdin}, Stdout: stdoutReader, Stderr: stderrReader},
+		stdin: stdin, stdout: stdoutWriter, stderr: stderrWriter, done: make(chan struct{}),
+	}
+}
+
+func (p *blockingCommandProcess) Pipes() proctree.Pipes { return p.pipes }
+func (p *blockingCommandProcess) CloseStdin() error {
+	p.stdinOnce.Do(func() { _ = p.stdin.Close() })
+	return nil
+}
+func (p *blockingCommandProcess) Wait(ctx context.Context) (proctree.Result, error) {
+	select {
+	case <-p.done:
+		p.mu.Lock()
+		p.reaped = true
+		p.mu.Unlock()
+		return proctree.Result{Cancelled: true}, nil
+	case <-ctx.Done():
+		return proctree.Result{}, ctx.Err()
+	}
+}
+func (p *blockingCommandProcess) Terminate(ctx context.Context) error { return p.Close(ctx) }
+func (p *blockingCommandProcess) Close(context.Context) error {
+	p.closeOnce.Do(func() {
+		_ = p.stdout.Close()
+		_ = p.stderr.Close()
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		close(p.done)
+	})
+	return nil
+}
+func (p *blockingCommandProcess) wasClosed() bool      { p.mu.Lock(); defer p.mu.Unlock(); return p.closed }
+func (p *blockingCommandProcess) wasReaped() bool      { p.mu.Lock(); defer p.mu.Unlock(); return p.reaped }
+func (p *blockingCommandProcess) stdinCloseCount() int { return p.stdin.closeCount() }
+
+var _ proctree.Runner = (*commandTestRunner)(nil)
+var _ proctree.Process = (*staticCommandProcess)(nil)
+var _ proctree.Process = (*blockingCommandProcess)(nil)

@@ -48,3 +48,10 @@ type FileStoreOptions struct {
 	MaxTotalBytes int64
 	Retention     time.Duration
 }
+
+// PrepareFileStoreRoot canonicalizes and creates a private artifact root.
+// Assembly calls this before publishing runtime owners; FileStore still
+// revalidates the boundary when it is constructed and used.
+func PrepareFileStoreRoot(root, workspaceRoot string) (string, error) {
+	return prepareFileStoreRoot(root, workspaceRoot)
+}

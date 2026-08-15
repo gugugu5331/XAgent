@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 )
@@ -30,7 +29,7 @@ func (s *fileStore) Cleanup(ctx context.Context) (CleanupResult, error) {
 		return CleanupResult{}, errors.New("artifact cleanup canceled")
 	default:
 	}
-	if err := ensurePrivateArtifactRoot(s.root); err != nil {
+	if err := s.ensurePrivateRootLocked(); err != nil {
 		return CleanupResult{}, errors.New("artifact cleanup unavailable")
 	}
 
@@ -43,8 +42,7 @@ func (s *fileStore) Cleanup(ctx context.Context) (CleanupResult, error) {
 			return result, errors.New("artifact cleanup canceled")
 		default:
 		}
-		path := filepath.Join(s.root, candidate.id+".artifact")
-		err := os.Remove(path)
+		err := s.privateRoot.remove(candidate.id + ".artifact")
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			result.Failed++
 			continue

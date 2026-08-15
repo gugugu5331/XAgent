@@ -166,7 +166,7 @@ func loadFile(path string, limits Limits) ([]candidateRule, error) {
 		rule, path := rawErrorLocation(err.path)
 		return nil, located(abs, rule, path, err.node, err.message)
 	}
-	rootMap, err := mapping(root, []string{"version", "hooks"}, []string{"version", "hooks"}, "$")
+	rootMap, err := mapping(root, []string{"version", "hooks"}, nil, "$")
 	if err != nil {
 		var parseErr *nodeError
 		if errors.As(err, &parseErr) {
@@ -174,11 +174,13 @@ func loadFile(path string, limits Limits) ([]candidateRule, error) {
 		}
 		return nil, located(abs, 0, "$", root, "invalid YAML structure")
 	}
-	version, err := intScalar(rootMap["version"])
-	if err != nil || version != 1 {
-		return nil, located(abs, 0, "version", rootMap["version"], "unsupported schema version")
+	if err := validateHookSchemaVersion(rootMap["version"]); err != nil {
+		return nil, located(abs, 0, "version", rootMap["version"], err.Error())
 	}
 	hooks := rootMap["hooks"]
+	if hooks == nil {
+		return nil, located(abs, 0, "hooks", root, "missing required field")
+	}
 	if hooks.Kind != yaml.SequenceNode {
 		return nil, located(abs, 0, "hooks", hooks, "must be a sequence")
 	}

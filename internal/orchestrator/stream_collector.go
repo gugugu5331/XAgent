@@ -10,6 +10,7 @@ import (
 
 	"xagent/internal/events"
 	"xagent/internal/provider"
+	"xagent/internal/redact"
 	"xagent/internal/tool"
 )
 
@@ -26,15 +27,69 @@ type StreamCollector struct {
 	Done          bool
 }
 
-func collectProviderStream(ctx context.Context, stream <-chan provider.StreamEvent, out chan<- events.Event) (StreamCollector, StopReason, error) {
+func collectProviderStream(ctx context.Context, stream provider.ChatStream, out chan<- events.Event) (StreamCollector, StopReason, error) {
 	return collectProviderStreamWithRedactor(ctx, stream, out, nil, 64)
 }
 
-func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provider.StreamEvent, out chan<- events.Event, redactor func(string) string, lookbehind int) (StreamCollector, StopReason, error) {
-	var collector StreamCollector
-	if redactor == nil {
-		redactor = func(value string) string { return value }
+// collectAndCloseProviderStreamWithRedactor is the single Orchestrator owner
+// for a successfully created Provider stream. Close is registered before the
+// event channel is inspected, so invalid streams, normal completion, Provider
+// errors, cancellation, and an output consumer exiting early all converge on
+// the same exactly-once close path.
+func collectAndCloseProviderStreamWithRedactor(
+	ctx context.Context,
+	stream provider.ChatStream,
+	out chan<- events.Event,
+	redactor func(string) string,
+	lookbehind int,
+) (collector StreamCollector, reason StopReason, err error) {
+	return ownProviderStreamWithRedactor(ctx, stream, nil, out, redactor, lookbehind)
+}
+
+// ownProviderStreamWithRedactor also owns partially initialized streams
+// returned together with a StreamChat error. A non-nil stream is registered
+// for Close before the start error is inspected.
+func ownProviderStreamWithRedactor(
+	ctx context.Context,
+	stream provider.ChatStream,
+	startErr error,
+	out chan<- events.Event,
+	redactor func(string) string,
+	lookbehind int,
+) (collector StreamCollector, reason StopReason, err error) {
+	if stream == nil {
+		if startErr != nil {
+			return collector, StopReasonProviderError, startErr
+		}
+		return collector, StopReasonProviderError, fmt.Errorf("provider 流不可用")
 	}
+	defer func() {
+		closeErr := closeProviderStream(stream)
+		if err == nil && closeErr != nil {
+			err = closeErr
+			reason = StopReasonProviderError
+		}
+	}()
+	if startErr != nil {
+		return collector, StopReasonProviderError, startErr
+	}
+	return collectProviderStreamWithRedactor(ctx, stream, out, redactor, lookbehind)
+}
+
+func collectProviderStreamWithRedactor(ctx context.Context, stream provider.ChatStream, out chan<- events.Event, redactor func(string) string, lookbehind int) (StreamCollector, StopReason, error) {
+	var collector StreamCollector
+	usageSeen := false
+	if stream == nil {
+		return collector, StopReasonProviderError, fmt.Errorf("provider 流不可用")
+	}
+	streamEvents := stream.Events()
+	if streamEvents == nil {
+		return collector, StopReasonProviderError, fmt.Errorf("provider 流不可用")
+	}
+	if redactor == nil {
+		redactor = redact.Text
+	}
+	safeRedactor := redact.NewRuntimeRedactor()
 	type pendingSegment struct {
 		eventType events.Type
 		text      string
@@ -88,7 +143,7 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 		case events.ThinkingDelta:
 			collector.ThinkingText.WriteString(value)
 		}
-		return emitEvent(ctx, out, events.Event{Type: eventType, Text: value})
+		return emitEvent(ctx, out, events.Event{Type: eventType, Text: safeRedactor.Redact(redactor(value))})
 	}
 	flushPending := func(final bool) bool {
 		if pendingBytes == 0 {
@@ -132,7 +187,7 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 		select {
 		case <-ctx.Done():
 			return collector, StopReasonCancelled, ctx.Err()
-		case event, ok := <-stream:
+		case event, ok := <-streamEvents:
 			// Cancellation owns the turn terminal state when it races a Provider
 			// error or channel close. Re-check after the receive so selecting the
 			// stream arm cannot nondeterministically turn the same cancellation
@@ -141,11 +196,14 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 				return collector, StopReasonCancelled, err
 			}
 			if !ok {
+				if len(collector.ToolCalls) > 0 {
+					return collector, "", nil
+				}
 				return collector, StopReasonProviderError, fmt.Errorf("provider 流异常结束")
 			}
 			switch event.Type {
 			case provider.StreamEventTextDelta:
-				appendPending(events.TextDelta, event.Delta)
+				appendPending(events.TextDelta, event.Delta.Text())
 				if !flushPending(false) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
@@ -153,7 +211,7 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 					return collector, StopReasonProviderError, fmt.Errorf("provider 流超过安全脱敏缓冲上限")
 				}
 			case provider.StreamEventThinkingDelta:
-				appendPending(events.ThinkingDelta, event.Delta)
+				appendPending(events.ThinkingDelta, event.Delta.Text())
 				if !flushPending(false) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
@@ -164,45 +222,59 @@ func collectProviderStreamWithRedactor(ctx context.Context, stream <-chan provid
 				if !flushPending(true) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
-				collector.ToolCalls = streamToolCalls(event)
-				return collector, "", nil
+				collector.ToolCalls = append(collector.ToolCalls, streamToolCalls(event)...)
 			case provider.StreamEventUsage:
 				if !flushPending(false) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
-				collector.Usage = event.Usage
-				if event.Usage != nil {
-					if !emitEvent(ctx, out, events.Event{Type: events.UsageUpdated, Usage: usageDisplay(event.Usage)}) {
-						return collector, StopReasonCancelled, ctx.Err()
-					}
+				if usageSeen || event.Usage == nil {
+					return collector, StopReasonProviderError, fmt.Errorf("provider usage 快照无效或重复")
 				}
+				collector.Usage = cloneUsage(event.Usage)
+				usageSeen = true
 			case provider.StreamEventDone:
 				if !flushPending(true) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
 				if event.Usage != nil {
-					collector.Usage = event.Usage
-					if !emitEvent(ctx, out, events.Event{Type: events.UsageUpdated, Usage: usageDisplay(event.Usage)}) {
-						return collector, StopReasonCancelled, ctx.Err()
+					if usageSeen {
+						return collector, StopReasonProviderError, fmt.Errorf("provider usage 快照重复")
 					}
+					collector.Usage = cloneUsage(event.Usage)
+					usageSeen = true
 				}
 				collector.Done = true
+				select {
+				case _, open := <-streamEvents:
+					if open {
+						return collector, StopReasonProviderError, fmt.Errorf("provider 流在终态后发布事件")
+					}
+				default:
+				}
 				return collector, StopReasonCompleted, nil
 			case provider.StreamEventError:
 				if !flushPending(true) {
 					return collector, StopReasonCancelled, ctx.Err()
 				}
-				if event.Err == nil {
+				if event.Error == nil {
 					return collector, StopReasonProviderError, fmt.Errorf("provider 返回空错误事件")
 				}
-				safeError := redactor(event.Err.Error())
-				if safeError == event.Err.Error() {
-					return collector, StopReasonProviderError, event.Err
+				safeError := redactor(event.Error.Error())
+				if safeError == event.Error.Error() {
+					return collector, StopReasonProviderError, event.Error
 				}
 				return collector, StopReasonProviderError, fmt.Errorf("%s", safeError)
 			}
 		}
 	}
+}
+
+func cloneUsage(usage *provider.Usage) *provider.Usage {
+	if usage == nil {
+		return nil
+	}
+	snapshot := *usage
+	return &snapshot
 }
 
 func splitRedactionSafePrefix(value string, lookbehindBytes int, redactor func(string) string) (string, string) {

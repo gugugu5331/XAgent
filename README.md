@@ -110,40 +110,57 @@ go run ./cmd/xagent
 
 ## 交互操作
 
-在会话列表中按 `Enter` 新建或打开会话。进入对话后，输入任务并按 `Enter` 提交。
+在会话列表中可恢复已有会话或新建会话。进入对话后，输入任务并按 `Enter` 提交。
 
 | 按键 | 作用 |
 | --- | --- |
-| `Enter` | 提交输入或选择会话 |
+| `Enter` | 在聊天页提交输入 |
 | `Tab` | 补全斜杠命令；多项匹配时打开候选菜单 |
 | `↑` / `↓` | 在命令候选菜单中移动选择 |
-| `Esc` / `Ctrl+C` | 取消正在生成的请求 |
-| `q` / `Ctrl+C` | 空闲时退出程序 |
 | `y` | 本次允许工具操作 |
 | `s` | 当前会话内允许同类操作 |
 | `p` | 永久允许（仅在该操作支持时可用） |
 | `n` / `Esc` | 拒绝或取消工具操作 |
 
-斜杠命令会由本地注册中心直接分发。基础设施命令在本地执行；Skill 命令会保留原始输入并启动对应 AI 工作流。命令名和别名不区分大小写。输入命令前缀后可按 `Tab` 补全，单个匹配直接写回，多个匹配显示选择菜单。
+以下上下文快捷键与 `/help` 共用 command metadata，不另行维护按键来源：
+
+| 上下文 | 按键 | 作用 |
+| --- | --- | --- |
+| `chat_idle` | `esc` | 打开会话列表 |
+| `chat_streaming` | `esc` | 取消当前请求 |
+| `chat_confirmation` | `esc` | 取消当前请求 |
+| `sessions` | `enter` | 恢复所选会话 |
+| `sessions` | `n` | 新建会话 |
+| `sessions` | `q` | 退出应用 |
+
+斜杠命令由本地注册中心直接分发。命令名和别名不区分大小写；输入命令前缀后可按 `Tab` 补全，单个匹配直接写回，多个匹配显示选择菜单。正式命令表与 `/help` 同样来自 command metadata：
 
 | 命令 | 别名 | 类型 | 作用 |
 | --- | --- | --- | --- |
-| `/help` | `/h`、`/?` | 本地 | 显示公开命令、用法和参数提示 |
-| `/compact` | `/ctx` | 本地 | 手动压缩当前会话上下文 |
-| `/clear` | `/cls` | 界面 | 只清空当前消息显示，保留会话历史和 Agent 上下文 |
-| `/plan` | `/p` | 界面 | 进入当前会话的计划模式 |
-| `/do` | `/d` | 界面 | 退出计划模式，恢复默认执行模式 |
-| `/session` | `/sess` | 本地 | 显示会话 ID、消息数、模式和流式状态 |
-| `/memory` | `/mem` | 本地 | 显示用户级和项目级记忆状态及条目数 |
-| `/permission` | `/perm` | 本地 | 显示权限模式和各层规则数量 |
-| `/status` | `/st` | 本地 | 显示 Provider、模型、模式、Token、Cache、MCP 和最近错误 |
-| `/commit` | — | Skill/shared | 在当前会话激活提交工作流 |
-| `/review` | `/rv`（隐藏兼容入口） | Skill/isolated | 在独立上下文审查当前改动并回流摘要 |
-| `/test` | — | Skill/isolated | 在独立上下文运行相关测试并回流摘要 |
+| `/artifact <opaque-id>` | — | `ui` | 打开本地 Artifact |
+| `/clear` | `/cls` | `ui` | 清空当前消息显示 |
+| `/compact` | `/ctx` | `local` | 压缩当前会话上下文 |
+| `/do` | `/d` | `ui` | 退出计划模式并恢复默认执行 |
+| `/help` | `/h`、`/?` | `local` | 显示可用命令 |
+| `/memory` | `/mem` | `local` | 显示记忆状态与条目数量 |
+| `/new` | — | `ui` | 创建并切换到新会话 |
+| `/permission` | `/perm` | `local` | 显示当前权限状态 |
+| `/plan` | `/p` | `ui` | 进入当前会话的计划模式 |
+| `/session` | `/sess` | `local` | 显示当前会话摘要 |
+| `/sessions` | `/list` | `ui` | 打开会话列表 |
+| `/status` | `/st` | `local` | 显示统一运行状态 |
+
+权限模式以及公开状态/诊断入口也由同一元数据生成：
+
+| 类别 | 名称 | 正式入口 | 说明 |
+| --- | --- | --- | --- |
+| `permission_mode` | `default` | `/permission` | 只读操作自动允许，其他操作需要确认 |
+| `permission_mode` | `permissive` | `/permission` | 除受保护命令外尽量自动允许 |
+| `permission_mode` | `strict` | `/permission` | 写入与命令执行需要确认 |
+| `status` | `status` | `/status` | 显示统一运行状态 |
+| `diagnostics` | `status` | `/status` | 显示有界、脱敏的诊断摘要 |
 
 状态栏中的 `[DEFAULT]` 和 `[PLAN]` 表示当前会话模式。`/plan` 会让后续普通请求持续使用只读计划模式，直到执行 `/do`；新建、切换或重新打开会话时恢复 `[DEFAULT]`。模式本身不写入会话存储。
-
-为保持兼容，`/permissions status`、`/mcp status`、`/diagnostics` 以及 `/memory status|index|off|delete|rebuild` 仍可使用，但不出现在帮助和补全中。
 
 ## Skill
 

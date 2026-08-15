@@ -1,8 +1,8 @@
 # XAgent 安全、可靠性与交付质量提升 Checklist（2026-07-30）
 
-> 状态：已批准（2026-07-31）
+> 状态：原 Checklist 及 C18/C18c Checklist 修订已批准（2026-07-31 至 2026-08-03）；当前目标：T4.29a（2026-08-10）
 >
-> 前置文档：`spec.md`、`plan.md`（含 C1–C17）和 `task.md` 均已批准
+> 前置文档：`spec.md`、`plan.md`（含 C1–C18c）和 `task.md`（含 C18/C18c Task 修订）均已批准
 >
 > 本文只定义可观测验收。只有实际运行结果可以勾选，计划文本、测试代码、CI 配置和预期输出均不能充当通过证据。
 
@@ -24,11 +24,11 @@
 
 ## 功能验收：凭据、网络、工具与资源
 
-- [ ] AC7 / F7：同一 canary 进入 LLM key、MCP env/header、Hook、Provider/MCP 返回值与错误后，TUI、模型输入、会话 JSONL、诊断、日志、memory、safe CI artifact 和测试失败输出均无原文。（验证：运行全渠道 canary E2E及落盘内容扫描，期望所有渠道只出现安全替代文本或摘要，私有 raw artifact以外无原文。）
+- [ ] AC7 / F7：同一 raw canary 与 path canary 进入 LLM key、MCP env/header、Hook、工具输出、Provider/MCP 返回值与错误后，当前 Provider 请求、返回 projection、Event/TUI/Hook、Conversation/JSONL/重启、摘要、诊断、日志、memory、safe CI artifact 和测试失败输出均无原文；私有 Artifact Store staging/committed artifact 是唯一允许持久保留完整 raw 工具输出的位置，瞬时输入 chunk 不得进入任何安全发布渠道。（验证：运行全渠道 canary E2E 与 ContextManager poison-store 场景，扫描所有安全渠道及固定失败信息，期望只出现安全替代文本或摘要，artifact open count=0。）
 - [ ] AC8 / F8：非本机明文 HTTP Provider/MCP 在发送前被拒绝；HTTPS 向 HTTP、外部域名、内网或解析后禁止地址重定向均被拒绝，认证头不跨源传播。（验证：使用受控 DNS、redirect 和目标服务 fixture，期望禁止目标未收到请求或认证头，允许目标通过且每跳及拨号地址均复验。）
 - [ ] AC9 / F9：远超限制的 stdout、stderr、文件、目录、长行、JSON 与 SSE 输入在采集阶段受累计预算约束，返回明确超限状态，峰值缓冲不随完整输入线性增长。（验证：运行 cap、cap+1、未知长度流和大规模输入测试，核对 Counter、原始字节数、truncated状态及内存上界。）
-- [ ] AC10 / F10：超限工具输出生成工作区外、仅当前用户可读的私有 artifact；界面显示 ID、字节数和截断提示，模型、JSONL、memory 与诊断不含原文，容量或保留期到达后可清理。（验证：运行大输出 Artifact E2E，检查权限、位置、一次性终结、用户读取入口和 retention/capacity 清理结果。）
-- [ ] AC11 / F11：包含后台子进程与孙进程的 Bash 或 Hook 在取消、超时或退出后 2 秒内终止完整进程树，不再产生副作用并完成有限清理。（验证：三平台原生运行进程树取消场景，观察所有后代退出、管道关闭和无迟到文件/事件。）
+- [ ] AC10 / F10：每次工具调用只由该调用独立的一个 Capture/Writer 从第一字节采集，并由生产唯一 Artifact Store 持有；inline cap 内与恰好 cap 时 Abort，cap+1 或已接受正字节后不完整时 Commit，ContextManager 不二次写文件、生成 Ref 或读取 payload。UserView 与 OutputMeta 中的 opaque Ref 逐字段一致；有 Ref 时 OutputMeta.CapturedBytes 等于两份 Ref.Bytes，截断状态与原因一致；无 Ref 时 CapturedBytes 不超过 inline cap、Truncated=false 且原因为空。私有权限、显式用户读取入口及 retention/capacity 清理仍有效，旧 Context 三阈值不能改变结果。（验证：运行 ASCII/CJK/emoji cap 矩阵、大输出 Artifact E2E 与静态 capability 门禁，核对 Begin/Abort/Commit、Ref 字段、权限和清理结果；projection、摘要、保存和重载阶段 Open count=0，只有明确的 OpenForUser 操作允许增加一次。）
+- [ ] AC11 / F11：包含后台子进程与孙进程的 Bash 或 Hook 在取消、超时或退出后 2 秒内终止完整进程树，不再产生副作用并完成有限清理；无输入或写入完成后由 Process owner 发送 stdin EOF，目标不会因借用句柄无法关闭而挂起。（验证：三平台原生运行进程树取消与 stdin EOF 场景，观察所有后代退出、管道关闭和无迟到文件/事件。）
 - [ ] AC12 / F12：Read、Grep、Glob 可及时取消；大文件、巨型目录、超长行和底层读取错误返回有界、可理解的部分结果或错误，不遗留继续遍历/分配的任务。（验证：运行取消、预算、I/O 故障和链接竞争矩阵，期望累计计数正确、结果有界且 race/泄漏检查通过。）
 - [ ] AC13 / F13：重复、菱形和深层 include 不会指数展开；累计文件/字节/展开/深度超限产生诊断；并发符号链接或 reparse 切换不能越出允许根。（验证：运行 include 图、cap/cap+1 与三平台链接竞态测试，期望稳定身份、去重、非破坏跳过和 fail-closed结果正确。）
 
@@ -38,12 +38,12 @@
 - [ ] AC15 / F15：关闭 MCP Manager 后 receive loop、HTTP body、远程 session 和 stdio 资源全部退出；重复关闭成功，关闭后新调用被拒绝，并发状态查询/调用/关闭无 race或死锁。（验证：对初始化成功、部分失败、并发Close和远端清理次数运行 race `count=20`，期望唯一清理、lease排空和幂等终态。）
 - [ ] AC16 / F16：stdio MCP 初始化失败会回收进程；大量 stderr 被持续排空但有限保留；突发响应后退出不 panic；取消阻塞写不会累积 goroutine或发生通道关闭竞争。（验证：三平台原生运行 init-fail、stderr burst、response burst、blocked writer 与 repeated close，期望进程/pipe/writer/supervisor全部收敛。）
 - [ ] AC17 / F17：Provider 在正常完成、解析错误、网络错误、取消和消费者提前退出五种路径均关闭底层流，扫描错误不会被误报为正常 EOF。（验证：OpenAI/Anthropic及Orchestrator五出口 race矩阵重复20次，期望每条路径唯一Close、错误分类正确且无阻塞生产者。）
-- [ ] AC18 / F18：响应按“结束原因→usage→流结束”到达时仍产生准确 usage，状态栏、上下文管理和持久化收到同一数值且只提交一次。（验证：运行 scripted Provider usage 顺序场景，比较Provider、Orchestrator、App与Conversation记录的usage。）
+- [ ] AC18 / F18：响应按“结束原因→usage→流结束”到达时，Provider 的唯一最终 usage 快照由 Orchestrator 只提交一次；App/Event 保留批准的 Input、Output、CacheCreation、CacheRead 四字段，ContextManager/Conversation 对其批准持久化的 Input/Output 字段与同一快照一致。ContextManager 对负值或算术溢出 fail closed，Orchestrator 对重复或迟到快照 fail closed，任一路径都不产生部分数值更新。（验证：运行 scripted Provider 顺序、重复和非法 usage 场景，比较 Provider、Orchestrator、App/Event、ContextManager 与 Conversation 的批准字段、提交次数和值，并确认非法输入前后状态不变。）
 
 ## 功能验收：会话与编排
 
 - [ ] AC19 / F19：超过64 KiB但未超系统上限的合法记录可保存并在重启后加载；真正超限、中间坏行或其他损坏会话仍在列表中并带安全诊断。（验证：运行v2 codec、torn-tail、中间损坏、列表部分结果和重启测试，期望合法记录语义一致、损坏项不静默消失。）
-- [ ] AC20 / F20：只修改工具外置状态、摘要或元数据而不改变消息数量，保存并重启后修改仍完整存在。（验证：加载既有会话，分别修改三类状态并执行保存/重启/重载比较。）
+- [ ] AC20 / F20：工具外置状态、摘要、PersistedContent、opaque Ref 或元数据在消息数量不变时仍可保存并重启恢复；对于历史 tool-result，JSONL、摘要、memory 与历史 Provider 请求的工具结果唯一来源是 PersistedContent+Ref，不得使用或恢复当前 run 的 ModelContent preview，重启也不能恢复旧 ModelContent。（验证：分别修改三类状态，保存、重启、重载并比较完整状态；扫描历史 tool-result 在 JSONL、摘要、memory 和重启请求中的投影，期望持久字段一致且 ModelContent canary 为零。）
 - [ ] AC21 / F21：会话目录无权限或扫描错误在界面与诊断中可见而非显示空历史；含可恢复坏行的会话仍可打开、继续对话并再次保存。（验证：注入列表I/O错误和可恢复坏行，观察partial result、错误展示及后续成功保存。）
 - [ ] AC22 / F22：保留期限、扫描文件上限、扫描字节上限和时间跨度提醒四项配置分别真实改变生产行为。（验证：固定Clock下逐项改变配置并比较清理、列表截断、扫描摘要和提醒事件。）
 - [ ] AC23 / F23：同批两个阻塞只读工具确实重叠执行但不超过并发上限，最终结果严格按原调用序号回灌。（验证：用Gate/Trace阻塞两个工具，观察并发区间、峰值和有序提交。）
@@ -61,7 +61,7 @@
 ## 跨平台与交付质量
 
 - [ ] AC31 / F31：macOS、Linux、Windows原生amd64均完成构建；三平台的路径逃逸、符号链接/reparse、权限保护、进程树取消和stdio关闭达到等价安全结果，不以交叉构建、Rosetta、WOW或ARM runner替代。（验证：三个原生runner各运行native profile的7个固定package/test二元组20次及cross-build profile。）
-- [ ] AC32 / F32：格式、静态、普通测试×3、race、敏感场景×20、coverage、三平台构建、repoaudit、docs、performance及E2E全部进入自动门禁；无missing、skip、超时或缓存旧结论。（验证：在同一revision运行final profile并检查每个Step与required manifest恰好出现批准次数。）
+- [ ] AC32 / F32：格式、静态、普通测试×3、race、敏感场景×20、coverage、三平台构建、repoaudit、docs、performance 及 E2E 全部进入自动门禁；无 missing、skip、超时或缓存旧结论。T5.28 的 unit-1、unit-2、unit-3 各自 Required 均逐项包含 C18 的 25 个根与 48 个完整 subtest path，共 73 项且每项 ExpectedRuns=1，三步证据独立，不能折算 ExpectedRuns=3；required gate 对 missing、skip/fail、excess/duplicate、错包同名、package-only pass 和闭合 subtest tree 的额外 descendant 均 fail closed。（验证：在同一 revision 运行 final/unit profile，逐 Step 比较 CommandManifest 与实际 JSON，要求三步各 73 项 ActualRuns=ExpectedRuns=1；另运行 T5.25b 验证命令，5 个自身 required 根各 ExpectedRuns=20，以及 T5.26 验证命令，4 个自身 required 根各 ExpectedRuns=20；向 gate 分别喂入 missing、excess、wrong-package、package-only 与额外 descendant 负例，均须非零失败，正确流须通过。）
 - [ ] AC33 / F33：F1–F33均可追溯到AC、Task和本Checklist；历史规格保留且current/historical/superseded关系无环；所有已勾选项有当前可复现证据。（验证：运行docs/repoaudit profile，期望双向追溯完整、无悬空替代、无计划冒充证据。）
 - [ ] AC34 / N9：在batch追加、snapshot替换和状态发布各持久化barrier注入写失败或进程中断，重启后至少恢复最后成功revision，无半条记录覆盖旧状态。（验证：运行`TestProcessInterruptionAtCommitBarriersPreservesLastRevision`覆盖批准的四个barrier并比较磁盘状态。）
 - [ ] AC35 / N10、N16：现有有效配置、权限规则、旧JSON、v1 JSONL和ExternalPath可直接使用或非破坏迁移；迁移失败时原文件内容、mode和位置保持不变。（验证：对成功/失败样本运行迁移与重启测试，并比较迁移前后原文件摘要。）
@@ -71,9 +71,9 @@
 ## 端到端场景
 
 - [ ] AC38.1：授权碰撞不能复用授权，直接/间接权限文件绕过均被拦截，受保护文件不变。（验证：运行`TestE2EAC38AuthorizationCollisionAndPermissionProtection`，期望pass且无canary泄露。）
-- [ ] AC38.2：大输出被安全截断并生成私有artifact，取消后完整进程树退出且不再产生副作用。（验证：运行`TestE2EAC38LargeOutputArtifactAndProcessTreeCancellation`，期望pass并核对artifact权限和2秒清理边界。）
-- [ ] AC38.3：长会话完成保存、重启、恢复、外置和会话切换后，消息、工具状态、摘要、元数据及外置状态语义一致。（验证：运行`TestE2EAC38LongConversationRestartExternalizeAndSwitch`，期望pass并比较重启前后状态摘要。）
-- [ ] AC38.4：MCP/Provider secret回显、恶意重定向、超限SSE、usage与关闭流程均不泄密、不死锁、不遗留网络、进程或goroutine资源。（验证：运行`TestE2EAC38MCPProviderSecretsRedirectBudgetAndClose`，期望pass且全渠道canary扫描为零。）
+- [ ] AC38.2：大输出从第一字节受有界采集，界面安全截断并显示 opaque Ref、字节数和完整性，私有 artifact 可经显式用户入口读取；取消后完整进程树在 2 秒内退出且不再产生副作用。（验证：运行`TestE2EAC38LargeOutputArtifactAndProcessTreeCancellation`，期望 pass，并核对 preview、Ref、bytes、complete、artifact 权限、用户读取入口、全渠道无泄密和进程树清理边界；唯一 Store/Capture 与自动 Open=0 另由同 revision 的 I7 证据证明。）
+- [ ] AC38.3：长会话完成保存、重启、恢复、外置和会话切换后，消息、工具状态、摘要、元数据及外置状态语义一致；历史 tool-result 不出现当前 run 的 ModelContent preview。（验证：运行`TestE2EAC38LongConversationRestartExternalizeAndSwitch`，期望 pass，并比较重启前后状态摘要及扫描持久化 canary；四视图扇出和临时槽全部出口清理由同 revision 的 I8 证据证明。）
+- [ ] AC38.4：MCP/Provider secret 回显、恶意重定向、超限 SSE、usage 与关闭流程均不泄密、不死锁、不遗留网络、进程或 goroutine 资源。（验证：运行`TestE2EAC38MCPProviderSecretsRedirectBudgetAndClose`，期望 pass，并核对全渠道 canary 为零、usage 唯一提交和资源收敛；异常出口的 ModelContent 槽清理由同 revision 的 I8 证据证明。）
 - [ ] AC38.5：macOS、Linux、Windows原生amd64均通过核心安全场景；错误平台、翻译执行、skip或仅交叉编译不能计为通过。（验证：三个原生runner分别运行`TestE2EAC38NativePlatformSecurity`及native identity gate。）
 - [ ] AC38 汇总：E2E profile只通过唯一生产组装根运行，3个harness根、2个production-adapter/TrustedRoots根和上述5个AC38根各恰好pass一次，无额外替代、missing或skip。（验证：运行e2e profile并由required-test gate核对10个根测试。）
 
@@ -81,10 +81,15 @@
 
 - [ ] I1 生产启动只有一个Assembly/Runtime registry；CLI、E2E与测试生产adapter复用同一组装根，不存在旧factory、第二组装根或双关闭表。（验证：运行assembly静态零引用和production-adapter/TrustedRoots测试。）
 - [ ] I2 配置Resolve、秘密注册、SafeFS/Process/Artifact/网络owner、权限/工具、本地资源、Provider/Hook/MCP/Store、Context/Orchestrator、App/TUI按批准顺序组装；任一初始化失败按反向顺序幂等回滚。（验证：逐故障点注入并比较创建/关闭Trace，期望每个owner恰好关闭一次。）
-- [ ] I3 SafeText、RuntimeRedactor、BoundedSink和安全DTO是跨界面、事件、模型、持久化及诊断的唯一文本边界，不存在raw fallback。（验证：运行AST/引用审计和全渠道canary测试。）
+- [ ] I3 SafeText、RuntimeRedactor、BoundedSink 和安全 DTO 是跨界面、事件、模型、持久化及诊断的唯一文本边界；全部工具、MCP 和 synthetic 结果只由唯一 ResultFactory 构造并经 ContextManager.ProjectToolResult 一次投影，不存在 raw fallback。（验证：在同一 revision 运行 T3.19、T3.19a、T4.29a 的 5 条批准 `go test -json` 命令，核对 8+12+5=25 个 required 根各 ExpectedRuns=1；Projection 24、Capture 11、ModelContent slot 13 共 48 个 canonical Root/Subtest path 各 run/pass 一次，任何未批准 descendant 为 Excess；同时核对 panic-on-open count=0、全渠道 canary 为零及 AST 零引用。）
 - [ ] I4 SafeFS、proctree和netpolicy由组装根签发窄capability/client；业务模块不能自行按字符串路径、裸exec或默认HTTP client绕过。（验证：运行依赖方向和禁止API静态审计及三平台原生安全测试。）
 - [ ] I5 Provider ChatStream、MCP Manager/Connection/Transport、Conversation Store和App runtime均有唯一owner、双context取消边界及幂等Close；部分初始化、并发Close和消费者提前退出均可收敛。（验证：运行生命周期race矩阵和反向关闭Trace。）
 - [ ] I6 Conversation v2、Orchestrator序号槽和App三层状态在保存、工具结果提交、usage提交及导航中保持确定顺序，迟到事件不能跨request/conversation边界。（验证：运行状态摘要golden、有序提交、导航事务及stale event测试。）
+- [ ] I7 生产工具结果只有唯一 Artifact Store→每次调用独立 Capture/Writer→唯一 ResultFactory→ContextManager.ProjectToolResult 数据链；ContextManager 不持有 Store、Reader、Writer、路径或文件能力，也不生成 Ref 或二次外置。（验证：运行 capability shape、生产 AST、poison Store 与组装注入测试，期望 ContextManager 的 artifact/path/file API 引用为零、Open count=0，每次调用得到不同 Capture/Writer，生产 Store 与 ResultFactory 各只有一个 owner。）
+- [ ] I8 ProjectToolResult 对同一 Result 的四个访问器各直接调用一次且只发布完整一致 projection；当前 run 的 Provider 只得到 ModelContent，Event/TUI/Hook 只得到 UserView，Conversation/JSONL/重启只得到 PersistedContent+opaque Ref。临时 ModelContent 槽在 StreamChat 交付、正常完成、所有同步错误、Provider 错误、取消、保存失败和会话切换后均清空，摘要重排只能按唯一 survivor 映射 rebase。（验证：运行 projection 变异矩阵、并发同 call ID、跨 iteration、摘要 rebase 和全部出口槽生命周期测试，期望无部分扇出、持久化 preview 或跨 run 残留。）
+- [ ] I9 T3.19a 的 safe candidate 在 T4.29a 前不得成为公开生产入口；T4.29a 原子切换后，公开 Result payload、直接 composite literal、Success/Failure、raw fallback、旧 Registry/Bash 构造入口和全部迁移 adapter 同时消失。（验证：在 R0 单一 revision 运行 ancestry、T4.29a exact-diff、production AST 与零引用审计，证明历史 candidate 未提前发布、T4.29a 是唯一连续切换点且 R0 无旧入口，不拼接切换前后 revision 结果。）
+- [ ] I10 MCP 只获得同一 ResultFactory 与每次调用新建 Capture 的窄闭包，纯 synthetic Hook 只获得同一 ResultFactory；二者均不能取得 Store、Reader、Writer、真实路径或 artifact payload。（验证：运行构造签名/capability 静态审计及 MCP/Hook 生产组装测试，期望批准依赖图编译通过、MCP 完成真实 Capture 链、Hook 只能构造有界 synthetic 结果，任一越权依赖负例均被 type/AST gate 拒绝。）
+- [ ] I11 C18c 的 concrete owner 与迁移边界保持闭合：`MarkIncomplete` 只在 Capture owner 内以 first-terminal-error-wins 记录已接受正字节后的批准不完整原因，和 Finish 共用唯一终态；`SafeResultProducer` 只声明在 Registry owner，immutable View 不传播 candidate 构造资格；T4.25d 前生产 MCP Manager 只有一个 legacy adapter 选择点且不持有 Capture/Store/Writer/Counter/Ref。T3.19a 的 MCP 证据只能证明 candidate adapter 对已解码 DTO 每次使用 fresh Capture/Writer/Counter，不能替代 T4.25d 的 transport/wire 首字节采集证据。（验证：运行 `TestCaptureAbortCommitAndUTF8ThresholdMatrix`、`TestAllToolResultsRequireInjectedFactory`、`TestMCPAdapterUsesInjectedResultFactoryOnEveryOutcome` 及 T4.25d 的 HTTP/stdio 首字节 Capture 测试，期望 required 根及 11 个 Capture canonical 子测试精确 run/pass、每次 Begin 后恰好一次 Commit 或 Abort；再做生产 AST/capability 审计，期望 `SafeResultProducer` 声明仅一处且位于 `registry.go`、`view.go` 无 candidate 标志传播、`buildToolCandidates` 仅调用一次 legacy constructor、Manager 无 Capture/Store owner。）
 
 ## CI、删除与证据闭环
 

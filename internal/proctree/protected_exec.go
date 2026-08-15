@@ -1,6 +1,7 @@
 package proctree
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -19,6 +20,67 @@ type scratchOwner struct {
 
 	once sync.Once
 	err  error
+}
+
+type protectionPlanFactory struct {
+	roots         []*safefs.Root
+	scratchParent string
+}
+
+func NewProtectionPlanFactory(roots []*safefs.Root, scratchParent string) (ProtectionPlanFactory, error) {
+	if scratchParent == "" || !filepath.IsAbs(scratchParent) || filepath.Clean(scratchParent) != scratchParent {
+		return nil, errors.New("proctree scratch parent is invalid")
+	}
+	copyRoots, err := copyValidProtectionRoots(roots)
+	if err != nil {
+		return nil, err
+	}
+	return &protectionPlanFactory{roots: copyRoots, scratchParent: scratchParent}, nil
+}
+
+func (f *protectionPlanFactory) Create(ctx context.Context) (ProtectionPlan, error) {
+	if f == nil || ctx == nil {
+		return ProtectionPlan{}, errors.New("proctree protection plan factory is unavailable")
+	}
+	select {
+	case <-ctx.Done():
+		return ProtectionPlan{}, ctx.Err()
+	default:
+	}
+	plan, err := newProtectionPlanWithScratch(f.roots, f.scratchParent)
+	if err != nil {
+		return ProtectionPlan{}, err
+	}
+	select {
+	case <-ctx.Done():
+		_ = plan.cleanupScratch()
+		return ProtectionPlan{}, ctx.Err()
+	default:
+		return plan, nil
+	}
+}
+
+func copyValidProtectionRoots(roots []*safefs.Root) ([]*safefs.Root, error) {
+	if len(roots) == 0 {
+		return nil, errors.New("proctree protection roots are invalid")
+	}
+	copyRoots := make([]*safefs.Root, len(roots))
+	seen := make(map[safefs.Identity]struct{}, len(roots))
+	for index, root := range roots {
+		if root == nil {
+			return nil, errors.New("proctree protection roots are invalid")
+		}
+		identity := root.Identity()
+		if identity == (safefs.Identity{}) {
+			return nil, errors.New("proctree protection roots are invalid")
+		}
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, errors.New("proctree protection roots contain duplicates")
+		}
+		seen[identity] = struct{}{}
+		copyRoots[index] = root
+	}
+	return copyRoots, nil
 }
 
 func NewProtectionPlan(roots []*safefs.Root, scratch *safefs.Root) (ProtectionPlan, error) {
@@ -130,6 +192,12 @@ func (p ProtectionPlan) cleanupScratch() error {
 		return errors.New("proctree scratch ownership is unavailable")
 	}
 	return p.scratchOwner.cleanup()
+}
+
+func cleanupUnstartedPlan(request Request) {
+	if request.Protection.validForStart() {
+		_ = request.Protection.cleanupScratch()
+	}
 }
 
 func (p ProtectionPlan) MarshalJSON() ([]byte, error) {

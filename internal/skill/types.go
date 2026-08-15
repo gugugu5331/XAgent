@@ -35,6 +35,7 @@ type Metadata struct {
 	Mode         Mode     `yaml:"mode"`
 	History      int      `yaml:"history,omitempty"`
 	Model        string   `yaml:"model,omitempty"`
+	historySet   bool
 }
 
 type Definition struct {

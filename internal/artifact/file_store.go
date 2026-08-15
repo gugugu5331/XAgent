@@ -34,6 +34,7 @@ type fileStore struct {
 
 	root          string
 	workspaceRoot string
+	privateRoot   privateArtifactRoot
 	options       FileStoreOptions
 	now           func() time.Time
 	totalBytes    int64
@@ -41,6 +42,14 @@ type fileStore struct {
 	records       map[string]artifactRecord
 	closed        bool
 	closeErr      error
+}
+
+type privateArtifactRoot interface {
+	create(string) (*os.File, error)
+	open(string) (*os.File, error)
+	rename(string, string) error
+	remove(string) error
+	close() error
 }
 
 func NewFileStore(options FileStoreOptions) (Store, error) {
@@ -126,6 +135,25 @@ func validateStoreRoots(root, workspace string) (string, string, error) {
 	return canonicalRoot, canonicalWorkspace, nil
 }
 
+func prepareFileStoreRoot(root, workspace string) (string, error) {
+	canonicalRoot, canonicalWorkspace, err := validateStoreRoots(root, workspace)
+	if err != nil {
+		return "", err
+	}
+	owner, preparedRoot, err := openPrivateArtifactRoot(canonicalRoot, canonicalWorkspace, true)
+	if err != nil || owner == nil || preparedRoot == "" {
+		if owner != nil {
+			_ = owner.close()
+		}
+		return "", errors.New("artifact private root preparation failed")
+	}
+	closeErr := owner.close()
+	if closeErr != nil {
+		return "", errors.New("artifact private root preparation failed")
+	}
+	return preparedRoot, nil
+}
+
 func validAbsolutePath(path string) bool {
 	return path != "" && utf8.ValidString(path) && filepath.IsAbs(path) && filepath.Clean(path) == path
 }
@@ -181,15 +209,16 @@ func (s *fileStore) Begin(ctx context.Context, metadata Metadata) (Writer, error
 	if s.closed {
 		return nil, errors.New("artifact store is closed")
 	}
-	if err := ensurePrivateArtifactRoot(s.root); err != nil {
+	if err := s.ensurePrivateRootLocked(); err != nil {
 		return nil, errors.New("artifact store initialization failed")
 	}
 	id, err := newArtifactID()
 	if err != nil {
 		return nil, errors.New("artifact identity creation failed")
 	}
-	staging := filepath.Join(s.root, "."+id+".staging")
-	file, err := createPrivateArtifactFile(staging)
+	stagingName := "." + id + ".staging"
+	finalName := id + ".artifact"
+	file, err := s.privateRoot.create(stagingName)
 	if err != nil {
 		return nil, errors.New("artifact staging creation failed")
 	}
@@ -197,8 +226,8 @@ func (s *fileStore) Begin(ctx context.Context, metadata Metadata) (Writer, error
 		store:       s,
 		file:        file,
 		id:          id,
-		stagingPath: staging,
-		finalPath:   filepath.Join(s.root, id+".artifact"),
+		stagingName: stagingName,
+		finalName:   finalName,
 		metadata:    metadata,
 		createdAt:   s.now().UTC(),
 		state:       writerActive,
@@ -216,12 +245,12 @@ func (s *fileStore) OpenForUser(ctx context.Context, id string) (io.ReadCloser, 
 	}
 	s.mu.RLock()
 	record, ok := s.records[id]
-	root := s.root
-	s.mu.RUnlock()
-	if !ok || !record.ref.Available {
+	if !ok || !record.ref.Available || s.privateRoot == nil {
+		s.mu.RUnlock()
 		return nil, Ref{}, errors.New("artifact is unavailable")
 	}
-	file, err := openPrivateArtifactFile(filepath.Join(root, id+".artifact"))
+	file, err := s.privateRoot.open(id + ".artifact")
+	s.mu.RUnlock()
 	if err != nil {
 		return nil, Ref{}, errors.New("artifact is unavailable")
 	}
@@ -255,8 +284,54 @@ func (s *fileStore) Close() error {
 		return s.closeErr
 	}
 	s.closed = true
-	s.workspaceRoot = ""
+	s.closePrivateRootIfIdleLocked()
 	return s.closeErr
+}
+
+func (s *fileStore) ensurePrivateRootLocked() error {
+	if s.privateRoot != nil {
+		return nil
+	}
+	owner, canonicalRoot, err := openPrivateArtifactRoot(s.root, s.workspaceRoot, true)
+	if err != nil || owner == nil || canonicalRoot == "" {
+		if owner != nil {
+			_ = owner.close()
+		}
+		return errors.New("artifact private root is unavailable")
+	}
+	s.root = canonicalRoot
+	s.privateRoot = owner
+	s.workspaceRoot = ""
+	return nil
+}
+
+func (s *fileStore) closePrivateRootIfIdleLocked() {
+	if !s.closed || len(s.active) != 0 || s.privateRoot == nil {
+		return
+	}
+	if err := s.privateRoot.close(); err != nil && s.closeErr == nil {
+		s.closeErr = errors.New("artifact private root close failed")
+	}
+	s.privateRoot = nil
+	s.workspaceRoot = ""
+}
+
+func (s *fileStore) renameArtifact(oldName, newName string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.privateRoot == nil {
+		return errors.New("artifact private root is unavailable")
+	}
+	return s.privateRoot.rename(oldName, newName)
+}
+
+func (s *fileStore) removeArtifact(name string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.privateRoot == nil {
+		return errors.New("artifact private root is unavailable")
+	}
+	return s.privateRoot.remove(name)
 }
 
 func newArtifactID() (string, error) {
@@ -333,6 +408,7 @@ func (s *fileStore) abortWriter(id string, bytes int64) {
 	if s.totalBytes < 0 {
 		s.totalBytes = 0
 	}
+	s.closePrivateRootIfIdleLocked()
 	s.mu.Unlock()
 }
 

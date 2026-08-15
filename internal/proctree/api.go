@@ -22,6 +22,13 @@ type ProtectionPlan struct {
 
 type protectionSeal struct{}
 
+// ProtectionPlanFactory creates one opaque, private-scratch plan per process
+// start. Once a plan is handed to Runner.Start, the runner owns its cleanup on
+// every failure path and transfers that ownership to Process on success.
+type ProtectionPlanFactory interface {
+	Create(context.Context) (ProtectionPlan, error)
+}
+
 type Pipes struct {
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
@@ -69,6 +76,7 @@ type Result struct {
 
 type Process interface {
 	Pipes() Pipes
+	CloseStdin() error
 	Wait(ctx context.Context) (Result, error)
 	Terminate(ctx context.Context) error
 	Close(ctx context.Context) error

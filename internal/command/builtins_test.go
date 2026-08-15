@@ -30,6 +30,8 @@ type testController struct {
 	legacyDiagErr     error
 	skillCalls        []skillCall
 	skillErr          error
+	artifactCalls     []string
+	artifactErr       error
 }
 
 type skillCall struct {
@@ -44,6 +46,10 @@ func (c *testController) SendUserMessage(text string) { c.sent = append(c.sent, 
 func (c *testController) ExecuteSkill(name string, args string, raw string) error {
 	c.skillCalls = append(c.skillCalls, skillCall{name: name, args: args, raw: raw})
 	return c.skillErr
+}
+func (c *testController) OpenArtifact(id string) error {
+	c.artifactCalls = append(c.artifactCalls, id)
+	return c.artifactErr
 }
 func (c *testController) ClearMessages()       { c.cleared++ }
 func (c *testController) SwitchMode(mode Mode) { c.mode = mode }
@@ -80,11 +86,11 @@ func (c *testController) lastError() string {
 	return c.errors[len(c.errors)-1].Error()
 }
 
-func TestBuiltinsRegisterNineVisibleCommands(t *testing.T) {
+func TestBuiltinsRegisterTwelveVisibleCommands(t *testing.T) {
 	registry := MustNew(Builtins()...)
 	visible := registry.Visible()
-	if len(visible) != 9 {
-		t.Fatalf("expected 9 visible commands, got %d: %#v", len(visible), visible)
+	if len(visible) != 12 {
+		t.Fatalf("expected 12 visible commands, got %d: %#v", len(visible), visible)
 	}
 	expected := map[string]struct {
 		aliases []string
@@ -92,7 +98,9 @@ func TestBuiltinsRegisterNineVisibleCommands(t *testing.T) {
 	}{
 		"help": {aliases: []string{"h", "?"}, typeOf: TypeLocal}, "compact": {aliases: []string{"ctx"}, typeOf: TypeLocal},
 		"clear": {aliases: []string{"cls"}, typeOf: TypeUI}, "plan": {aliases: []string{"p"}, typeOf: TypeUI},
-		"do": {aliases: []string{"d"}, typeOf: TypeUI}, "session": {aliases: []string{"sess"}, typeOf: TypeLocal},
+		"artifact": {typeOf: TypeUI},
+		"do":       {aliases: []string{"d"}, typeOf: TypeUI}, "session": {aliases: []string{"sess"}, typeOf: TypeLocal},
+		"new": {typeOf: TypeUI}, "sessions": {aliases: []string{"list"}, typeOf: TypeUI},
 		"memory": {aliases: []string{"mem"}, typeOf: TypeLocal}, "permission": {aliases: []string{"perm"}, typeOf: TypeLocal},
 		"status": {aliases: []string{"st"}, typeOf: TypeLocal},
 	}
@@ -174,6 +182,80 @@ func TestBuiltinUICommands(t *testing.T) {
 	if controller.mode != ModeDefault || controller.refreshed != 2 {
 		t.Fatalf("do did not restore mode: %#v", controller)
 	}
+}
+
+func TestArtifactOpenIsLocalUserOnly(t *testing.T) {
+	registry := MustNew(Builtins()...)
+
+	t.Run("controller boundary accepts only an id value", func(t *testing.T) {
+		method, ok := reflect.TypeOf((*Controller)(nil)).Elem().MethodByName("OpenArtifact")
+		if !ok {
+			t.Fatal("OpenArtifact controller boundary missing")
+		}
+		errorType := reflect.TypeOf((*error)(nil)).Elem()
+		if method.Type.NumIn() != 1 || method.Type.In(0).Kind() != reflect.String || method.Type.NumOut() != 1 || method.Type.Out(0) != errorType {
+			t.Fatalf("OpenArtifact boundary is not id-only: %v", method.Type)
+		}
+	})
+
+	t.Run("public metadata delegates one opaque value", func(t *testing.T) {
+		controller := &testController{}
+		result := registry.Dispatch("/artifact 0123456789abcdef", controller)
+		if result.Kind != DispatchExecuted || result.Err != nil {
+			t.Fatalf("artifact dispatch failed: %#v", result)
+		}
+		if !reflect.DeepEqual(controller.artifactCalls, []string{"0123456789abcdef"}) {
+			t.Fatalf("unexpected artifact calls: %#v", controller.artifactCalls)
+		}
+		if len(controller.sent) != 0 || len(controller.skillCalls) != 0 || len(controller.notices) != 0 {
+			t.Fatalf("artifact command crossed its narrow controller boundary: %#v", controller)
+		}
+
+		var definition Definition
+		found := false
+		for _, candidate := range registry.Definitions() {
+			if candidate.Name == "artifact" {
+				definition = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatal("public artifact metadata missing")
+		}
+		if definition.Type != TypeUI || definition.Hidden || definition.Usage != "/artifact <opaque-id>" || definition.ArgHint != "<opaque-id>" {
+			t.Fatalf("unexpected artifact metadata: %#v", definition)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		input string
+	}{
+		{name: "missing argument", input: "/artifact"},
+		{name: "whitespace argument", input: "/artifact   \t"},
+		{name: "multiple arguments", input: "/artifact one two"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			controller := &testController{}
+			result := registry.Dispatch(test.input, controller)
+			if result.Err == nil || result.Err.Error() != "用法: /artifact <opaque-id>" {
+				t.Fatalf("expected bounded usage error: %#v", result)
+			}
+			if len(controller.artifactCalls) != 0 {
+				t.Fatalf("invalid input reached controller: %#v", controller.artifactCalls)
+			}
+		})
+	}
+
+	t.Run("controller error propagates", func(t *testing.T) {
+		want := errors.New("artifact unavailable")
+		controller := &testController{artifactErr: want}
+		result := registry.Dispatch("/artifact opaque", controller)
+		if !errors.Is(result.Err, want) || controller.lastError() != want.Error() {
+			t.Fatalf("artifact controller error was not propagated: result=%#v controller=%#v", result, controller)
+		}
+	})
 }
 
 func TestReviewMigration(t *testing.T) {

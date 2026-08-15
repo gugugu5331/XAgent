@@ -12,7 +12,7 @@ func TestParseDecisionProtocol(t *testing.T) {
 	valid := map[string]ToolDecisionKind{" {\"decision\":\"allow\"}\n": DecisionContinue, "{\"decision\":\"deny\",\"reason\":\"stop\"}": DecisionDeny}
 	for input, want := range valid {
 		decision, err := parseDecision([]byte(input), DefaultLimits(), nil)
-		if err != nil || decision.Kind != want {
+		if err != nil || decision.Kind() != want {
 			t.Fatalf("%q = %#v,%v", input, decision, err)
 		}
 	}
@@ -34,11 +34,11 @@ func TestDecisionReasonSafety(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Reason != "[redacted]" {
-		t.Fatalf("reason = %q", decision.Reason)
+	if decision.Reason() != "[redacted]" {
+		t.Fatalf("reason = %q", decision.Reason())
 	}
 	cleaned, err := parseDecision([]byte("{\"decision\":\"deny\",\"reason\":\"\\u001b[31mkeep\\u001b[0m\\u0000\\u0001\"}"), DefaultLimits(), nil)
-	if err != nil || cleaned.Reason != "keep" {
+	if err != nil || cleaned.Reason() != "keep" {
 		t.Fatalf("control-character cleanup = %#v, %v", cleaned, err)
 	}
 	if _, err := parseDecision([]byte("{\"decision\":\"deny\",\"reason\":\"\\u001b[31m\\u001b[0m\\u0000\\u0001\"}"), DefaultLimits(), nil); err == nil {
@@ -80,8 +80,8 @@ func TestDecisionReasonRedactsSecretsContainingRemovedControls(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if decision.Reason != "[redacted]" {
-				t.Fatalf("control-bearing secret leaked after cleanup: %q", decision.Reason)
+			if decision.Reason() != "[redacted]" {
+				t.Fatalf("control-bearing secret leaked after cleanup: %q", decision.Reason())
 			}
 		})
 	}
@@ -94,7 +94,7 @@ func TestDecisionReasonPreservesShortSecretBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Reason != "prefix" {
-		t.Fatalf("embedded short secret changed ordinary text: %q", decision.Reason)
+	if decision.Reason() != "prefix" {
+		t.Fatalf("embedded short secret changed ordinary text: %q", decision.Reason())
 	}
 }

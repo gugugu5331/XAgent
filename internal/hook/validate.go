@@ -7,9 +7,33 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"xagent/internal/matcher"
 	"xagent/internal/redact"
 )
+
+const hookSchemaVersionError = "must be integer 1"
+
+const (
+	hookTimeoutMin             = time.Millisecond
+	hookTimeoutMax             = 10 * time.Minute
+	hookCommandDefaultTimeout  = 30 * time.Second
+	hookHTTPDefaultTimeout     = 10 * time.Second
+	hookSubAgentDefaultTimeout = 30 * time.Second
+)
+
+// validateHookSchemaVersion is the first semantic validation performed on a
+// decoded hooks.yaml document. Keeping it independent from rule compilation
+// ensures an unsupported format cannot expand env values or construct any
+// action runtime state.
+func validateHookSchemaVersion(node *yaml.Node) error {
+	version, err := intScalar(node)
+	if err != nil || version != 1 {
+		return invalidAt("version", hookSchemaVersionError)
+	}
+	return nil
+}
 
 type compiledAction struct {
 	typeName ActionType
@@ -196,8 +220,8 @@ func compileAction(event Event, async bool, timeout Duration, config ActionConfi
 	if timeout.Set && config.Type == ActionPrompt {
 		return compiledAction{}, invalidAt("timeout", "timeout is not valid for prompt")
 	}
-	if timeout.Set && (timeout.Duration <= 0 || timeout.Duration > 10*time.Minute) {
-		return compiledAction{}, invalidAt("timeout", "timeout must be positive and at most 10m")
+	if timeout.Set && (timeout.Duration < hookTimeoutMin || timeout.Duration > hookTimeoutMax) {
+		return compiledAction{}, invalidAt("timeout", "timeout must be between 1ms and 10m")
 	}
 	if !timeout.Set && config.Type != ActionCommand && config.Type != ActionHTTP && config.Type != ActionSubAgent && timeout.Duration != 0 {
 		return compiledAction{}, invalidAt("timeout", "timeout is not valid for action")
@@ -222,7 +246,7 @@ func compileAction(event Event, async bool, timeout Duration, config ActionConfi
 		if timeout.Set {
 			action.timeout = timeout.Duration
 		} else {
-			action.timeout = 30 * time.Second
+			action.timeout = hookCommandDefaultTimeout
 		}
 	case ActionHTTP:
 		action.http, err = compileHTTPAction(config, limits, lookup, runtimeRedactor)
@@ -232,7 +256,7 @@ func compileAction(event Event, async bool, timeout Duration, config ActionConfi
 		if timeout.Set {
 			action.timeout = timeout.Duration
 		} else {
-			action.timeout = 10 * time.Second
+			action.timeout = hookHTTPDefaultTimeout
 		}
 	case ActionPrompt:
 		if strings.TrimSpace(config.Content) == "" {
@@ -270,6 +294,8 @@ func compileAction(event Event, async bool, timeout Duration, config ActionConfi
 		}
 		if timeout.Set {
 			action.timeout = timeout.Duration
+		} else {
+			action.timeout = hookSubAgentDefaultTimeout
 		}
 	}
 	if config.Decision {

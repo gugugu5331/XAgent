@@ -1,7 +1,6 @@
 package tool
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -42,12 +41,30 @@ type RegistrationOptions struct {
 	RemoteAnnotations json.RawMessage
 }
 
+// SafeResultProducer marks a tool whose every publishable outcome is built by
+// the injected ResultFactory boundary. Candidate registries reject tools that
+// do not implement this closed assembly-time assertion.
+type SafeResultProducer interface {
+	Tool
+	UsesSafeResultBoundary() bool
+}
+
 type Registry struct {
-	tools       map[string]Tool
-	executors   map[string]Tool
-	descriptors map[string]ToolDescriptor
-	order       []string
-	immutable   bool
+	tools         map[string]Definition
+	executors     map[string]Tool
+	descriptors   map[string]ToolDescriptor
+	order         []string
+	immutable     bool
+	safeCandidate bool
+}
+
+// NewSafeCandidateRegistry returns an empty registry that accepts only tools
+// carrying the injected safe-result boundary. Final Assembly remains the sole
+// owner that populates it with one shared factory and fresh-Capture closures.
+func NewSafeCandidateRegistry() *Registry {
+	registry := newEmptyRegistry()
+	registry.safeCandidate = true
+	return registry
 }
 
 func NewRegistry(projectRoot string) (*Registry, error) {
@@ -100,6 +117,12 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	if tool == nil {
 		return fmt.Errorf("工具不能为空")
 	}
+	if r.safeCandidate {
+		producer, ok := tool.(SafeResultProducer)
+		if !ok || !producer.UsesSafeResultBoundary() {
+			return fmt.Errorf("工具未使用安全结果边界")
+		}
+	}
 	name := tool.Name()
 	if name == "" {
 		return fmt.Errorf("工具名称不能为空")
@@ -116,7 +139,7 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 		return fmt.Errorf("工具 %q annotations 无效: %w", name, err)
 	}
 	if r.tools == nil {
-		r.tools = make(map[string]Tool)
+		r.tools = make(map[string]Definition)
 	}
 	if r.descriptors == nil {
 		r.descriptors = make(map[string]ToolDescriptor)
@@ -132,7 +155,7 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	if r.executors == nil {
 		r.executors = make(map[string]Tool)
 	}
-	r.tools[name] = &registeredTool{descriptor: cloneDescriptor(descriptor), executor: tool}
+	r.tools[name] = &registeredTool{descriptor: cloneDescriptor(descriptor)}
 	r.executors[name] = tool
 	r.descriptors[name] = descriptor
 	r.order = append(r.order, name)
@@ -140,10 +163,10 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 }
 
 func newEmptyRegistry() *Registry {
-	return &Registry{tools: make(map[string]Tool), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor)}
+	return &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor)}
 }
 
-func (r *Registry) Get(name string) (Tool, bool) {
+func (r *Registry) Get(name string) (Definition, bool) {
 	if r == nil {
 		return nil, false
 	}
@@ -167,11 +190,11 @@ func (r *Registry) Names() []string {
 	return append([]string(nil), r.order...)
 }
 
-func (r *Registry) List() []Tool {
+func (r *Registry) List() []Definition {
 	if r == nil {
 		return nil
 	}
-	tools := make([]Tool, 0, len(r.order))
+	tools := make([]Definition, 0, len(r.order))
 	for _, name := range r.order {
 		tools = append(tools, r.tools[name])
 	}
@@ -279,7 +302,6 @@ func restrictPolicyWithRemoteAnnotations(policy ExecutionPolicy, raw json.RawMes
 
 type registeredTool struct {
 	descriptor ToolDescriptor
-	executor   Tool
 }
 
 func (t *registeredTool) Name() string {
@@ -296,8 +318,4 @@ func (t *registeredTool) Schema() Schema {
 
 func (t *registeredTool) Risk() Risk {
 	return t.descriptor.Risk
-}
-
-func (t *registeredTool) Execute(ctx context.Context, input Input) Result {
-	return t.executor.Execute(ctx, input)
 }

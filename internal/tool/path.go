@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 func ResolveProjectPath(projectRoot string, requestedPath string) (string, error) {
@@ -40,7 +38,7 @@ func ReadProjectFile(projectRoot string, requestedPath string) (string, []byte, 
 	if err != nil {
 		return "", nil, err
 	}
-	file, err := openProjectFileNoFollow(projectRoot, resolved, unix.O_RDONLY, 0)
+	file, err := openProjectFileNoFollow(projectRoot, resolved, os.O_RDONLY, 0)
 	if err != nil {
 		return "", nil, fmt.Errorf("%s: 打开文件失败: %w", ErrPathOutsideProject, err)
 	}
@@ -115,7 +113,7 @@ func readFileInScope(scope ReadScope, requestedPath string) (resolvedReadPath, [
 	if err != nil {
 		return resolvedReadPath{}, nil, err
 	}
-	file, err := openFileNoFollow(target.root, target.absolute, unix.O_RDONLY, 0)
+	file, err := openFileNoFollow(target.root, target.absolute, os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return resolvedReadPath{}, nil, fmt.Errorf("%s: 打开文件失败: %w", ErrNotFound, err)
@@ -142,7 +140,7 @@ func WriteProjectFile(projectRoot string, requestedPath string, data []byte) (st
 	if err != nil {
 		return "", err
 	}
-	file, err := openProjectFileNoFollow(projectRoot, resolved, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, 0o600)
+	file, err := openProjectFileNoFollow(projectRoot, resolved, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("%s: 打开文件失败: %w", ErrPathOutsideProject, err)
 	}
@@ -173,34 +171,23 @@ func openFileNoFollow(root string, absolutePath string, flags int, perm uint32) 
 	if err != nil {
 		return nil, err
 	}
-	parts := splitPathParts(rel)
-	if len(parts) == 0 {
+	if len(splitPathParts(rel)) == 0 {
 		return nil, fmt.Errorf("empty relative path")
 	}
-	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	openedRoot, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, err
 	}
-	currentFD := rootFD
-	for index, part := range parts {
-		last := index == len(parts)-1
-		if last {
-			fd, err := unix.Openat(currentFD, part, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, perm)
-			unix.Close(currentFD)
-			if err != nil {
-				return nil, err
-			}
-			return os.NewFile(uintptr(fd), resolved), nil
-		}
-		nextFD, err := unix.Openat(currentFD, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		unix.Close(currentFD)
-		if err != nil {
-			return nil, err
-		}
-		currentFD = nextFD
+	file, openErr := openedRoot.OpenFile(rel, flags, os.FileMode(perm))
+	closeErr := openedRoot.Close()
+	if openErr != nil {
+		return nil, openErr
 	}
-	unix.Close(currentFD)
-	return nil, fmt.Errorf("invalid path")
+	if closeErr != nil {
+		_ = file.Close()
+		return nil, closeErr
+	}
+	return file, nil
 }
 
 type readRoot struct {

@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
 	"xagent/internal/diagnostics"
 	"xagent/internal/memory"
 	"xagent/internal/prompt"
+	"xagent/internal/redact"
 )
+
+const defaultMaxSectionBytes = 25 * 1024
 
 type PrepareMode string
 
@@ -37,9 +41,11 @@ type ContextOptionsPreparer interface {
 }
 
 type Manager struct {
-	Instructions InstructionLoader
-	Memory       MemoryIndexProvider
-	Context      ContextPreparer
+	Instructions    InstructionLoader
+	Memory          MemoryIndexProvider
+	Context         ContextPreparer
+	Redactor        *redact.RuntimeRedactor
+	MaxSectionBytes int
 }
 
 type PreparedContext struct {
@@ -104,7 +110,43 @@ func (m *Manager) PrepareStable(ctx context.Context) PreparedContext {
 		prepared.Diagnostics = append(prepared.Diagnostics, m.Memory.Diagnostics()...)
 	}
 	prepared.StableSections = append(prepared.StableSections, restoreBoundarySection())
+	prepared.StableSections = m.safeSections(prepared.StableSections)
 	return prepared
+}
+
+func (m *Manager) safeSections(sections []prompt.Section) []prompt.Section {
+	if m == nil {
+		return nil
+	}
+	redactor := m.Redactor
+	if redactor == nil {
+		redactor = redact.NewRuntimeRedactor()
+	}
+	limit := m.MaxSectionBytes
+	if limit <= 0 {
+		limit = defaultMaxSectionBytes
+	}
+	result := make([]prompt.Section, 0, len(sections))
+	for _, section := range sections {
+		section.Name = boundedUTF8(redactor.Text(strings.TrimSpace(section.Name)), limit)
+		section.Content = boundedUTF8(redactor.Text(strings.TrimSpace(section.Content)), limit)
+		if section.Name == "" || section.Content == "" {
+			continue
+		}
+		result = append(result, section)
+	}
+	return result
+}
+
+func boundedUTF8(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
 }
 
 func (m *Manager) memorySections() ([]prompt.Section, []diagnostics.Diagnostic) {

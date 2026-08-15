@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
+	"math"
 	"strings"
 	"time"
 
@@ -21,29 +23,37 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 	}
 	unknownToolCalls := 0
 	for iteration := 1; iteration <= options.MaxIterations; iteration++ {
-		if !emitEvent(ctx, out, progressEvent(iteration, options.MaxIterations, "", "")) {
+		if !emitEvent(ctx, out, o.progressEvent(iteration, options.MaxIterations, "", "")) {
 			return finishRunResult(result, start, StopReasonCancelled, ctx.Err())
 		}
-		stream, err := o.streamWithExecution(ctx, conv, req.Mode, state.profile, true, iteration, state.ref)
-		if err != nil {
+		stream, startErr := o.streamWithExecutionState(ctx, conv, req.Mode, state.profile, true, iteration, state.ref, state)
+		collector, reason, err := ownProviderStreamWithRedactor(ctx, stream, startErr, out, o.redactText, o.redactionLookbehind)
+		if startErr != nil {
 			reason, runErr := classifyStreamStartFailure(ctx, err)
 			return finishRunResult(result, start, reason, o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, reason, runErr.Error(), runErr))
 		}
 		parentCheckpoint := checkpointConversation(conv)
 		iterationProfile := state.profile.Clone()
-		collector, reason, err := collectProviderStreamWithRedactor(ctx, stream, out, o.redactText, o.redactionLookbehind)
-		addUsage(&result.Usage, collector.Usage)
-		if o.contextManager != nil {
-			o.contextManager.UpdateUsage(conv, collector.Usage)
+		if err == nil {
+			if usageErr := o.commitProviderUsage(ctx, conv, collector.Usage, out); usageErr != nil {
+				stopReason, runErr := classifyStreamStartFailure(ctx, usageErr)
+				return finishRunResult(result, start, stopReason, o.stopRunWithError(
+					ctx, conv, state, out, iteration, options.MaxIterations, stopReason, runErr.Error(), runErr,
+				))
+			}
+			addUsage(&result.Usage, collector.Usage)
 		}
 		if o.thinking.Show {
-			conversation.AppendThinkingMessage(conv, collector.ThinkingText.String())
+			thinking := strings.TrimSpace(collector.ThinkingText.String())
+			if thinking != "" {
+				o.appendConversationMessage(conv, conversation.RoleThinking, o.safeText(thinking), nil)
+			}
 		}
 		if collector.AssistantText.Len() > 0 {
 			text := collector.AssistantText.String()
 			runtime := o.hookRuntime()
 			message := runtime.BeginMessage(hookLifecycleContext(ctx), state.ref, hook.MessageAssistant, text)
-			conversation.AppendAssistantMessage(conv, text)
+			o.appendConversationMessage(conv, conversation.RoleAssistant, o.safeText(text), nil)
 			runtime.EndMessage(hookLifecycleContext(ctx), message)
 		}
 		if err != nil {
@@ -57,13 +67,13 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 			if state.profile.UpdateMemory {
 				o.updateMemoryAfterCompleted(req, collector.AssistantText.String())
 			}
-			if !emitEvent(ctx, out, progressEvent(iteration, options.MaxIterations, string(StopReasonCompleted), "已完成")) {
+			if !emitEvent(ctx, out, o.progressEvent(iteration, options.MaxIterations, string(StopReasonCompleted), "已完成")) {
 				return finishRunResult(result, start, StopReasonCancelled, ctx.Err())
 			}
 			return finishRunResult(result, start, StopReasonCompleted)
 		}
 		if containsLoadSkillCall(collector.ToolCalls) {
-			terminal, stopReason, unknownCount, err := o.handleSkillToolCalls(ctx, conv, req, state, parentCheckpoint, iterationProfile, collector.ToolCalls, out)
+			terminal, stopReason, unknownCount, err := o.handleSkillToolCalls(ctx, conv, req, state, parentCheckpoint, iterationProfile, iteration, collector.ToolCalls, out)
 			unknownToolCalls += unknownCount
 			if err != nil {
 				if stopReason == "" || stopReason == StopReasonCompleted {
@@ -92,14 +102,14 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 		if err != nil {
 			return finishRunResult(result, start, StopReasonProviderError, o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, err.Error(), err))
 		}
-		batches := makeToolBatches(collector.ToolCalls, registry)
 		execCtx, scopeErr := o.contextWithReadScope(ctx, iterationProfile)
 		if scopeErr != nil {
 			return finishRunResult(result, start, StopReasonProviderError, o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, scopeErr.Error(), scopeErr))
 		}
-		executions, stopReason, err := o.executeToolBatchesWithRegistryAndRef(execCtx, req.Mode, registry, batches, state.ref, out)
-		for _, execution := range executions {
-			o.appendToolMessages(conv, execution.Call, execution.Result)
+		executions, stopReason, err := o.scheduleToolCallsWithRegistryAndRef(execCtx, req.Mode, registry, collector.ToolCalls, state.ref, out)
+		executions, publishErr := o.publishToolExecutions(ctx, conv, state, iteration, executions, out)
+		if publishErr != nil {
+			return finishRunResult(result, start, StopReasonProviderError, o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, StopReasonProviderError, publishErr.Error(), publishErr))
 		}
 		if err != nil {
 			return finishRunResult(result, start, stopReason, o.stopRunWithError(ctx, conv, state, out, iteration, options.MaxIterations, stopReason, err.Error(), err))
@@ -116,6 +126,15 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 		return finishRunResult(result, start, StopReasonProviderError, o.redactError(err))
 	}
 	return finishRunResult(result, start, StopReasonMaxIterations)
+}
+
+func closeProviderStream(stream provider.ChatStream) error {
+	if stream == nil {
+		return nil
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return stream.Close(closeCtx)
 }
 
 func classifyStreamStartFailure(ctx context.Context, err error) (StopReason, error) {
@@ -154,6 +173,51 @@ func addUsage(total *provider.Usage, usage *provider.Usage) {
 	total.CacheReadInputTokens += usage.CacheReadInputTokens
 }
 
+// commitProviderUsage is the sole ordered commit point for the Provider's
+// final usage snapshot. The same immutable values update conversation context
+// and the public status event; neither consumer derives or re-reads usage.
+func (o *Orchestrator) commitProviderUsage(ctx context.Context, conv *conversation.Conversation, usage *provider.Usage, out chan<- events.Event) error {
+	if usage == nil {
+		return nil
+	}
+	snapshot := *usage
+	if err := validateProviderUsageSnapshot(snapshot); err != nil {
+		return err
+	}
+	var previousContext *conversation.ContextMetadata
+	if conv != nil && conv.Context != nil {
+		copy := *conv.Context
+		previousContext = &copy
+	}
+	if o.contextManager != nil {
+		if err := o.contextManager.UpdateUsage(conv, snapshot); err != nil {
+			return err
+		}
+	}
+	if !emitEvent(ctx, out, events.Event{Type: events.UsageUpdated, Usage: usageDisplay(&snapshot)}) {
+		if conv != nil && o.contextManager != nil {
+			conv.Context = previousContext
+		}
+		if err := requestContextError(ctx); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	return nil
+}
+
+func validateProviderUsageSnapshot(usage provider.Usage) error {
+	values := [...]int64{usage.InputTokens, usage.OutputTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens}
+	var total int64
+	for _, value := range values {
+		if value < 0 || value > math.MaxInt64-total {
+			return errors.New("provider usage snapshot is invalid")
+		}
+		total += value
+	}
+	return nil
+}
+
 func (o *Orchestrator) saveConversationIfNeeded(ctx context.Context, conv *conversation.Conversation, state *executionState) error {
 	if state == nil || !state.profile.Persist || o.store == nil {
 		return nil
@@ -167,10 +231,15 @@ func (o *Orchestrator) saveConversationIfNeeded(ctx context.Context, conv *conve
 		saveCtx, cancel = context.WithTimeout(context.WithoutCancel(saveCtx), 2*time.Second)
 		defer cancel()
 	}
-	return o.store.Save(saveCtx, conv)
+	_, err := o.store.Save(saveCtx, conv)
+	return err
 }
 
 func (o *Orchestrator) stopRunWithError(ctx context.Context, conv *conversation.Conversation, state *executionState, out chan<- events.Event, iteration int, max int, reason StopReason, message string, err error) error {
+	if isOrderedToolCommitError(err) {
+		emitEvent(ctx, out, o.progressEvent(iteration, max, string(reason), message))
+		return o.redactError(err)
+	}
 	if saveErr := o.saveRunAfterStop(ctx, conv, state, out, iteration, max, reason, o.redactText(message)); saveErr != nil {
 		return o.redactError(saveErr)
 	}
@@ -181,7 +250,7 @@ func (o *Orchestrator) saveRunAfterStop(ctx context.Context, conv *conversation.
 	if err := o.saveConversationIfNeeded(ctx, conv, state); err != nil {
 		return err
 	}
-	emitEvent(ctx, out, progressEvent(iteration, max, string(reason), o.redactText(message)))
+	emitEvent(ctx, out, o.progressEvent(iteration, max, string(reason), message))
 	return nil
 }
 
@@ -196,14 +265,18 @@ func (o *Orchestrator) updateMemoryAfterCompleted(req RunRequest, assistantText 
 	o.memory.UpdateAsync(memory.UpdateInput{Scope: memory.ScopeProject, Candidate: candidate, Source: "agent_loop_completed", Now: time.Now()})
 }
 
-func progressEvent(iteration int, max int, reason string, message string) events.Event {
-	return events.Event{Type: events.AgentProgressed, Progress: &events.AgentProgress{Iteration: iteration, Max: max, StopReason: reason, Message: message}}
+func (o *Orchestrator) progressEvent(iteration int, max int, reason string, message string) events.Event {
+	return events.Event{Type: events.AgentProgressed, Progress: &events.AgentProgress{Iteration: iteration, Max: max, StopReason: reason, Message: o.safeText(message)}}
 }
 
 func countUnknownToolResults(executions []ToolExecution) int {
 	count := 0
 	for _, execution := range executions {
-		if execution.Result.Error != nil && execution.Result.Error.Code == tool.ErrToolNotFound {
+		if execution.Projected && execution.Projection.UserView.Error != nil && execution.Projection.UserView.Error.Code == tool.ErrToolNotFound {
+			count++
+			continue
+		}
+		if !execution.Projected && execution.Result.Error != nil && execution.Result.Error.Code == tool.ErrToolNotFound {
 			count++
 		}
 	}

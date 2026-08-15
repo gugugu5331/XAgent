@@ -4,13 +4,117 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"xagent/internal/budget"
 	"xagent/internal/config"
 	"xagent/internal/diagnostics"
 	"xagent/internal/prompt"
+	"xagent/internal/safefs"
 )
+
+func TestInstructionCacheKeyBindsFileContentAndIncludeOrder(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeInstructionFile(t, filepath.Join(projectRoot, "root.md"), "root")
+	writeInstructionFile(t, filepath.Join(projectRoot, "child.md"), "child")
+	opened, err := safefs.Bootstrap(projectRoot, safefs.Policy{})
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := opened.Root.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	rootBinding, err := opened.Root.Bind("root.md")
+	if err != nil {
+		t.Fatalf("Bind root: %v", err)
+	}
+	childBinding, err := opened.Root.Bind("child.md")
+	if err != nil {
+		t.Fatalf("Bind child: %v", err)
+	}
+	rootIdentity, err := FileIdentityFromBinding(rootBinding)
+	if err != nil {
+		t.Fatalf("FileIdentityFromBinding root: %v", err)
+	}
+	childIdentity, err := FileIdentityFromBinding(childBinding)
+	if err != nil {
+		t.Fatalf("FileIdentityFromBinding child: %v", err)
+	}
+	rootVersion, err := NewFileVersion(rootIdentity, []byte("root"))
+	if err != nil {
+		t.Fatalf("NewFileVersion root: %v", err)
+	}
+	childVersion, err := NewFileVersion(childIdentity, []byte("child"))
+	if err != nil {
+		t.Fatalf("NewFileVersion child: %v", err)
+	}
+	source := GraphSource{Name: "项目根指令", Scope: ScopeProjectRoot, Priority: PriorityProjectRoot, Root: rootIdentity}
+	edge := IncludeEdge{From: rootIdentity, To: childIdentity, Position: 0}
+	key, err := NewCacheKey(source, []FileVersion{rootVersion, childVersion}, []IncludeEdge{edge})
+	if err != nil {
+		t.Fatalf("NewCacheKey: %v", err)
+	}
+
+	changedChild, err := NewFileVersion(childIdentity, []byte("changed child"))
+	if err != nil {
+		t.Fatalf("NewFileVersion changed child: %v", err)
+	}
+	contentKey, err := NewCacheKey(source, []FileVersion{rootVersion, changedChild}, []IncludeEdge{edge})
+	if err != nil {
+		t.Fatalf("NewCacheKey changed content: %v", err)
+	}
+	orderKey, err := NewCacheKey(source, []FileVersion{rootVersion, childVersion}, []IncludeEdge{{From: rootIdentity, To: childIdentity, Position: 1}})
+	if err != nil {
+		t.Fatalf("NewCacheKey changed include order: %v", err)
+	}
+	if key == contentKey || key == orderKey || contentKey == orderKey {
+		t.Fatal("cache key did not bind file content and include order independently")
+	}
+}
+
+func TestInstructionCacheStillConsumesExpansionBudget(t *testing.T) {
+	const content = "cached expansion"
+	key := CacheKey{digest: [32]byte{1}}
+	cache := &ExpansionCache{}
+	if err := cache.Store(key, CachedExpansion{Content: content}); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	limits, err := budget.NewLimits(budget.Limit{Dimension: budget.ExpandedBytes, Value: int64(len(content))})
+	if err != nil {
+		t.Fatalf("NewLimits: %v", err)
+	}
+	counter, err := budget.NewCounter(limits, limits)
+	if err != nil {
+		t.Fatalf("NewCounter: %v", err)
+	}
+
+	first, found, err := cache.Lookup(key, counter)
+	if err != nil || !found || first.Content != content {
+		t.Fatalf("first Lookup = (%#v, %t, %v), want cached content", first, found, err)
+	}
+	if got := counter.Snapshot().Used(budget.ExpandedBytes); got != int64(len(content)) {
+		t.Fatalf("expanded bytes after first hit = %d, want %d", got, len(content))
+	}
+
+	second, found, err := cache.Lookup(key, counter)
+	if err == nil || !found {
+		t.Fatalf("second Lookup = (%#v, %t, %v), want budget failure on cache hit", second, found, err)
+	}
+	if second.Content != "" || second.Files != nil || second.Edges != nil {
+		t.Fatalf("second Lookup exposed content after budget failure: %#v", second)
+	}
+	if got := counter.Snapshot().Used(budget.ExpandedBytes); got != int64(len(content)) {
+		t.Fatalf("failed cache hit changed expanded bytes to %d, want %d", got, len(content))
+	}
+}
 
 func TestLoaderUsesInstructionFallbackFiles(t *testing.T) {
 	projectRoot := t.TempDir()
@@ -115,6 +219,46 @@ func TestLoaderReportsOversizedInstructionFile(t *testing.T) {
 		t.Fatalf("len(sections) = %d, want 0", len(sections))
 	}
 	assertInstructionDiagnostic(t, items, "instructions_file_too_large")
+}
+
+func TestLoaderUsesSharedCumulativeInstructionBudget(t *testing.T) {
+	projectRoot := t.TempDir()
+	userRoot := t.TempDir()
+	cfg := testConfig()
+	rootContent := "root\n@include child.md"
+	childContent := "child"
+	cfg.MaxFiles = 2
+	cfg.MaxTotalBytes = int64(len(rootContent) + len(childContent))
+	cfg.MaxExpandedBytes = int64(len("root\nchild"))
+	writeInstructionFile(t, filepath.Join(projectRoot, cfg.ProjectFile), rootContent)
+	writeInstructionFile(t, filepath.Join(projectRoot, "child.md"), childContent)
+
+	loader := Loader{ProjectRoot: projectRoot, UserDir: userRoot, Config: cfg}
+	sections, items := loader.Load(context.Background())
+	if len(sections) != 1 || sections[0].Content != "root\nchild" {
+		t.Fatalf("boundary load = %#v diagnostics=%#v", sections, items)
+	}
+	assertNoInstructionDiagnostic(t, items, "instructions_files_limit")
+	assertNoInstructionDiagnostic(t, items, "instructions_total_bytes_limit")
+	assertNoInstructionDiagnostic(t, items, "instructions_expanded_bytes_limit")
+
+	cfg.MaxFiles = 1
+	loader.Config = cfg
+	sections, items = loader.Load(context.Background())
+	if len(sections) != 1 || sections[0].Content != "root" {
+		t.Fatalf("file-limited load exposed rejected include: %#v diagnostics=%#v", sections, items)
+	}
+	assertInstructionDiagnostic(t, items, "instructions_files_limit")
+}
+
+func TestLoaderCancellationStopsSafefsDiscovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sections, items := (Loader{ProjectRoot: t.TempDir(), UserDir: t.TempDir(), Config: testConfig()}).Load(ctx)
+	if len(sections) != 0 {
+		t.Fatalf("canceled load returned sections: %#v", sections)
+	}
+	assertInstructionDiagnostic(t, items, "instructions_context_cancelled")
 }
 
 func TestLoaderOptionalSectionsStayBelowFixedStableSections(t *testing.T) {
@@ -300,4 +444,89 @@ func assertInstructionDiagnostic(t *testing.T, items []diagnostics.Diagnostic, c
 		}
 	}
 	t.Fatalf("diagnostics missing %q: %#v", code, items)
+}
+
+func runIncludeLinkRace(t *testing.T) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	outside := t.TempDir()
+	userRoot := t.TempDir()
+	const canary = "outside-instruction-canary-73194628"
+	writeInstructionFile(t, filepath.Join(projectRoot, "MEWCODE.md"), "root\n@include slot/secret.md")
+	writeInstructionFile(t, filepath.Join(outside, "secret.md"), canary)
+	slot := filepath.Join(projectRoot, "slot")
+	held := filepath.Join(projectRoot, "slot-held")
+	writeInstructionFile(t, filepath.Join(slot, "secret.md"), "inside")
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	started := make(chan struct{})
+	errorsSeen := make(chan error, 1)
+	var startedOnce sync.Once
+	var swaps atomic.Int64
+	reportError := func(err error) {
+		select {
+		case errorsSeen <- err:
+		default:
+		}
+		startedOnce.Do(func() { close(started) })
+	}
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := os.Rename(slot, held); err != nil {
+				reportError(err)
+				return
+			}
+			if err := os.Symlink(outside, slot); err != nil {
+				_ = os.Rename(held, slot)
+				reportError(err)
+				return
+			}
+			swaps.Add(1)
+			startedOnce.Do(func() { close(started) })
+			runtime.Gosched()
+			if err := os.Remove(slot); err != nil {
+				reportError(err)
+				return
+			}
+			if err := os.Rename(held, slot); err != nil {
+				reportError(err)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	<-started
+
+	loader := Loader{ProjectRoot: projectRoot, UserDir: userRoot, Config: testConfig()}
+	leaked := false
+	for attempt := 0; attempt < 64; attempt++ {
+		sections, items := loader.Load(context.Background())
+		for _, section := range sections {
+			leaked = leaked || strings.Contains(section.Content, canary)
+		}
+		for _, item := range items {
+			leaked = leaked || strings.Contains(item.Message, canary) || strings.Contains(item.Path, canary)
+		}
+		runtime.Gosched()
+	}
+	close(stop)
+	<-done
+	select {
+	case err := <-errorsSeen:
+		t.Fatalf("link race fixture failed: %v", err)
+	default:
+	}
+	if swaps.Load() == 0 {
+		t.Fatal("link race fixture made no replacement")
+	}
+	if leaked {
+		t.Fatal("safefs instruction load exposed outside-root content during link replacement")
+	}
 }

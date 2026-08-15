@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type CommandMenuItem struct {
@@ -14,9 +15,11 @@ type CommandMenuItem struct {
 }
 
 type CommandMenu struct {
-	Items    []CommandMenuItem
-	Selected int
-	Visible  bool
+	Items     []CommandMenuItem
+	Selected  int
+	Visible   bool
+	region    Region
+	regionSet bool
 }
 
 func (m *CommandMenu) Open(items []CommandMenuItem) {
@@ -48,12 +51,39 @@ func (m CommandMenu) SelectedItem() (CommandMenuItem, bool) {
 	return m.Items[m.Selected], true
 }
 
+func (m *CommandMenu) SetRegion(region Region) {
+	m.region = Region{
+		X: nonNegative(region.X), Y: nonNegative(region.Y),
+		Width: nonNegative(region.Width), Height: nonNegative(region.Height),
+	}
+	m.regionSet = true
+}
+
 func (m CommandMenu) View() string {
 	if !m.Visible || len(m.Items) == 0 {
 		return ""
 	}
+	start, end := 0, len(m.Items)
+	if m.regionSet {
+		if m.region.Width == 0 || m.region.Height == 0 {
+			return ""
+		}
+		maxRows := m.region.Height
+		if end > maxRows {
+			start = m.Selected - maxRows + 1
+			if start < 0 {
+				start = 0
+			}
+			end = start + maxRows
+			if end > len(m.Items) {
+				end = len(m.Items)
+				start = end - maxRows
+			}
+		}
+	}
 	var builder strings.Builder
-	for index, item := range m.Items {
+	for index := start; index < end; index++ {
+		item := m.Items[index]
 		prefix := "  "
 		if index == m.Selected {
 			prefix = "› "
@@ -68,11 +98,14 @@ func (m CommandMenu) View() string {
 		if strings.TrimSpace(item.Description) != "" {
 			line += " — " + item.Description
 		}
+		if m.regionSet {
+			line = ansi.Truncate(line, m.region.Width, "")
+		}
 		if index == m.Selected {
 			line = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render(line)
 		}
 		builder.WriteString(line)
-		if index < len(m.Items)-1 {
+		if index < end-1 {
 			builder.WriteByte('\n')
 		}
 	}

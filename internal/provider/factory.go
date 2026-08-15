@@ -2,29 +2,46 @@ package provider
 
 import (
 	"fmt"
-	"net/http"
 	"time"
 
 	"xagent/internal/config"
+	"xagent/internal/diagnostics"
+	"xagent/internal/netpolicy"
+	"xagent/internal/redact"
 )
 
-func New(cfg config.LLMConfig) (Provider, error) {
-	return NewWithOptions(cfg, ProviderOptions{})
+type ProviderOptions struct {
+	Endpoint        netpolicy.Endpoint
+	Client          netpolicy.Client
+	RuntimeRedactor *redact.RuntimeRedactor
+	CleanupTimeout  time.Duration
+	Diagnostics     diagnostics.BoundedSink
 }
 
-type ProviderOptions struct{}
-
-func NewWithOptions(cfg config.LLMConfig, _ ProviderOptions) (Provider, error) {
-	timeout := time.Duration(cfg.RequestTimeoutMS) * time.Millisecond
-	if timeout <= 0 {
-		timeout = time.Duration(config.DefaultLLMRequestTimeoutMS) * time.Millisecond
+func NewWithOptions(cfg config.LLMConfig, options ProviderOptions) (Provider, error) {
+	if options.Client == nil {
+		return nil, fmt.Errorf("Provider 需要受控网络客户端")
 	}
-	client := &http.Client{Timeout: timeout}
+	if options.RuntimeRedactor == nil {
+		return nil, fmt.Errorf("Provider 需要运行时脱敏器")
+	}
+	if options.Endpoint.URL == nil || options.Endpoint.Origin == "" || options.Endpoint.Purpose != netpolicy.PurposeProvider {
+		return nil, fmt.Errorf("Provider 需要已验证的网络端点")
+	}
+	cfg.BaseURL = options.Endpoint.URL.String()
+	streamOptions := ChatStreamOptions{
+		CleanupTimeout: options.CleanupTimeout,
+		Diagnostics:    options.Diagnostics,
+	}
 	switch cfg.Protocol {
 	case config.ProtocolAnthropic:
-		return NewAnthropic(cfg, client), nil
+		provider := NewAnthropic(cfg, options.Client, options.RuntimeRedactor)
+		provider.streamOptions = streamOptions
+		return provider, nil
 	case config.ProtocolOpenAI:
-		return NewOpenAI(cfg, client), nil
+		provider := NewOpenAI(cfg, options.Client, options.RuntimeRedactor)
+		provider.streamOptions = streamOptions
+		return provider, nil
 	default:
 		return nil, fmt.Errorf("未知 Provider 协议: %s", cfg.Protocol)
 	}

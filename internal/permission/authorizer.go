@@ -53,8 +53,10 @@ func (a *Authorizer) CheckHard(normalized NormalizedCall, context Context) *Deci
 	call := normalized.Call
 	if a != nil && a.permissionHealthDegraded() {
 		if isConservativeReadOnlyTool(call.Name) {
-			decision := a.allow(normalized, context, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
-			return &decision
+			// Degraded read-only calls remain eligible, but CheckHard must not
+			// issue an execution capability. The ordinary stage runs only after
+			// BeforeTool and performs the actual issuance.
+			return nil
 		}
 		decision := deny(call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "permission config error"}, "权限配置文件损坏，无法安全执行该工具", "Permission configuration is invalid, so this action cannot be performed safely.")
 		return &decision
@@ -81,6 +83,12 @@ func (a *Authorizer) CheckHard(normalized NormalizedCall, context Context) *Deci
 func (a *Authorizer) DecideOrdinary(normalized NormalizedCall, context Context) Decision {
 	if context.Mode == "" {
 		context.Mode = ModeDefault
+	}
+	if a != nil && a.permissionHealthDegraded() {
+		if isConservativeReadOnlyTool(normalized.Call.Name) {
+			return a.allow(normalized, context, GrantMode, Source{Kind: SourceHardConstraint, Description: "permission config degraded read-only allowlist"})
+		}
+		return deny(normalized.Call, ReasonConfigError, Source{Kind: SourceHardConstraint, Description: "permission config error"}, "权限配置文件损坏，无法安全执行该工具", "Permission configuration is invalid, so this action cannot be performed safely.")
 	}
 	if a == nil {
 		return a.decideByMode(context.Mode, normalized, context)

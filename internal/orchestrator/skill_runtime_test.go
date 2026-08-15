@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"xagent/internal/config"
+	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
 	"xagent/internal/events"
 	"xagent/internal/provider"
@@ -29,7 +30,7 @@ type scriptedSkillProvider struct {
 
 func (p *scriptedSkillProvider) Name() string { return "skill-script" }
 
-func (p *scriptedSkillProvider) StreamChat(_ context.Context, request provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (p *scriptedSkillProvider) StreamChat(_ context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
 	p.mu.Lock()
 	index := len(p.requests)
 	p.requests = append(p.requests, request)
@@ -38,15 +39,10 @@ func (p *scriptedSkillProvider) StreamChat(_ context.Context, request provider.C
 		scripted = append([]provider.StreamEvent(nil), p.events[index]...)
 	}
 	p.mu.Unlock()
-	out := make(chan provider.StreamEvent, len(scripted)+1)
-	for _, event := range scripted {
-		out <- event
-	}
 	if len(scripted) == 0 {
-		out <- provider.StreamEvent{Type: provider.StreamEventDone}
+		scripted = append(scripted, provider.StreamEvent{Type: provider.StreamEventDone})
 	}
-	close(out)
-	return out, nil
+	return newOrchestratorTestChatStream(scripted...), nil
 }
 
 func (p *scriptedSkillProvider) Requests() []provider.ChatRequest {
@@ -58,7 +54,7 @@ func (p *scriptedSkillProvider) Requests() []provider.ChatRequest {
 func newSkillRuntimeFixture(t *testing.T, files map[string]string, scripted [][]provider.StreamEvent) (*Orchestrator, *conversation.Conversation, *skill.Activity, *scriptedSkillProvider) {
 	t.Helper()
 	root := t.TempDir()
-	store, err := conversation.NewFileStore(filepath.Join(root, "sessions"))
+	store, err := newConversationTestStore(filepath.Join(root, "sessions"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,22 +82,28 @@ func newSkillRuntimeFixture(t *testing.T, files map[string]string, scripted [][]
 	}
 	provider := &scriptedSkillProvider{events: scripted}
 	executor := tool.NewExecutor(registry, root, time.Second, 4096)
+	historyPolicy, err := NewSkillHistoryPolicy(1<<30, 10_000_000, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	orch := NewWithOptions(OrchestratorOptions{
-		Provider:     provider,
-		Store:        store,
-		Resources:    resources.New(),
-		Thinking:     config.ThinkingConfig{},
-		Registry:     registry,
-		Executor:     executor,
-		SkillManager: manager,
-		DefaultModel: "default-model",
+		Provider:           provider,
+		Store:              store,
+		Resources:          resources.New(),
+		Thinking:           config.ThinkingConfig{},
+		Registry:           registry,
+		Executor:           executor,
+		SkillHistoryPolicy: historyPolicy,
+		RequestBudgeter:    contextmgr.NewRequestBudgeter(),
+		SkillManager:       manager,
+		DefaultModel:       "default-model",
 	})
 	return orch, conv, skill.NewActivity(), provider
 }
 
 func TestEmptySkillCatalogPreservesOrdinaryRequestBehavior(t *testing.T) {
 	script := [][]provider.StreamEvent{{
-		{Type: provider.StreamEventTextDelta, Delta: "ordinary reply"},
+		{Type: provider.StreamEventTextDelta, Delta: testSafeText("ordinary reply")},
 		{Type: provider.StreamEventUsage, Usage: &provider.Usage{InputTokens: 3, OutputTokens: 2}},
 		{Type: provider.StreamEventDone},
 	}}
@@ -110,6 +112,7 @@ func TestEmptySkillCatalogPreservesOrdinaryRequestBehavior(t *testing.T) {
 	withoutSkills := NewWithOptions(OrchestratorOptions{
 		Provider: withoutProvider, Store: withSkills.store, Resources: withSkills.resources,
 		Thinking: withSkills.thinking, Registry: withSkills.registry, Executor: withSkills.executor,
+		SkillHistoryPolicy: withSkills.skillHistoryPolicy, RequestBudgeter: withSkills.skillHistoryBudgeter,
 		DefaultModel: withSkills.defaultModel,
 	})
 	withoutConversation := conversation.NewConversation("without-skills", withConversation.CreatedAt)
@@ -131,7 +134,7 @@ func TestEmptySkillCatalogPreservesOrdinaryRequestBehavior(t *testing.T) {
 			if event.Type == events.Error {
 				t.Fatal(event.Err)
 			}
-			snapshots = append(snapshots, eventSnapshot{typeName: event.Type, text: event.Text, progress: event.Progress, usage: event.Usage})
+			snapshots = append(snapshots, eventSnapshot{typeName: event.Type, text: event.Text.Text(), progress: event.Progress, usage: event.Usage})
 		}
 		return snapshots
 	}
@@ -145,12 +148,6 @@ func TestEmptySkillCatalogPreservesOrdinaryRequestBehavior(t *testing.T) {
 	withoutRequests := withoutProvider.Requests()
 	if len(withRequests) != 1 || len(withoutRequests) != 1 {
 		t.Fatalf("unexpected Provider call counts: with=%d without=%d", len(withRequests), len(withoutRequests))
-	}
-	for index := range withRequests[0].Messages {
-		withRequests[0].Messages[index].CreatedAt = time.Time{}
-	}
-	for index := range withoutRequests[0].Messages {
-		withoutRequests[0].Messages[index].CreatedAt = time.Time{}
 	}
 	if !reflect.DeepEqual(withRequests[0], withoutRequests[0]) {
 		t.Fatal("empty Skill catalog changed the ordinary Provider request")
@@ -181,7 +178,7 @@ model: skill-model
 ACTIVE LINT {{args}}
 `,
 	}, [][]provider.StreamEvent{{
-		{Type: provider.StreamEventTextDelta, Delta: "lint done"},
+		{Type: provider.StreamEventTextDelta, Delta: testSafeText("lint done")},
 		{Type: provider.StreamEventDone},
 	}})
 
@@ -216,11 +213,11 @@ ACTIVE LINT {{args}}
 	if got := toolDefinitionNames(request.Tools); strings.Join(got, ",") != "Read,load_skill" {
 		t.Fatalf("unexpected tool view: %#v", got)
 	}
-	if len(conv.Messages) != 2 || conv.Messages[0].Content != "/lint focus" || conv.Messages[1].Content != "lint done" {
+	if len(conv.Messages) != 2 || conv.Messages[0].Content.Text() != "/lint focus" || conv.Messages[1].Content.Text() != "lint done" {
 		t.Fatalf("unexpected main history: %#v", conv.Messages)
 	}
 	for _, message := range conv.Messages {
-		if strings.Contains(message.Content, "ACTIVE LINT") {
+		if strings.Contains(message.Content.Text(), "ACTIVE LINT") {
 			t.Fatalf("SOP leaked into history: %#v", conv.Messages)
 		}
 	}
@@ -237,8 +234,8 @@ mode: shared
 SECURE {{args}}
 `,
 	}, [][]provider.StreamEvent{{
-		{Type: provider.StreamEventTextDelta, Delta: "reply " + opaqueSecret[:55]},
-		{Type: provider.StreamEventTextDelta, Delta: opaqueSecret[55:]},
+		{Type: provider.StreamEventTextDelta, Delta: testSafeText("reply " + opaqueSecret[:55])},
+		{Type: provider.StreamEventTextDelta, Delta: testSafeText(opaqueSecret[55:])},
 		{Type: provider.StreamEventDone},
 	}})
 	runtimeRedactor := redact.NewRuntimeRedactor()
@@ -256,13 +253,13 @@ SECURE {{args}}
 		if event.Type == events.Error {
 			t.Fatal(event.Err)
 		}
-		visible.WriteString(event.Text)
+		visible.WriteString(event.Text.Text())
 	}
 	if strings.Contains(visible.String(), opaqueSecret) {
 		t.Fatalf("shared streaming events leaked runtime secret: %q", visible.String())
 	}
 	for _, message := range conv.Messages {
-		if strings.Contains(message.Content, opaqueSecret) {
+		if strings.Contains(message.Content.Text(), opaqueSecret) {
 			t.Fatalf("shared history leaked runtime secret: %#v", conv.Messages)
 		}
 	}
@@ -271,8 +268,8 @@ SECURE {{args}}
 		t.Fatalf("expected one request, got %d", len(requests))
 	}
 	for _, block := range append(append([]provider.SystemBlock(nil), requests[0].StableSystem...), requests[0].DynamicSystem...) {
-		if strings.Contains(block.Content, opaqueSecret) {
-			t.Fatalf("shared provider prompt leaked runtime secret: %q", block.Content)
+		if strings.Contains(block.Content.Text(), opaqueSecret) {
+			t.Fatalf("shared provider prompt leaked runtime secret: %q", block.Content.Text())
 		}
 	}
 }
@@ -288,9 +285,9 @@ mode: shared
 SECOND ITERATION SOP {{args}}
 `,
 	}, [][]provider.StreamEvent{
-		{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "load-1", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":"lint","args":"now"}`}}},
-		{{Type: provider.StreamEventTextDelta, Delta: "done"}, {Type: provider.StreamEventDone}},
-		{{Type: provider.StreamEventTextDelta, Delta: "follow-up done"}, {Type: provider.StreamEventDone}},
+		{{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("load-1", tool.LoadSkillToolName, `{"name":"lint","args":"now"}`)}},
+		{{Type: provider.StreamEventTextDelta, Delta: testSafeText("done")}, {Type: provider.StreamEventDone}},
+		{{Type: provider.StreamEventTextDelta, Delta: testSafeText("follow-up done")}, {Type: provider.StreamEventDone}},
 	})
 
 	eventStream, err := orch.SendRequest(context.Background(), conv, RunRequest{UserText: "please lint", Mode: RunModeDefault, Activity: activity})
@@ -317,11 +314,11 @@ SECOND ITERATION SOP {{args}}
 	}
 	var hasCall, hasResult bool
 	for _, message := range conv.Messages {
-		hasCall = hasCall || message.Role == conversation.RoleToolCall && message.ToolName == tool.LoadSkillToolName
-		hasResult = hasResult || message.Role == conversation.RoleToolResult && message.ToolName == tool.LoadSkillToolName
+		hasCall = hasCall || message.Role == conversation.RoleToolCall && message.Tool != nil && message.Tool.Name == tool.LoadSkillToolName
+		hasResult = hasResult || message.Role == conversation.RoleToolResult && message.Tool != nil && message.Tool.Name == tool.LoadSkillToolName
 	}
-	if !hasCall || !hasResult {
-		t.Fatalf("shared load was not recorded normally: %#v", conv.Messages)
+	if hasCall || hasResult {
+		t.Fatalf("legacy load_skill adapter persisted tool history: %#v", conv.Messages)
 	}
 	if active := activity.Snapshot().Active; len(active) != 1 || active[0].Name != "lint" {
 		t.Fatalf("Agent-loaded shared Skill was not retained after its loading request: %#v", active)
@@ -359,12 +356,12 @@ mode: shared
 READ ONLY
 `,
 	}, [][]provider.StreamEvent{
-		{{Type: provider.StreamEventToolCall, ToolCalls: []tool.Call{
-			{ID: "glob-before", Name: "Glob", ArgumentsJSON: `{"pattern":"*.md"}`},
-			{ID: "load-middle", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":"read-only"}`},
-			{ID: "grep-after", Name: "Grep", ArgumentsJSON: `{"pattern":"needle","path":"."}`},
-		}}},
-		{{Type: provider.StreamEventTextDelta, Delta: "mixed calls done"}, {Type: provider.StreamEventDone}},
+		{
+			{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("glob-before", "Glob", `{"pattern":"*.md"}`)},
+			{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("load-middle", tool.LoadSkillToolName, `{"name":"read-only"}`)},
+			{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("grep-after", "Grep", `{"pattern":"needle","path":"."}`)},
+		},
+		{{Type: provider.StreamEventTextDelta, Delta: testSafeText("mixed calls done")}, {Type: provider.StreamEventDone}},
 	})
 
 	eventStream, err := orch.SendRequest(context.Background(), conv, RunRequest{UserText: "load while using tools", Mode: RunModeDefault, Activity: activity})
@@ -388,14 +385,16 @@ READ ONLY
 	var grepError string
 	for _, message := range conv.Messages {
 		if message.Role == conversation.RoleToolCall {
-			calls = append(calls, message.ToolName)
+			if message.Tool != nil {
+				calls = append(calls, message.Tool.Name)
+			}
 		}
-		if message.Role == conversation.RoleToolResult && message.ToolName == "Grep" {
-			grepError = message.ToolErrorCode
+		if message.Role == conversation.RoleToolResult && message.Tool != nil && message.Tool.Name == "Grep" && message.Tool.Error != nil {
+			grepError = message.Tool.Error.Code
 		}
 	}
-	if got := strings.Join(calls, ","); got != "Glob,load_skill,Grep" {
-		t.Fatalf("provider tool-call order changed: %s", got)
+	if got := strings.Join(calls, ","); got != "" {
+		t.Fatalf("legacy adapter persisted provider tool calls: %s", got)
 	}
 	if grepError == tool.ErrToolNotFound {
 		t.Fatal("tool after load_skill incorrectly used the next-iteration whitelist")
@@ -413,8 +412,8 @@ mode: shared
 READ ONLY
 `,
 	}, [][]provider.StreamEvent{
-		{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "forged", Name: "Bash", ArgumentsJSON: `{"command":"touch should-not-exist"}`}}},
-		{{Type: provider.StreamEventTextDelta, Delta: "handled rejection"}, {Type: provider.StreamEventDone}},
+		{{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("forged", "Bash", `{"command":"touch should-not-exist"}`)}},
+		{{Type: provider.StreamEventTextDelta, Delta: testSafeText("handled rejection")}, {Type: provider.StreamEventDone}},
 	})
 	if _, err := orch.PrepareSkill(skill.Invocation{Name: "read-only", Origin: skill.OriginSlash}, activity); err != nil {
 		t.Fatal(err)
@@ -423,10 +422,12 @@ READ ONLY
 	if err != nil {
 		t.Fatal(err)
 	}
+	var rejected bool
 	for event := range eventStream {
 		if event.Type == events.Error {
 			t.Fatal(event.Err)
 		}
+		rejected = rejected || event.Type == events.ToolError && event.Tool != nil && event.Tool.ErrorCode == tool.ErrToolNotFound
 	}
 	if len(scripted.Requests()) != 2 {
 		t.Fatalf("expected rejection followed by final response, got %d calls", len(scripted.Requests()))
@@ -434,20 +435,14 @@ READ ONLY
 	if got := strings.Join(toolDefinitionNames(scripted.Requests()[0].Tools), ","); got != "Read,load_skill" {
 		t.Fatalf("filtered request exposed unexpected tools: %s", got)
 	}
-	var rejected bool
-	for _, message := range conv.Messages {
-		if message.Role == conversation.RoleToolResult && message.ToolErrorCode == tool.ErrToolNotFound {
-			rejected = true
-		}
-	}
 	if !rejected {
-		t.Fatalf("forged filtered tool was not rejected: %#v", conv.Messages)
+		t.Fatal("forged filtered tool was not rejected by bounded legacy event")
 	}
 }
 
 func systemBlocksContain(blocks []provider.SystemBlock, value string) bool {
 	for _, block := range blocks {
-		if strings.Contains(block.Content, value) {
+		if strings.Contains(block.Content.Text(), value) {
 			return true
 		}
 	}

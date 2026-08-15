@@ -3,8 +3,13 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"xagent/internal/config"
@@ -13,7 +18,6 @@ import (
 	"xagent/internal/diagnostics"
 	"xagent/internal/events"
 	"xagent/internal/hook"
-	"xagent/internal/mcpclient"
 	"xagent/internal/memory"
 	"xagent/internal/permission"
 	"xagent/internal/prompt"
@@ -26,19 +30,36 @@ import (
 )
 
 type OrchestratorOptions struct {
-	Provider            provider.Provider
-	Store               conversation.ConversationStore
-	Resources           resources.PromptProvider
-	Thinking            config.ThinkingConfig
-	Registry            *tool.Registry
-	Executor            *tool.Executor
+	Provider  provider.Provider
+	Store     conversation.Store
+	Resources resources.PromptProvider
+	Thinking  config.ThinkingConfig
+	Registry  *tool.Registry
+	Executor  *tool.Executor
+	// CleanupTimeout and LifecycleDiagnostics are the C7 inputs for
+	// request-owned Provider ChatStreams. Diagnostics remains the legacy
+	// session/context Collector below; keeping the two fields distinct avoids
+	// widening or replacing the established diagnostic projection API while
+	// allowing the process root to inject its one bounded sink.
+	CleanupTimeout       time.Duration
+	LifecycleDiagnostics diagnostics.BoundedSink
+	// Authorizer is the Assembly-owned permission boundary. When supplied,
+	// NewWithOptions retains it instead of creating a second authority or
+	// reloading rules from a process-level path.
+	Authorizer          *permission.Authorizer
 	ContextManager      *contextmgr.Manager
+	ResultFactory       *tool.ResultFactory
+	SkillHistoryPolicy  SkillHistoryPolicy
+	RequestBudgeter     contextmgr.RequestBudgeter
+	MaxRecordBytes      int64
+	MaxSessionBytes     int64
 	SessionContext      sessionPreparer
 	Memory              memoryUpdater
 	Diagnostics         *diagnostics.Collector
 	Agent               config.AgentConfig
 	SkillManager        *skill.Manager
 	DefaultModel        string
+	RuntimeRedactor     *redact.RuntimeRedactor
 	Redact              func(string) string
 	RedactionLookbehind int
 	Hooks               hook.Runtime
@@ -61,65 +82,97 @@ type memoryUpdater interface {
 }
 
 type Orchestrator struct {
-	provider            provider.Provider
-	store               conversation.ConversationStore
-	resources           resources.PromptProvider
-	thinking            config.ThinkingConfig
-	registry            *tool.Registry
-	readOnlyRegistry    *tool.Registry
-	executor            *tool.Executor
-	authorizer          *permission.Authorizer
-	contextManager      *contextmgr.Manager
-	sessionContext      sessionPreparer
-	memory              memoryUpdater
-	diagnostics         *diagnostics.Collector
-	skillManager        *skill.Manager
-	defaultModel        string
-	redact              func(string) string
-	redactionLookbehind int
-	permissionMode      permission.Mode
-	runOptions          RunOptions
-	runs                *runTracker
-	hooks               hook.Runtime
+	provider             provider.Provider
+	store                conversation.Store
+	resources            resources.PromptProvider
+	thinking             config.ThinkingConfig
+	registry             *tool.Registry
+	readOnlyRegistry     *tool.Registry
+	executor             *tool.Executor
+	authorizer           *permission.Authorizer
+	contextManager       *contextmgr.Manager
+	resultFactory        *tool.ResultFactory
+	skillHistoryPolicy   SkillHistoryPolicy
+	skillHistoryBudgeter contextmgr.RequestBudgeter
+	maxRecordBytes       int64
+	maxSessionBytes      int64
+	requestGeneration    atomic.Uint64
+	confirmationSequence atomic.Uint64
+	confirmationMu       sync.Mutex
+	pendingConfirmations map[string]*pendingConfirmation
+	sessionContext       sessionPreparer
+	memory               memoryUpdater
+	diagnostics          *diagnostics.Collector
+	chatStreamOptions    provider.ChatStreamOptions
+	skillManager         *skill.Manager
+	defaultModel         string
+	runtimeRedactor      *redact.RuntimeRedactor
+	redact               func(string) string
+	redactionLookbehind  int
+	permissionMode       permission.Mode
+	runOptions           RunOptions
+	runs                 *runTracker
+	hooks                hook.Runtime
 }
 
-func New(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
+type pendingConfirmation struct {
+	callID   string
+	decision chan events.ToolConfirmationDecision
+	resolved bool
+}
+
+func New(provider provider.Provider, store conversation.Store, resources resources.PromptProvider, thinking config.ThinkingConfig) *Orchestrator {
 	return NewWithOptions(OrchestratorOptions{Provider: provider, Store: store, Resources: resources, Thinking: thinking})
 }
 
-func NewWithTools(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig, registry *tool.Registry, executor *tool.Executor) *Orchestrator {
+func NewWithTools(provider provider.Provider, store conversation.Store, resources resources.PromptProvider, thinking config.ThinkingConfig, registry *tool.Registry, executor *tool.Executor) *Orchestrator {
 	return NewWithToolsAndContext(provider, store, resources, thinking, registry, executor, nil)
 }
 
-func NewWithToolsAndContext(provider provider.Provider, store conversation.ConversationStore, resources resources.PromptProvider, thinking config.ThinkingConfig, registry *tool.Registry, executor *tool.Executor, contextManager *contextmgr.Manager) *Orchestrator {
+func NewWithToolsAndContext(provider provider.Provider, store conversation.Store, resources resources.PromptProvider, thinking config.ThinkingConfig, registry *tool.Registry, executor *tool.Executor, contextManager *contextmgr.Manager) *Orchestrator {
 	return NewWithOptions(OrchestratorOptions{Provider: provider, Store: store, Resources: resources, Thinking: thinking, Registry: registry, Executor: executor, ContextManager: contextManager})
 }
 
 func NewWithOptions(options OrchestratorOptions) *Orchestrator {
+	runtimeRedactor := options.RuntimeRedactor
+	if runtimeRedactor == nil {
+		runtimeRedactor = redact.NewRuntimeRedactor()
+	}
 	redactor := options.Redact
 	if redactor == nil {
-		redactor = redact.Text
+		redactor = runtimeRedactor.Text
 	}
 	lookbehind := options.RedactionLookbehind
 	if lookbehind < 64 {
 		lookbehind = 64
 	}
 	var readOnlyRegistry *tool.Registry
-	var authorizer *permission.Authorizer
+	authorizer := options.Authorizer
 	if options.Executor != nil {
-		readOnlyRegistry, _ = tool.NewReadOnlyRegistry(options.Executor.ProjectRoot)
-		loaded := permission.LoadRules(options.Executor.ProjectRoot)
-		authority, _ := permission.NewTicketAuthority()
-		options.Executor.TicketVerifier = authority
-		authorizer = &permission.Authorizer{
-			Session:    permission.NewSession(),
-			User:       loaded.User,
-			Project:    loaded.Project,
-			Local:      loaded.Local,
-			LoadErrors: loaded.Errors,
-			Writer:     permission.Writer{},
-			Redact:     redactor,
-			Issuer:     authority,
+		if options.Registry != nil {
+			// Assembly supplies one safe-candidate Registry. Derive an immutable
+			// view over those exact tool instances instead of constructing a
+			// second set of legacy Read/Glob/Grep producers.
+			readOnlyRegistry, _ = options.Registry.View(tool.ViewOptions{ReadOnly: true})
+		} else {
+			// Compatibility constructors may still omit Registry until the
+			// T4.29a atomic cutover removes their legacy construction path.
+			readOnlyRegistry, _ = tool.NewReadOnlyRegistry(options.Executor.ProjectRoot)
+		}
+		if authorizer == nil {
+			loaded := permission.LoadRules(options.Executor.ProjectRoot)
+			authority, _ := permission.NewTicketAuthority()
+			options.Executor.TicketVerifier = authority
+			authorizer = &permission.Authorizer{
+				Session:    permission.NewSession(),
+				User:       loaded.User,
+				Project:    loaded.Project,
+				Local:      loaded.Local,
+				LoadErrors: loaded.Errors,
+				Writer:     permission.Writer{},
+				Redact:     redactor,
+				Issuer:     authority,
+			}
 		}
 	}
 	runOptions := runOptionsFromConfig(options.Agent)
@@ -127,7 +180,40 @@ func NewWithOptions(options OrchestratorOptions) *Orchestrator {
 	if hooks == nil {
 		hooks = hook.Noop()
 	}
-	return &Orchestrator{provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking, registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer, contextManager: options.ContextManager, sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics, skillManager: options.SkillManager, defaultModel: strings.TrimSpace(options.DefaultModel), redact: redactor, redactionLookbehind: lookbehind, permissionMode: permission.ModeDefault, runOptions: runOptions, runs: newRunTracker(), hooks: hooks}
+	return &Orchestrator{
+		provider: options.Provider, store: options.Store, resources: options.Resources, thinking: options.Thinking,
+		registry: options.Registry, readOnlyRegistry: readOnlyRegistry, executor: options.Executor, authorizer: authorizer,
+		contextManager: options.ContextManager, resultFactory: options.ResultFactory,
+		skillHistoryPolicy: options.SkillHistoryPolicy, skillHistoryBudgeter: options.RequestBudgeter,
+		maxRecordBytes: options.MaxRecordBytes, maxSessionBytes: options.MaxSessionBytes,
+		sessionContext: options.SessionContext, memory: options.Memory, diagnostics: options.Diagnostics,
+		chatStreamOptions: provider.ChatStreamOptions{
+			CleanupTimeout: options.CleanupTimeout,
+			Diagnostics:    options.LifecycleDiagnostics,
+		},
+		skillManager: options.SkillManager, defaultModel: strings.TrimSpace(options.DefaultModel),
+		runtimeRedactor: runtimeRedactor, redact: redactor, redactionLookbehind: lookbehind,
+		permissionMode: permission.ModeDefault, runOptions: runOptions, runs: newRunTracker(), hooks: hooks,
+		pendingConfirmations: make(map[string]*pendingConfirmation),
+	}
+}
+
+func (o *Orchestrator) candidateResultsEnabled() bool {
+	return o != nil && o.resultFactory != nil
+}
+
+func (o *Orchestrator) configureCandidateState(state *executionState, conversationID string) error {
+	if !o.candidateResultsEnabled() {
+		return nil
+	}
+	if o.contextManager == nil || o.maxRecordBytes <= 0 || o.maxSessionBytes <= 0 || o.maxRecordBytes > o.maxSessionBytes {
+		return fmt.Errorf("safe tool result candidate dependencies are incomplete")
+	}
+	generation := o.requestGeneration.Add(1)
+	if generation == 0 {
+		return fmt.Errorf("request generation overflow")
+	}
+	return state.configureModelContentSlots(conversationID, generation, o.maxRecordBytes, o.maxSessionBytes)
 }
 
 // WaitIdle waits until every main or independent Agent run has completed its
@@ -152,6 +238,25 @@ func (o *Orchestrator) redactText(value string) string {
 		return redact.Text(value)
 	}
 	return o.redact(value)
+}
+
+func (o *Orchestrator) safeText(value string) redact.SafeText {
+	if o == nil || o.runtimeRedactor == nil {
+		return redact.NewRuntimeRedactor().Redact(redact.Text(value))
+	}
+	return o.runtimeRedactor.Redact(o.redactText(value))
+}
+
+func (o *Orchestrator) safeError(code string, err error) *diagnostics.SafeError {
+	if err == nil {
+		return nil
+	}
+	return &diagnostics.SafeError{
+		Code:        code,
+		Source:      "orchestrator",
+		Message:     o.safeText(err.Error()),
+		Recoverable: false,
+	}
 }
 
 func (o *Orchestrator) redactError(err error) error {
@@ -214,7 +319,7 @@ func (o *Orchestrator) CompactContext(ctx context.Context, conv *conversation.Co
 		Observer:         hookCompactionObserver{runtime: o.hookRuntime(), binding: binding, redact: o.redactText},
 	})
 	if result.Changed {
-		if saveErr := o.store.Save(ctx, conv); saveErr != nil {
+		if _, saveErr := o.store.Save(ctx, conv); saveErr != nil {
 			return result, saveErr
 		}
 	}
@@ -259,19 +364,23 @@ func (o *Orchestrator) SendRequest(ctx context.Context, conv *conversation.Conve
 	if err != nil {
 		return nil, err
 	}
+	if err := o.configureCandidateState(state, conv.ID); err != nil {
+		return nil, err
+	}
 	runtime := o.hookRuntime()
 	state.ref = runtime.BeginTurn(requestCtxOrBackground(ctx), conv.ID, hook.ExecutionMain, hookMode(req.Mode))
 	message := runtime.BeginMessage(requestCtxOrBackground(ctx), state.ref, hook.MessageUser, req.UserText)
-	conversation.AppendUserMessage(conv, req.UserText)
+	o.appendConversationMessage(conv, conversation.RoleUser, o.safeText(req.UserText), nil)
 	runtime.EndMessage(requestCtxOrBackground(ctx), message)
 	out := make(chan events.Event)
 
 	go func() {
 		defer close(out)
 		defer endRun()
+		defer state.clearModelContentSlots()
 		start := time.Now()
 		result := RunResult{}
-		if !emitEvent(ctx, out, events.Event{Type: events.UserSubmitted, Text: req.UserText}) {
+		if !emitEvent(ctx, out, events.Event{Type: events.UserSubmitted, Text: o.safeText(req.UserText)}) {
 			result = finishRunResult(result, start, StopReasonCancelled, ctx.Err())
 		} else {
 			result = o.runAgentLoop(ctx, conv, req, state, out, start)
@@ -325,13 +434,13 @@ func hookTurnStatus(result RunResult) hook.TurnStatus {
 
 func (o *Orchestrator) emitTerminalEvent(ctx context.Context, out chan<- events.Event, result RunResult) {
 	if result.Err != nil {
-		emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.redactError(result.Err)})
+		emitEvent(ctx, out, events.Event{Type: events.Error, Err: o.safeError("orchestrator_run_failed", result.Err)})
 		return
 	}
 	emitEvent(ctx, out, events.Event{Type: events.Done, Duration: result.Duration})
 }
 
-func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, mode RunMode, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
+func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversation, mode RunMode, includeTools bool, iteration int) (provider.ChatStream, error) {
 	profile, err := o.buildExecutionProfile(mode, skill.NewActivity(), 0)
 	if err != nil {
 		return nil, err
@@ -339,11 +448,37 @@ func (o *Orchestrator) stream(ctx context.Context, conv *conversation.Conversati
 	return o.streamWithProfile(ctx, conv, mode, profile, includeTools, iteration)
 }
 
-func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int) (<-chan provider.StreamEvent, error) {
+func (o *Orchestrator) streamWithProfile(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int) (provider.ChatStream, error) {
 	return o.streamWithExecution(ctx, conv, mode, profile, includeTools, iteration, hook.ExecutionRef{})
 }
 
-func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int, ref hook.ExecutionRef) (<-chan provider.StreamEvent, error) {
+func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int, ref hook.ExecutionRef) (provider.ChatStream, error) {
+	return o.streamWithExecutionState(ctx, conv, mode, profile, includeTools, iteration, ref, nil)
+}
+
+func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conversation.Conversation, mode RunMode, profile skill.ExecutionProfile, includeTools bool, iteration int, ref hook.ExecutionRef, state *executionState) (stream provider.ChatStream, err error) {
+	if state != nil && o.candidateResultsEnabled() {
+		if conv == nil {
+			state.clearModelContentSlots()
+			return nil, fmt.Errorf("conversation is unavailable")
+		}
+		slots := &state.modelContents
+		slots.mu.Lock()
+		generation := slots.requestGeneration
+		slots.mu.Unlock()
+		if err := state.beginModelContentIteration(conv.ID, generation, iteration); err != nil {
+			return nil, err
+		}
+		defer func() {
+			// StreamChat owns a value request after handoff. No model-only view may
+			// remain reachable from executionState on success or error.
+			state.clearModelContentSlots()
+		}()
+	}
+	var beforeMessages []conversation.Message
+	if conv != nil {
+		beforeMessages = cloneMessages(conv.Messages)
+	}
 	optionalSections := []prompt.Section{}
 	binding := hook.CompactBinding{}
 	if conv != nil {
@@ -378,8 +513,13 @@ func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversati
 		if o.diagnostics != nil {
 			o.diagnostics.Add(prepared.Diagnostics...)
 		}
+		if prepared.MessagesChanged && state != nil && o.candidateResultsEnabled() {
+			if err := state.rebaseModelContentSlots(uniqueMessageSurvivors(beforeMessages, conv.Messages)); err != nil {
+				return nil, err
+			}
+		}
 		if prepared.MessagesChanged && profile.Persist && o.store != nil {
-			if err := o.store.Save(ctx, conv); err != nil {
+			if _, err := o.store.Save(ctx, conv); err != nil {
 				return nil, err
 			}
 		}
@@ -388,8 +528,13 @@ func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversati
 		if err != nil {
 			return nil, err
 		}
+		if result.Changed && state != nil && o.candidateResultsEnabled() {
+			if err := state.rebaseModelContentSlots(uniqueMessageSurvivors(beforeMessages, conv.Messages)); err != nil {
+				return nil, err
+			}
+		}
 		if result.Changed && profile.Persist && o.store != nil {
-			if err := o.store.Save(ctx, conv); err != nil {
+			if _, err := o.store.Save(ctx, conv); err != nil {
 				return nil, err
 			}
 		}
@@ -431,11 +576,15 @@ func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversati
 		OptionalStableSections: optionalSections,
 		HookBlocks:             hookBlocks,
 	})
+	messages, err := o.providerMessagesWithState(conv, state, iteration)
+	if err != nil {
+		return nil, err
+	}
 	request := provider.ChatRequest{
 		Model:         profile.Model,
-		StableSystem:  providerStableBlocks(bundle.StableBlocks),
-		DynamicSystem: providerDynamicBlocks(bundle.DynamicBlocks),
-		Messages:      conversation.ContextMessages(conv),
+		StableSystem:  o.providerStableBlocks(bundle.StableBlocks),
+		DynamicSystem: o.providerDynamicBlocks(bundle.DynamicBlocks),
+		Messages:      messages,
 		Thinking:      o.thinking,
 		Cache:         provider.CachePolicy{EnablePromptCache: true},
 	}
@@ -443,7 +592,7 @@ func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversati
 		request.Tools = toolDefinitionsFromRegistry(requestRegistry)
 	}
 	if bundle.UsesOrderedBlocks() {
-		request.System = providerOrderedBlocks(bundle.OrderedBlocks)
+		request.System = o.providerOrderedBlocks(bundle.OrderedBlocks)
 		request.StableSystem = nil
 		request.DynamicSystem = nil
 		request.Cache.SystemBreakpointName = bundle.SystemBreakpointName
@@ -451,6 +600,36 @@ func (o *Orchestrator) streamWithExecution(ctx context.Context, conv *conversati
 	}
 	if lease != nil {
 		request.Observer = newPromptLeaseObserver(lease)
+	}
+	request, err = o.applyIndependentSkillHistory(ctx, request)
+	if err != nil {
+		if lease != nil {
+			lease.Release()
+		}
+		return nil, err
+	}
+	if err := requestContextError(ctx); err != nil {
+		if lease != nil {
+			lease.Release()
+		}
+		if hasIndependentSkillHistoryBinding(ctx) {
+			err = wrapIndependentSkillHistoryError(err)
+		}
+		return nil, err
+	}
+	return o.streamChat(ctx, request)
+}
+
+// streamChat is the single Provider handoff. Concrete Providers that own a
+// lifecycle-aware ChatStream receive the exact resolved C7 options; legacy or
+// test Providers that only implement the original interface remain compatible
+// and use their existing StreamChat path.
+func (o *Orchestrator) streamChat(ctx context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
+	if o == nil || o.provider == nil {
+		return nil, errors.New("Provider 不可用")
+	}
+	if configured, ok := o.provider.(provider.ChatStreamOptionsProvider); ok {
+		return configured.StreamChatWithOptions(ctx, request, o.chatStreamOptions)
 	}
 	return o.provider.StreamChat(ctx, request)
 }
@@ -473,91 +652,315 @@ func promptRunMode(mode RunMode) prompt.RunMode {
 	}
 }
 
-func providerStableBlocks(blocks []prompt.Block) []provider.SystemBlock {
+func (o *Orchestrator) providerStableBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: true})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: true})
 	}
 	return result
 }
 
-func providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
+func (o *Orchestrator) providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: false})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: false})
 	}
 	return result
 }
 
-func providerOrderedBlocks(blocks []prompt.Block) []provider.SystemBlock {
+func (o *Orchestrator) providerOrderedBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: block.Content, Cacheable: block.Stable})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: block.Stable})
 	}
 	return result
 }
 
-func (o *Orchestrator) appendToolMessages(conv *conversation.Conversation, call tool.Call, result tool.Result) {
-	data := resultData(result)
-	errorData := resultErrorData(result)
-	if len(data) > 0 {
-		data = json.RawMessage(o.redactText(string(data)))
-	}
-	if len(errorData) > 0 {
-		errorData = json.RawMessage(o.redactText(string(errorData)))
-	}
-	conversation.AppendToolCallMessage(conv, call.ID, call.Name, o.redactText(redactedArguments(call)))
-	conversation.AppendToolResultMessage(conv, call.ID, call.Name, resultHistoryStatus(result), o.redactText(redactSensitive(result.Summary)), o.redactText(resultContent(result)), resultErrorCode(result), result.Truncated, data, errorData)
+func (o *Orchestrator) providerMessages(messages []conversation.Message) []provider.ModelMessage {
+	result, _ := o.providerMessagesFromSlice(messages, "", nil, 0)
+	return result
 }
 
-func (o *Orchestrator) appendUnsupportedToolMessages(conv *conversation.Conversation, calls []tool.Call, result tool.Result) {
-	for _, call := range calls {
-		callResult := result
-		callResult.CallID = call.ID
-		callResult.Name = call.Name
-		o.appendToolMessages(conv, call, callResult)
+func (o *Orchestrator) providerMessagesWithState(conv *conversation.Conversation, state *executionState, iteration int) ([]provider.ModelMessage, error) {
+	if conv == nil {
+		return nil, fmt.Errorf("conversation is unavailable")
 	}
+	return o.providerMessagesFromSlice(conv.Messages, conv.ID, state, iteration)
+}
+
+func (o *Orchestrator) providerMessagesFromSlice(messages []conversation.Message, conversationID string, state *executionState, iteration int) ([]provider.ModelMessage, error) {
+	result := make([]provider.ModelMessage, 0, len(messages))
+	for messageIndex, message := range messages {
+		role, ok := providerMessageRole(message.Role)
+		if !ok {
+			continue
+		}
+		modelMessage := provider.ModelMessage{
+			Role:    role,
+			Content: message.Content,
+		}
+		if message.Tool != nil {
+			modelMessage.ToolCallID = message.Tool.CallID
+			modelMessage.ToolName = message.Tool.Name
+			modelMessage.ArgumentsJSON = message.Tool.ArgumentsJSON
+			modelMessage.ToolResult = message.Tool.Result
+			modelMessage.ToolResultStatus = string(message.Tool.Status)
+			if state != nil && message.Role == conversation.RoleToolResult {
+				modelContent, found, err := state.lookupModelContentForMessage(conversationID, iteration, messageIndex, message.Tool.CallID)
+				if err != nil {
+					return nil, err
+				}
+				if found {
+					modelMessage.Content = modelContent
+					modelMessage.ToolResult = modelContent
+				}
+			}
+		}
+		result = append(result, modelMessage)
+	}
+	return result, nil
+}
+
+func uniqueMessageSurvivors(before, after []conversation.Message) map[int][]int {
+	result := make(map[int][]int, len(before))
+	for oldIndex := range before {
+		for newIndex := range after {
+			if sameConversationMessage(before[oldIndex], after[newIndex]) {
+				result[oldIndex] = append(result[oldIndex], newIndex)
+			}
+		}
+	}
+	return result
+}
+
+func sameConversationMessage(left, right conversation.Message) bool {
+	if left.Role != right.Role || left.Content.Text() != right.Content.Text() || !left.CreatedAt.Equal(right.CreatedAt) || (left.Tool == nil) != (right.Tool == nil) {
+		return false
+	}
+	if left.Tool == nil {
+		return true
+	}
+	l, r := left.Tool, right.Tool
+	if l.CallID != r.CallID || l.Name != r.Name || l.ArgumentsJSON.Text() != r.ArgumentsJSON.Text() || l.State != r.State ||
+		l.Status != r.Status || l.Summary.Text() != r.Summary.Text() || l.Result.Text() != r.Result.Text() ||
+		l.Truncated != r.Truncated || l.TruncationReason.Text() != r.TruncationReason.Text() ||
+		(l.Artifact == nil) != (r.Artifact == nil) || (l.Error == nil) != (r.Error == nil) {
+		return false
+	}
+	if l.Artifact != nil && *l.Artifact != *r.Artifact {
+		return false
+	}
+	return l.Error == nil || (l.Error.Code == r.Error.Code && l.Error.Message.Text() == r.Error.Message.Text() && l.Error.Recoverable == r.Error.Recoverable)
+}
+
+func providerMessageRole(role conversation.MessageRole) (provider.ModelMessageRole, bool) {
+	switch role {
+	case conversation.RoleUser:
+		return provider.ModelMessageRoleUser, true
+	case conversation.RoleAssistant:
+		return provider.ModelMessageRoleAssistant, true
+	case conversation.RoleToolCall:
+		return provider.ModelMessageRoleToolCall, true
+	case conversation.RoleToolResult:
+		return provider.ModelMessageRoleToolResult, true
+	case conversation.RoleContextSummary:
+		return provider.ModelMessageRoleContextSummary, true
+	case conversation.RoleContextBoundary:
+		return provider.ModelMessageRoleContextBoundary, true
+	default:
+		return "", false
+	}
+}
+
+type projectedToolPublication struct {
+	executionIndex int
+	execution      ToolExecution
+	projection     contextmgr.ToolResultProjection
+	arguments      redact.SafeText
+}
+
+type orderedToolCommitError struct {
+	err error
+}
+
+func (e *orderedToolCommitError) Error() string {
+	if e == nil || e.err == nil {
+		return "ordered tool commit failed"
+	}
+	return e.err.Error()
+}
+
+func (e *orderedToolCommitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func isOrderedToolCommitError(err error) bool {
+	var commitErr *orderedToolCommitError
+	return errors.As(err, &commitErr)
+}
+
+func (o *Orchestrator) publishToolExecutions(ctx context.Context, conv *conversation.Conversation, state *executionState, providerIteration int, executions []ToolExecution, out chan<- events.Event) ([]ToolExecution, error) {
+	if !o.candidateResultsEnabled() {
+		// The migration adapter already emitted the bounded compatibility
+		// Event/Hook at execution time. It cannot project, persist, or stage.
+		return executions, nil
+	}
+	if o.contextManager == nil || state == nil || conv == nil {
+		return executions, fmt.Errorf("safe tool result publisher is unavailable")
+	}
+	// Results produced after Provider iteration N are consumed by request N+1.
+	nextIteration := providerIteration + 1
+	slots := &state.modelContents
+	slots.mu.Lock()
+	generation := slots.requestGeneration
+	slots.mu.Unlock()
+	if err := state.beginModelContentIteration(conv.ID, generation, nextIteration); err != nil {
+		return executions, err
+	}
+	publications := make([]projectedToolPublication, 0, len(executions))
+	for index := range executions {
+		execution := executions[index]
+		if execution.State == tool.CancelledBeforeStart {
+			if execution.HasResult || execution.Result.CallID != "" {
+				state.clearModelContentSlots()
+				return executions, fmt.Errorf("tool cancelled before start cannot publish a result")
+			}
+			continue
+		}
+		if execution.State.Valid() && !execution.State.CanProduceResult() && execution.HasResult {
+			state.clearModelContentSlots()
+			return executions, fmt.Errorf("tool execution state cannot publish a result")
+		}
+		if execution.State.CanProduceResult() && !execution.HasResult {
+			state.clearModelContentSlots()
+			return executions, fmt.Errorf("terminal tool execution is missing its result")
+		}
+		if !execution.HasResult {
+			continue
+		}
+		if resultState := execution.Result.ExecutionState(); resultState.Valid() && execution.State.Valid() && resultState != execution.State {
+			state.clearModelContentSlots()
+			return executions, fmt.Errorf("tool execution state does not match its result")
+		}
+		projection, err := o.contextManager.ProjectToolResult(execution.Result)
+		if err != nil {
+			state.clearModelContentSlots()
+			return executions, err
+		}
+		publications = append(publications, projectedToolPublication{
+			executionIndex: index, execution: execution, projection: projection, arguments: o.safeText(redactedArguments(execution.Call)),
+		})
+	}
+	// Execution workers retain their original return slots. Only the durable
+	// publication view is ordered by the Provider call ordinal.
+	sort.SliceStable(publications, func(i, j int) bool {
+		return publications[i].execution.Index < publications[j].execution.Index
+	})
+	if len(publications) == 0 {
+		return executions, nil
+	}
+	baseMessageIndex := len(conv.Messages)
+	for index := range publications {
+		publication := &publications[index]
+		messageIndex := baseMessageIndex + index*2 + 1
+		execution := publication.execution
+		if _, err := state.stageCurrentModelContent(nextIteration, messageIndex, execution.Call.ID, publication.projection.ModelContent); err != nil {
+			state.clearModelContentSlots()
+			return executions, err
+		}
+	}
+	checkpoint := checkpointConversation(conv)
+	for index := range publications {
+		publication := &publications[index]
+		call := publication.execution.Call
+		o.appendConversationMessage(conv, conversation.RoleToolCall, o.safeText(call.Name), &conversation.ToolState{
+			CallID: call.ID, Name: call.Name, ArgumentsJSON: publication.arguments, State: tool.Prepared,
+		})
+		messageIndex, err := conversation.AppendProjectedToolResultMessage(conv, conversation.ToolResultMessageInput{
+			CallID: call.ID, Name: call.Name, PersistedContent: publication.projection.PersistedContent,
+			UserView: publication.projection.UserView, OutputMeta: publication.projection.OutputMeta,
+		})
+		if err != nil || messageIndex != baseMessageIndex+index*2+1 {
+			restoreConversation(conv, checkpoint)
+			state.clearModelContentSlots()
+			if err != nil {
+				return executions, err
+			}
+			return executions, fmt.Errorf("projected tool result message index mismatch")
+		}
+		publication.execution.Projection = publication.projection
+		publication.execution.Projected = true
+		executions[publication.executionIndex] = publication.execution
+	}
+	var eventErr error
+	for index := range publications {
+		publication := publications[index]
+		execution := publication.execution
+		if execution.HookInput.CallID != "" {
+			o.hookRuntime().AfterTool(hookLifecycleContext(ctx), execution.Ref, execution.HookInput, hook.ToolOutputFromUserView(publication.projection.UserView), execution.Duration)
+		}
+		if !emitEvent(ctx, out, events.ToolResultEventFromUserView(execution.Call.ID, execution.Call.Name, publication.arguments, publication.projection.UserView)) {
+			eventErr = ctx.Err()
+			if eventErr == nil {
+				eventErr = fmt.Errorf("tool result event publication failed")
+			}
+			break
+		}
+	}
+	// Conversation is the execution-fact owner once all safe projections have
+	// been appended. Event cancellation must not roll it back or prevent the
+	// one ordered save attempt.
+	saveErr := o.saveConversationIfNeeded(ctx, conv, state)
+	if eventErr != nil || saveErr != nil {
+		return executions, &orderedToolCommitError{err: errors.Join(eventErr, saveErr)}
+	}
+	return executions, nil
+}
+
+func (o *Orchestrator) publishToolExecution(ctx context.Context, conv *conversation.Conversation, state *executionState, providerIteration int, execution ToolExecution, out chan<- events.Event) (ToolExecution, error) {
+	published, err := o.publishToolExecutions(ctx, conv, state, providerIteration, []ToolExecution{execution}, out)
+	if len(published) == 0 {
+		return execution, err
+	}
+	return published[0], err
+}
+
+func (o *Orchestrator) appendConversationMessage(conv *conversation.Conversation, role conversation.MessageRole, content redact.SafeText, toolState *conversation.ToolState) {
+	if conv == nil {
+		return
+	}
+	now := time.Now()
+	conv.Messages = append(conv.Messages, conversation.Message{Role: role, Content: content, CreatedAt: now, Tool: toolState})
+	if role == conversation.RoleUser && conv.Title.Text() == "新会话" {
+		conv.Title = o.safeText(conversationTitle(content.Text()))
+	}
+	conv.UpdatedAt = now
+}
+
+func conversationTitle(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\n", " "))
+	if value == "" {
+		return "新会话"
+	}
+	runes := []rune(value)
+	if len(runes) > 24 {
+		return string(runes[:24]) + "..."
+	}
+	return value
 }
 
 func streamToolCalls(event provider.StreamEvent) []tool.Call {
-	if len(event.ToolCalls) > 0 {
-		return event.ToolCalls
-	}
 	if event.ToolCall == nil {
 		return nil
 	}
-	return []tool.Call{*event.ToolCall}
-}
-
-func multipleToolCallsResult(calls []tool.Call) tool.Result {
-	callID := "multiple_tool_calls"
-	if len(calls) > 0 && calls[0].ID != "" {
-		callID = calls[0].ID
-	}
-	names := make([]string, 0, len(calls))
-	for _, call := range calls {
-		names = append(names, call.Name)
-	}
-	return tool.Result{
-		CallID:  callID,
-		Name:    "multiple_tool_calls",
-		Status:  tool.StatusError,
-		Summary: "本阶段不支持一次返回多个工具调用",
-		Content: "本阶段一次只能执行一个工具调用，请重新选择一个工具调用。",
-		Data:    map[string]any{"tool_names": names, "count": len(calls)},
-		Error:   &tool.Error{Code: tool.ErrMultipleToolCallsUnsupported, Message: "本阶段不支持一次返回多个工具调用", Recoverable: true},
-	}
-}
-
-func unsupportedToolLoopResult(call tool.Call) tool.Result {
-	return tool.Result{
-		CallID:  call.ID,
-		Name:    call.Name,
-		Status:  tool.StatusError,
-		Summary: "本阶段不支持连续工具调用",
-		Content: "本阶段不支持 Agent Loop 中的第二次工具调用。",
-		Error:   &tool.Error{Code: tool.ErrMultipleToolCallsUnsupported, Message: "本阶段不支持连续工具调用", Recoverable: true},
-	}
+	return []tool.Call{{
+		ID:            event.ToolCall.ID,
+		Name:          event.ToolCall.Name,
+		ArgumentsJSON: event.ToolCall.ArgumentsJSON.Text(),
+	}}
 }
 
 func toolResultEvent(result tool.Result) events.Event {
@@ -594,28 +997,36 @@ func (o *Orchestrator) redactToolDisplay(display *events.ToolDisplay) {
 	if display == nil {
 		return
 	}
-	display.Arguments = o.redactText(display.Arguments)
-	display.Summary = o.redactText(display.Summary)
-	display.Stdout = o.redactText(display.Stdout)
-	display.Stderr = o.redactText(display.Stderr)
-	display.ArtifactID = o.redactText(display.ArtifactID)
+	display.Arguments = o.safeText(display.Arguments.Text())
+	display.Summary = o.safeText(display.Summary.Text())
+	display.Stdout = o.safeText(display.Stdout.Text())
+	display.Stderr = o.safeText(display.Stderr.Text())
+	if display.Artifact != nil {
+		display.Artifact.ID = o.redactText(display.Artifact.ID)
+	}
 }
 
-func (o *Orchestrator) safeConfirmationRequest(call tool.Call, decision permission.Decision, decisionCh chan events.ToolConfirmationDecision) *events.ToolConfirmationRequest {
-	request := confirmationRequest(call, decision, decisionCh)
+func (o *Orchestrator) safeConfirmationRequest(call tool.Call, decision permission.Decision, confirmationID string) *events.ToolConfirmationRequest {
+	request := confirmationRequest(call, decision, confirmationID)
 	if request == nil {
 		return nil
 	}
-	request.Arguments = o.redactText(request.Arguments)
-	request.Prompt = o.redactText(request.Prompt)
-	request.ScopePreview = o.redactText(request.ScopePreview)
-	request.Warning = o.redactText(request.Warning)
-	request.RevokeHint = o.redactText(request.RevokeHint)
+	request.Arguments = o.safeText(request.Arguments.Text())
+	request.Prompt = o.safeText(request.Prompt.Text())
+	request.Target = o.safeText(request.Target.Text())
+	request.ScopePreview = o.safeText(request.ScopePreview.Text())
+	for index := range request.Scopes {
+		request.Scopes[index].Description = o.safeText(request.Scopes[index].Description.Text())
+	}
+	request.RuleLocation = o.safeText(request.RuleLocation.Text())
+	request.Warning = o.safeText(request.Warning.Text())
+	request.RevokeHint = o.safeText(request.RevokeHint.Text())
 	return request
 }
 
 func newToolDisplay(call tool.Call, status events.ToolDisplayStatus, summary string) *events.ToolDisplay {
-	return &events.ToolDisplay{CallID: call.ID, Name: call.Name, Arguments: redactedArguments(call), Summary: summary, Status: status}
+	redactor := redact.NewRuntimeRedactor()
+	return &events.ToolDisplay{CallID: call.ID, Name: call.Name, Arguments: redactor.Redact(redactedArguments(call)), Summary: redactor.Redact(summary), Status: status}
 }
 
 func redactedArguments(call tool.Call) string {
@@ -624,7 +1035,7 @@ func redactedArguments(call tool.Call) string {
 		return redactSensitive(call.ArgumentsJSON)
 	}
 	if strings.HasPrefix(call.Name, "mcp__") {
-		data, err := json.Marshal(mcpclient.RedactArguments(args))
+		data, err := json.Marshal(redact.Map(args))
 		if err != nil {
 			return "{}"
 		}
@@ -650,6 +1061,7 @@ func resultHistoryStatus(result tool.Result) string {
 }
 
 func resultDisplay(result tool.Result) *events.ToolDisplay {
+	redactor := redact.NewRuntimeRedactor()
 	status := events.ToolDisplaySuccess
 	switch result.Status {
 	case tool.StatusError, tool.StatusTimeout:
@@ -660,20 +1072,25 @@ func resultDisplay(result tool.Result) *events.ToolDisplay {
 			status = events.ToolDisplayCancelled
 		}
 	}
-	return &events.ToolDisplay{
-		CallID:            result.CallID,
-		Name:              result.Name,
-		Summary:           redactSensitive(result.Summary),
-		Status:            status,
-		ErrorCode:         resultErrorCode(result),
-		Stdout:            stringData(result.Data, "stdout"),
-		Stderr:            stringData(result.Data, "stderr"),
-		Truncated:         result.Truncated,
-		Recoverable:       resultRecoverable(result),
-		ArtifactID:        artifactID(result),
-		ArtifactBytes:     artifactBytes(result),
-		ArtifactAvailable: artifactAvailable(result),
+	display := &events.ToolDisplay{
+		CallID:      result.CallID,
+		Name:        result.Name,
+		Summary:     redactor.Redact(redactSensitive(result.Summary)),
+		Status:      status,
+		ErrorCode:   resultErrorCode(result),
+		Stdout:      redactor.Redact(stringData(result.Data, "stdout")),
+		Stderr:      redactor.Redact(stringData(result.Data, "stderr")),
+		Truncated:   result.Truncated,
+		Recoverable: resultRecoverable(result),
 	}
+	if id := artifactID(result); id != "" {
+		display.Artifact = &events.ArtifactRef{
+			ID:        id,
+			Bytes:     artifactBytes(result),
+			Available: artifactAvailable(result),
+		}
+	}
+	return display
 }
 
 func stringData(data map[string]any, key string) string {
@@ -735,26 +1152,103 @@ func formatToolConfirmation(call tool.Call) string {
 	}
 }
 
-func confirmationRequest(call tool.Call, decision permission.Decision, decisionCh chan events.ToolConfirmationDecision) *events.ToolConfirmationRequest {
+func confirmationRequest(call tool.Call, decision permission.Decision, confirmationID string) *events.ToolConfirmationRequest {
+	redactor := redact.NewRuntimeRedactor()
 	request := &events.ToolConfirmationRequest{
+		ConfirmationID: confirmationID,
 		CallID:         call.ID,
 		Name:           call.Name,
-		Arguments:      redactedArguments(call),
-		Prompt:         formatPermissionPrompt(call, decision),
+		Arguments:      redactor.Redact(redactedArguments(call)),
+		Prompt:         redactor.Redact(formatPermissionPrompt(call, decision)),
 		AllowPermanent: decision.Prompt != nil && decision.Prompt.AllowPermanent,
-		Decision:       decisionCh,
 	}
 	if decision.Prompt == nil {
 		return request
 	}
 	request.Risk = string(decision.Prompt.Risk)
 	request.PermissionMode = string(decision.Prompt.Mode)
+	request.Target = redactor.Redact(decision.Prompt.Target)
 	if decision.Prompt.RulePreview != nil {
-		request.ScopePreview = decision.Prompt.RulePreview.Display()
+		request.ScopePreview = redactor.Redact(decision.Prompt.RulePreview.Display())
 	}
-	request.Warning = permissionWarning(call, decision.Prompt)
-	request.RevokeHint = permissionRevokeHint(request.AllowPermanent)
+	if decision.Prompt.Scopes != nil {
+		request.Scopes = make([]events.ConfirmationScopeDisplay, len(decision.Prompt.Scopes))
+		for index, scope := range decision.Prompt.Scopes {
+			request.Scopes[index] = events.ConfirmationScopeDisplay{
+				Scope:       string(scope.Scope),
+				Available:   scope.Available,
+				Description: redactor.Redact(scope.Description),
+			}
+		}
+	}
+	request.RuleLocation = redactor.Redact(decision.Prompt.RuleLocation)
+	request.Warning = redactor.Redact(permissionWarning(call, decision.Prompt))
+	request.RevokeHint = redactor.Redact(decision.Prompt.RevokeHint)
 	return request
+}
+
+func (o *Orchestrator) openToolConfirmation(callID string) (string, <-chan events.ToolConfirmationDecision, func(), bool) {
+	if o == nil || strings.TrimSpace(callID) == "" {
+		return "", nil, func() {}, false
+	}
+	generation, ok := nextAtomicSequence(&o.confirmationSequence)
+	if !ok {
+		return "", nil, func() {}, false
+	}
+	confirmationID := fmt.Sprintf("confirmation-%d", generation)
+	pending := &pendingConfirmation{callID: callID, decision: make(chan events.ToolConfirmationDecision, 1)}
+	o.confirmationMu.Lock()
+	if o.pendingConfirmations == nil {
+		o.pendingConfirmations = make(map[string]*pendingConfirmation)
+	}
+	o.pendingConfirmations[confirmationID] = pending
+	o.confirmationMu.Unlock()
+
+	release := func() {
+		o.confirmationMu.Lock()
+		if o.pendingConfirmations[confirmationID] == pending {
+			delete(o.pendingConfirmations, confirmationID)
+		}
+		o.confirmationMu.Unlock()
+	}
+	return confirmationID, pending.decision, release, true
+}
+
+func nextAtomicSequence(sequence *atomic.Uint64) (uint64, bool) {
+	if sequence == nil {
+		return 0, false
+	}
+	for {
+		current := sequence.Load()
+		if current == math.MaxUint64 {
+			return 0, false
+		}
+		if sequence.CompareAndSwap(current, current+1) {
+			return current + 1, true
+		}
+	}
+}
+
+// ResolveToolConfirmation is the narrow decision boundary used by App. The
+// safe confirmation Event carries only opaque identity and display values;
+// the writable decision channel remains owned by Orchestrator.
+func (o *Orchestrator) ResolveToolConfirmation(decision events.ToolConfirmationDecision) bool {
+	if o == nil || strings.TrimSpace(decision.ConfirmationID) == "" || strings.TrimSpace(decision.CallID) == "" {
+		return false
+	}
+	o.confirmationMu.Lock()
+	defer o.confirmationMu.Unlock()
+	pending := o.pendingConfirmations[decision.ConfirmationID]
+	if pending == nil || pending.callID != decision.CallID || pending.resolved {
+		return false
+	}
+	select {
+	case pending.decision <- decision:
+		pending.resolved = true
+		return true
+	default:
+		return false
+	}
 }
 
 func permissionWarning(call tool.Call, prompt *permission.ConfirmationPrompt) string {
@@ -765,13 +1259,6 @@ func permissionWarning(call tool.Call, prompt *permission.ConfirmationPrompt) st
 		return "高风险工具调用，请确认目标和影响范围。"
 	}
 	return ""
-}
-
-func permissionRevokeHint(allowPermanent bool) string {
-	if allowPermanent {
-		return "永久授权会写入本地权限规则，可稍后从权限配置中撤销。"
-	}
-	return "本次工具调用不支持永久授权。"
 }
 
 func formatPermissionPrompt(call tool.Call, decision permission.Decision) string {
@@ -793,7 +1280,9 @@ func formatPermissionPrompt(call tool.Call, decision permission.Decision) string
 	if warning := permissionWarning(call, decision.Prompt); warning != "" {
 		parts = append(parts, "警告: "+warning)
 	}
-	parts = append(parts, permissionRevokeHint(decision.Prompt.AllowPermanent))
+	if hint := strings.TrimSpace(decision.Prompt.RevokeHint); hint != "" {
+		parts = append(parts, hint)
+	}
 	shortcut := "按 y 允许本次，按 s 本会话允许，按 n 拒绝，Esc 取消。"
 	if decision.Prompt.AllowPermanent {
 		shortcut = "按 y 允许本次，按 s 本会话允许，按 p 永久允许，按 n 拒绝，Esc 取消。"
@@ -861,28 +1350,6 @@ func resultContent(result tool.Result) string {
 		return redactSensitive(result.Summary)
 	}
 	return string(data)
-}
-
-func resultData(result tool.Result) json.RawMessage {
-	if result.Data == nil {
-		return nil
-	}
-	data, err := marshalRedactedJSON(result.Data)
-	if err != nil {
-		return nil
-	}
-	return data
-}
-
-func resultErrorData(result tool.Result) json.RawMessage {
-	if result.Error == nil {
-		return nil
-	}
-	data, err := marshalRedactedJSON(result.Error)
-	if err != nil {
-		return nil
-	}
-	return data
 }
 
 func marshalRedactedJSON(value any) (json.RawMessage, error) {

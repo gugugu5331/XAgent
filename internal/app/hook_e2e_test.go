@@ -47,7 +47,7 @@ func TestHookE2EDriverSmoke(t *testing.T) {
 hooks: []
 `,
 		Scripts: [][]provider.StreamEvent{{
-			{Type: provider.StreamEventTextDelta, Delta: "smoke complete"},
+			{Type: provider.StreamEventTextDelta, Delta: appSafeText("smoke complete")},
 			{Type: provider.StreamEventDone},
 		}},
 	})
@@ -58,7 +58,7 @@ hooks: []
 	if driver.countEvent(agentevents.Done) != 1 || driver.countEvent(agentevents.Error) != 0 {
 		t.Fatalf("smoke terminal events = %#v", driver.events)
 	}
-	if conversationRef == nil || len(conversationRef.Messages) != 2 || conversationRef.Messages[0].Content != "smoke request" || conversationRef.Messages[1].Content != "smoke complete" {
+	if conversationRef == nil || len(conversationRef.Messages) != 2 || conversationRef.Messages[0].Content.Text() != "smoke request" || conversationRef.Messages[1].Content.Text() != "smoke complete" {
 		t.Fatalf("smoke conversation = %#v", conversationRef)
 	}
 	requests := fixture.provider.Requests()
@@ -101,8 +101,8 @@ hooks:
 `,
 		CommandRunner: runner,
 		Scripts: [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "read-lifecycle", Name: "Read", ArgumentsJSON: `{"path":"seed.txt"}`}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "lifecycle complete"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventToolCall, ToolCall: &provider.SafeToolCall{ID: "read-lifecycle", Name: "Read", ArgumentsJSON: appSafeText(`{"path":"seed.txt"}`)}}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("lifecycle complete")}, {Type: provider.StreamEventDone}},
 		},
 	})
 	if err := os.WriteFile(filepath.Join(fixture.projectRoot, "seed.txt"), []byte("seed"), 0o600); err != nil {
@@ -229,12 +229,12 @@ hooks:
 `, server.URL),
 		CommandRunner: runner,
 		Scripts: [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{
+			{{Type: provider.StreamEventToolCall, ToolCall: &provider.SafeToolCall{
 				ID:            "typed-transport",
 				Name:          "Read",
-				ArgumentsJSON: `{"path":"payload.txt","text":"alpha","number":9007199254740993,"flag":true,"object":{"key":"value"},"array":[1,"two",false]}`,
+				ArgumentsJSON: appSafeText(`{"path":"payload.txt","text":"alpha","number":9007199254740993,"flag":true,"object":{"key":"value"},"array":[1,"two",false]}`),
 			}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "transport complete"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("transport complete")}, {Type: provider.StreamEventDone}},
 		},
 	})
 	if err := os.WriteFile(filepath.Join(fixture.projectRoot, "payload.txt"), []byte("read payload"), 0o600); err != nil {
@@ -328,8 +328,8 @@ hooks:
 				PermissionMode: "default",
 				CommandRunner:  runner,
 				Scripts: [][]provider.StreamEvent{
-					{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "write-decision", Name: "Write", ArgumentsJSON: `{"path":"decision.txt","content":"executed"}`}}},
-					{{Type: provider.StreamEventTextDelta, Delta: "decision complete"}, {Type: provider.StreamEventDone}},
+					{{Type: provider.StreamEventToolCall, ToolCall: &provider.SafeToolCall{ID: "write-decision", Name: "Write", ArgumentsJSON: appSafeText(`{"path":"decision.txt","content":"executed"}`)}}},
+					{{Type: provider.StreamEventTextDelta, Delta: appSafeText("decision complete")}, {Type: provider.StreamEventDone}},
 				},
 			})
 			driver := hookE2EDriver{model: &fixture.model}
@@ -362,12 +362,12 @@ hooks:
 				var denied *conversation.Message
 				for index := range conversationRef.Messages {
 					message := &conversationRef.Messages[index]
-					if message.Role == conversation.RoleToolResult && message.ToolCallID == "write-decision" {
+					if message.Role == conversation.RoleToolResult && message.Tool != nil && message.Tool.CallID == "write-decision" {
 						denied = message
 						break
 					}
 				}
-				if denied == nil || denied.ToolErrorCode != tool.ErrHookDenied || denied.ToolResultStatus != string(tool.StatusDenied) || !strings.Contains(denied.Content, "blocked by deterministic E2E policy") || !bytes.Contains(denied.ToolResultError, []byte(`"recoverable":true`)) {
+				if denied == nil || denied.Tool == nil || denied.Tool.Error == nil || denied.Tool.Error.Code != tool.ErrHookDenied || denied.Tool.Status != tool.StatusDenied || !strings.Contains(denied.Content.Text(), "blocked by deterministic E2E policy") || !denied.Tool.Error.Recoverable {
 					t.Fatalf("hook_denied result did not flow back to the model: %#v", denied)
 				}
 			}
@@ -500,8 +500,8 @@ hooks:
 		CommandRunner: runner,
 		SkillDir:      skillDir,
 		Scripts: [][]provider.StreamEvent{
-			{{Type: provider.StreamEventTextDelta, Delta: "main answer"}, {Type: provider.StreamEventDone}},
-			{{Type: provider.StreamEventTextDelta, Delta: "isolated summary"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("main answer")}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("isolated summary")}, {Type: provider.StreamEventDone}},
 		},
 	})
 	driver := hookE2EDriver{model: &fixture.model}
@@ -527,7 +527,7 @@ hooks:
 	}
 	for index, want := range wantMain {
 		message := conversationRef.Messages[index]
-		if message.Role != want.role || message.Content != want.content {
+		if message.Role != want.role || message.Content.Text() != want.content {
 			t.Fatalf("main history[%d] = %#v, want %#v", index, message, want)
 		}
 	}
@@ -585,9 +585,9 @@ hooks:
 `,
 		CommandRunner: runner,
 		Scripts: [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "failure-read", Name: "Read", ArgumentsJSON: `{"path":"failure-seed.txt"}`}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "agent survived timeout"}, {Type: provider.StreamEventDone}},
-			{{Type: provider.StreamEventTextDelta, Delta: "agent remained isolated"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventToolCall, ToolCall: &provider.SafeToolCall{ID: "failure-read", Name: "Read", ArgumentsJSON: appSafeText(`{"path":"failure-seed.txt"}`)}}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("agent survived timeout")}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventTextDelta, Delta: appSafeText("agent remained isolated")}, {Type: provider.StreamEventDone}},
 		},
 	})
 	if err := os.WriteFile(filepath.Join(fixture.projectRoot, "failure-seed.txt"), []byte("seed"), 0o600); err != nil {
@@ -688,7 +688,7 @@ func newHookE2EFixture(t *testing.T, options hookE2EFixtureOptions) *hookE2EFixt
 	var idSequence atomic.Uint64
 	engine, err := hook.NewEngine(snapshot, hook.EngineOptions{
 		ProjectRoot:       projectRoot,
-		Diagnostics:       collector,
+		LegacyDiagnostics: collector,
 		Redactor:          runtimeRedactor,
 		CommandRunner:     options.CommandRunner,
 		HTTPRunner:        options.HTTPRunner,
@@ -866,16 +866,17 @@ type hookE2EProvider struct {
 	scripts  [][]provider.StreamEvent
 	requests []provider.ChatRequest
 	next     int
+	tracker  appTestStreamTracker
 }
 
 func (*hookE2EProvider) Name() string { return "hook-e2e-scripted" }
 
-func (p *hookE2EProvider) StreamChat(_ context.Context, request provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (p *hookE2EProvider) StreamChat(_ context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, hookE2ECloneRequest(request))
 	index := p.next
 	p.next++
-	events := []provider.StreamEvent{{Type: provider.StreamEventTextDelta, Delta: "script default"}, {Type: provider.StreamEventDone}}
+	events := []provider.StreamEvent{{Type: provider.StreamEventTextDelta, Delta: appSafeText("script default")}, {Type: provider.StreamEventDone}}
 	if index < len(p.scripts) {
 		events = append([]provider.StreamEvent(nil), p.scripts[index]...)
 	}
@@ -884,12 +885,7 @@ func (p *hookE2EProvider) StreamChat(_ context.Context, request provider.ChatReq
 		request.Observer.MarkSent()
 		request.Observer.Finish(true)
 	}
-	out := make(chan provider.StreamEvent, len(events))
-	for _, event := range events {
-		out <- event
-	}
-	close(out)
-	return out, nil
+	return newAppTestChatStream(events, &p.tracker), nil
 }
 
 func (p *hookE2EProvider) Requests() []provider.ChatRequest {
@@ -906,7 +902,7 @@ func hookE2ECloneRequest(request provider.ChatRequest) provider.ChatRequest {
 	request.System = append([]provider.SystemBlock(nil), request.System...)
 	request.StableSystem = append([]provider.SystemBlock(nil), request.StableSystem...)
 	request.DynamicSystem = append([]provider.SystemBlock(nil), request.DynamicSystem...)
-	request.Messages = append([]conversation.Message(nil), request.Messages...)
+	request.Messages = append([]provider.ModelMessage(nil), request.Messages...)
 	request.Tools = append([]provider.ToolDefinition(nil), request.Tools...)
 	return request
 }
@@ -984,20 +980,22 @@ type hookE2EStore struct {
 	active  *conversation.Conversation
 }
 
-func (s *hookE2EStore) List(context.Context) ([]conversation.Conversation, error) { return nil, nil }
-func (s *hookE2EStore) Load(_ context.Context, id string) (*conversation.Conversation, error) {
+func (s *hookE2EStore) List(context.Context) (conversation.ListResult, error) {
+	return conversation.ListResult{}, nil
+}
+func (s *hookE2EStore) Load(_ context.Context, id string) (conversation.LoadResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.active == nil || s.active.ID != id {
-		return nil, fmt.Errorf("conversation %s not found", id)
+		return conversation.LoadResult{}, fmt.Errorf("conversation %s not found", id)
 	}
-	return s.active, nil
+	return conversation.LoadResult{Conversation: s.active, Available: true, Recovery: conversation.RecoveryReport{Status: conversation.RecoveryClean}}, nil
 }
-func (s *hookE2EStore) Save(_ context.Context, value *conversation.Conversation) error {
+func (s *hookE2EStore) Save(_ context.Context, value *conversation.Conversation) (conversation.SaveResult, error) {
 	s.mu.Lock()
 	s.active = value
 	s.mu.Unlock()
-	return nil
+	return conversation.SaveResult{Kind: conversation.SaveNoop}, nil
 }
 func (s *hookE2EStore) Create(context.Context) (*conversation.Conversation, error) {
 	s.mu.Lock()
@@ -1005,6 +1003,9 @@ func (s *hookE2EStore) Create(context.Context) (*conversation.Conversation, erro
 	s.created++
 	s.active = conversation.NewConversation(fmt.Sprintf("e2e-session-%d", s.created), time.Unix(1_700_000_000, 0))
 	return s.active, nil
+}
+func (s *hookE2EStore) Maintain(context.Context) (conversation.MaintenanceResult, error) {
+	return conversation.MaintenanceResult{}, nil
 }
 
 type hookE2EResources struct{}
@@ -1057,18 +1058,16 @@ func hookE2EDecodeObject(t *testing.T, data []byte) map[string]any {
 }
 
 func hookE2ERequestContains(request provider.ChatRequest, value string) bool {
-	if strings.Contains(request.SystemPrompt, value) {
-		return true
-	}
 	for _, blocks := range [][]provider.SystemBlock{request.System, request.StableSystem, request.DynamicSystem} {
 		for _, block := range blocks {
-			if strings.Contains(block.Content, value) {
+			if strings.Contains(block.Content.Text(), value) {
 				return true
 			}
 		}
 	}
 	for _, message := range request.Messages {
-		if strings.Contains(message.Content, value) || strings.Contains(message.ToolResultContent, value) || strings.Contains(string(message.ToolResultError), value) {
+		if strings.Contains(message.Content.Text(), value) || strings.Contains(message.ArgumentsJSON.Text(), value) ||
+			strings.Contains(message.ToolResult.Text(), value) || strings.Contains(message.ToolResultStatus, value) {
 			return true
 		}
 	}
@@ -1088,7 +1087,7 @@ func hookE2EHookBlockContents(request provider.ChatRequest) []string {
 	result := []string{}
 	for _, block := range request.System {
 		if strings.HasPrefix(block.Name, "hook:") {
-			result = append(result, block.Content)
+			result = append(result, block.Content.Text())
 		}
 	}
 	return result

@@ -53,7 +53,7 @@ func commandRule(event Event, ordinal int, command string, decision, once, async
 
 func newTestEngine(t *testing.T, rules []Rule, runner CommandRunner, collector *diagnostics.Collector) *Engine {
 	t.Helper()
-	engine, err := NewEngine(newSnapshot(rules), EngineOptions{ProjectRoot: t.TempDir(), CommandRunner: runner, Diagnostics: collector, ShutdownGrace: time.Second, ShutdownJoinGrace: time.Second})
+	engine, err := NewEngine(newSnapshot(rules), EngineOptions{ProjectRoot: t.TempDir(), CommandRunner: runner, LegacyDiagnostics: collector, ShutdownGrace: time.Second, ShutdownJoinGrace: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,8 +63,8 @@ func newTestEngine(t *testing.T, rules []Rule, runner CommandRunner, collector *
 func TestDispatchStableOrderAndToolDecision(t *testing.T) {
 	runner := &fakeCommandRunner{results: map[string]CommandResult{"allow": {Stdout: []byte(`{"decision":"allow"}`)}, "deny": {Stdout: []byte(`{"decision":"deny","reason":"blocked"}`)}, "after": {Stdout: []byte(`{"decision":"allow"}`)}}, errors: map[string]error{}, block: map[string]chan struct{}{}}
 	engine := newTestEngine(t, []Rule{commandRule(EventToolBefore, 1, "allow", true, false, false), commandRule(EventToolBefore, 2, "deny", true, false, false), commandRule(EventToolBefore, 3, "after", true, false, false)}, runner, nil)
-	decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}, ToolInput{CallID: "c", Name: "Read", Arguments: map[string]any{}})
-	if !decision.IsDeny() || decision.Reason != "blocked" {
+	decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}, NewToolInput("c", "Read", map[string]any{}))
+	if !decision.IsDeny() || decision.Reason() != "blocked" {
 		t.Fatalf("decision = %#v", decision)
 	}
 	calls := runner.Calls()
@@ -159,7 +159,7 @@ func TestShutdownCancellationNotice(t *testing.T) {
 		EngineOptions{
 			ProjectRoot:       t.TempDir(),
 			CommandRunner:     runner,
-			Diagnostics:       collector,
+			LegacyDiagnostics: collector,
 			AsyncWorkers:      1,
 			AsyncQueue:        3,
 			ShutdownGrace:     10 * time.Millisecond,
@@ -421,7 +421,7 @@ func TestShutdownAdmissionBarrierAndContext(t *testing.T) {
 	}
 }
 
-func TestShutdownCanceledWhileWaitingForLifecycleCanRetry(t *testing.T) {
+func TestShutdownWaiterCancellationDoesNotRestartCleanup(t *testing.T) {
 	turnStarted := make(chan struct{})
 	turnRelease := make(chan struct{})
 	runner := &fakeCommandRunner{
@@ -451,8 +451,8 @@ func TestShutdownCanceledWhileWaitingForLifecycleCanRetry(t *testing.T) {
 	engine.lifecycleMu.Lock()
 	state := engine.systemState
 	engine.lifecycleMu.Unlock()
-	if state != 1 {
-		t.Fatalf("canceled pre-stop left state %d", state)
+	if state != 4 {
+		t.Fatalf("caller cancellation changed closing state to %d", state)
 	}
 	close(turnRelease)
 	<-turnDone
@@ -460,7 +460,7 @@ func TestShutdownCanceledWhileWaitingForLifecycleCanRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if calls := runner.Calls(); len(calls) != 2 || calls[0] != "turn-end" || calls[1] != "system-stop" {
-		t.Fatalf("retry lifecycle = %#v", calls)
+		t.Fatalf("continued lifecycle = %#v", calls)
 	}
 }
 
@@ -478,7 +478,7 @@ func TestCommandIOFailureSettlement(t *testing.T) {
 	}, runner, collector)
 	ref := ExecutionRef{SessionID: "s", ExecutionID: "e", TurnID: "t", Kind: ExecutionMain, Mode: ModeDefault}
 	for attempt := 0; attempt < 2; attempt++ {
-		decision := engine.BeforeTool(context.Background(), ref, ToolInput{CallID: "c", Name: "Read", Arguments: map[string]any{}})
+		decision := engine.BeforeTool(context.Background(), ref, NewToolInput("c", "Read", map[string]any{}))
 		if decision.IsDeny() {
 			t.Fatalf("I/O failure produced deny on attempt %d: %#v", attempt, decision)
 		}

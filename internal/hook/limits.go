@@ -3,59 +3,61 @@ package hook
 // Limits contains every configurable and runtime bound imposed by schema v1.
 // A value returned by DefaultLimits is an independent copy.
 type Limits struct {
-	YAMLBytes            int
-	RulesPerFile         int
-	PredicatesPerRule    int
-	CommandBytes         int
-	CommandEnvCount      int
-	EnvKeyBytes          int
-	EnvValueBytes        int
-	EventJSONBytes       int
-	CommandStdoutBytes   int
-	CommandStderrBytes   int
-	HTTPURLBytes         int
-	HTTPHeaderCount      int
-	HTTPHeaderNameBytes  int
-	HTTPHeaderValueBytes int
-	HTTPRequestBytes     int
-	HTTPResponseBytes    int
-	HTTPRedirects        int
-	PromptTemplateBytes  int
-	PromptFragmentBytes  int
-	PromptOwnerBytes     int
-	SubAgentNameBytes    int
-	SubAgentInputBytes   int
-	DenyReasonBytes      int
-	DiagnosticBytes      int
+	YAMLBytes             int
+	RulesPerFile          int
+	PredicatesPerRule     int
+	CommandBytes          int
+	CommandEnvCount       int
+	EnvKeyBytes           int
+	EnvValueBytes         int
+	EventJSONBytes        int
+	CommandStdoutBytes    int
+	CommandStderrBytes    int
+	HTTPURLBytes          int
+	HTTPHeaderCount       int
+	HTTPHeaderNameBytes   int
+	HTTPHeaderValueBytes  int
+	HTTPRequestBytes      int
+	HTTPResponseBytes     int
+	HTTPErrorPreviewBytes int
+	HTTPRedirects         int
+	PromptTemplateBytes   int
+	PromptFragmentBytes   int
+	PromptOwnerBytes      int
+	SubAgentNameBytes     int
+	SubAgentInputBytes    int
+	DenyReasonBytes       int
+	DiagnosticBytes       int
 }
 
 // DefaultLimits returns the immutable production defaults as a value copy.
 func DefaultLimits() Limits {
 	return Limits{
-		YAMLBytes:            256 << 10,
-		RulesPerFile:         256,
-		PredicatesPerRule:    32,
-		CommandBytes:         16 << 10,
-		CommandEnvCount:      64,
-		EnvKeyBytes:          128,
-		EnvValueBytes:        8 << 10,
-		EventJSONBytes:       1 << 20,
-		CommandStdoutBytes:   32 << 10,
-		CommandStderrBytes:   32 << 10,
-		HTTPURLBytes:         2 << 10,
-		HTTPHeaderCount:      32,
-		HTTPHeaderNameBytes:  128,
-		HTTPHeaderValueBytes: 8 << 10,
-		HTTPRequestBytes:     1 << 20,
-		HTTPResponseBytes:    64 << 10,
-		HTTPRedirects:        3,
-		PromptTemplateBytes:  64 << 10,
-		PromptFragmentBytes:  128 << 10,
-		PromptOwnerBytes:     256 << 10,
-		SubAgentNameBytes:    64,
-		SubAgentInputBytes:   64 << 10,
-		DenyReasonBytes:      2 << 10,
-		DiagnosticBytes:      2 << 10,
+		YAMLBytes:             256 << 10,
+		RulesPerFile:          256,
+		PredicatesPerRule:     32,
+		CommandBytes:          16 << 10,
+		CommandEnvCount:       64,
+		EnvKeyBytes:           128,
+		EnvValueBytes:         8 << 10,
+		EventJSONBytes:        1 << 20,
+		CommandStdoutBytes:    32 << 10,
+		CommandStderrBytes:    32 << 10,
+		HTTPURLBytes:          2 << 10,
+		HTTPHeaderCount:       32,
+		HTTPHeaderNameBytes:   128,
+		HTTPHeaderValueBytes:  8 << 10,
+		HTTPRequestBytes:      1 << 20,
+		HTTPResponseBytes:     64 << 10,
+		HTTPErrorPreviewBytes: 1 << 10,
+		HTTPRedirects:         3,
+		PromptTemplateBytes:   64 << 10,
+		PromptFragmentBytes:   128 << 10,
+		PromptOwnerBytes:      256 << 10,
+		SubAgentNameBytes:     64,
+		SubAgentInputBytes:    64 << 10,
+		DenyReasonBytes:       2 << 10,
+		DiagnosticBytes:       2 << 10,
 	}
 }
 
@@ -108,6 +110,9 @@ func normalizeLimits(l Limits) Limits {
 	}
 	if l.HTTPResponseBytes > 0 {
 		d.HTTPResponseBytes = l.HTTPResponseBytes
+	}
+	if l.HTTPErrorPreviewBytes > 0 {
+		d.HTTPErrorPreviewBytes = l.HTTPErrorPreviewBytes
 	}
 	if l.HTTPRedirects > 0 {
 		d.HTTPRedirects = l.HTTPRedirects

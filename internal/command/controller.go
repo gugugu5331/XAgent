@@ -5,6 +5,7 @@ type Controller interface {
 	DisplayError(err error)
 	SendUserMessage(text string)
 	ExecuteSkill(name string, args string, raw string) error
+	OpenArtifact(id string) error
 
 	ClearMessages()
 	SwitchMode(mode Mode)

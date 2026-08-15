@@ -1,47 +1,43 @@
 package conversation
 
 import (
-	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
+
+	"xagent/internal/redact"
 )
 
+// Conversation is the only runtime and persistence state accepted by Store.
+// Every text field has crossed the runtime redaction boundary.
 type Conversation struct {
-	ID        string           `json:"id"`
-	Title     string           `json:"title"`
-	Messages  []Message        `json:"messages"`
-	Context   *ContextMetadata `json:"context,omitempty"`
-	CreatedAt time.Time        `json:"created_at"`
-	UpdatedAt time.Time        `json:"updated_at"`
+	ID        string
+	Title     redact.SafeText
+	Messages  []Message
+	Context   *ContextMetadata
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type ContextMetadata struct {
-	Summary                 string            `json:"summary,omitempty"`
-	LastBoundary            string            `json:"last_boundary,omitempty"`
-	LastCompressionAt       *time.Time        `json:"last_compression_at,omitempty"`
-	SummaryFailureCount     int               `json:"summary_failure_count,omitempty"`
-	LastInputTokens         int64             `json:"last_input_tokens,omitempty"`
-	LastOutputTokens        int64             `json:"last_output_tokens,omitempty"`
-	LastEstimatedTokens     int64             `json:"last_estimated_tokens,omitempty"`
-	LastEstimatedCharacters int               `json:"last_estimated_characters,omitempty"`
-	RecoveryDiagnostics     []JSONLDiagnostic `json:"recovery_diagnostics,omitempty"`
+	Summary                 redact.SafeText
+	LastBoundary            redact.SafeText
+	LastCompressionAt       *time.Time
+	SummaryFailureCount     int
+	LastInputTokens         int64
+	LastOutputTokens        int64
+	LastEstimatedTokens     int64
+	LastEstimatedCharacters int
 }
 
 func NewConversation(id string, now time.Time) *Conversation {
-	return &Conversation{
-		ID:        id,
-		Title:     "新会话",
-		Messages:  []Message{},
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
+	redactor := redact.NewRuntimeRedactor()
+	return &Conversation{ID: id, Title: redactor.Redact("新会话"), Messages: []Message{}, CreatedAt: now, UpdatedAt: now}
 }
 
 func AppendUserMessage(conversation *Conversation, text string) {
 	appendMessage(conversation, RoleUser, text)
-	if conversation.Title == "新会话" {
-		conversation.Title = titleFromText(text)
+	if conversation != nil && conversation.Title.Text() == "新会话" {
+		conversation.Title = compatibilitySafeText(titleFromText(text))
 	}
 }
 
@@ -51,124 +47,35 @@ func AppendAssistantMessage(conversation *Conversation, text string) {
 
 func AppendContextSummaryMessage(conversation *Conversation, text string) {
 	appendMessage(conversation, RoleContextSummary, text)
-	ensureContext(conversation).Summary = text
+	ensureContext(conversation).Summary = compatibilitySafeText(text)
 }
 
 func AppendContextBoundaryMessage(conversation *Conversation, text string) {
 	appendMessage(conversation, RoleContextBoundary, text)
-	ensureContext(conversation).LastBoundary = text
+	ensureContext(conversation).LastBoundary = compatibilitySafeText(text)
 }
 
 func AppendThinkingMessage(conversation *Conversation, text string) {
-	if strings.TrimSpace(text) == "" {
-		return
+	if strings.TrimSpace(text) != "" {
+		appendMessage(conversation, RoleThinking, text)
 	}
-	appendMessage(conversation, RoleThinking, text)
-}
-
-func AppendToolCallMessage(conversation *Conversation, callID string, name string, rawArguments string) {
-	appendToolMessage(conversation, Message{
-		Role:             RoleToolCall,
-		Content:          name + "(" + rawArguments + ")",
-		ToolCallID:       callID,
-		ToolName:         name,
-		RawToolArguments: rawArguments,
-	})
-}
-
-func AppendToolResultMessage(conversation *Conversation, callID string, name string, status string, summary string, content string, errorCode string, truncated bool, data json.RawMessage, errorData json.RawMessage) {
-	appendToolMessage(conversation, Message{
-		Role:                RoleToolResult,
-		Content:             content,
-		ToolCallID:          callID,
-		ToolName:            name,
-		ToolResultContent:   content,
-		ToolResultStatus:    status,
-		ToolResultSummary:   summary,
-		ToolResultTruncated: truncated,
-		ToolResultData:      data,
-		ToolResultError:     errorData,
-		ToolErrorCode:       errorCode,
-	})
 }
 
 func ContextMessages(conversation *Conversation) []Message {
 	if conversation == nil {
 		return nil
 	}
-	messages := make([]Message, 0, len(conversation.Messages))
+	result := make([]Message, 0, len(conversation.Messages))
 	for _, message := range conversation.Messages {
-		if message.Role == RoleUser || message.Role == RoleAssistant || message.Role == RoleToolCall || message.Role == RoleToolResult || message.Role == RoleContextSummary || message.Role == RoleContextBoundary {
-			messages = append(messages, contextMessage(message))
+		switch message.Role {
+		case RoleUser, RoleAssistant, RoleToolCall, RoleToolResult, RoleContextSummary, RoleContextBoundary:
+			result = append(result, cloneV2MessageSlice([]Message{message})[0])
 		}
 	}
-	return messages
+	return result
 }
 
-func contextMessage(message Message) Message {
-	if !message.Externalized {
-		return message
-	}
-	content := externalizedContent(message)
-	message.Content = content
-	message.ToolResultContent = content
-	return message
-}
-
-func externalizedContent(message Message) string {
-	var builder strings.Builder
-	if strings.TrimSpace(message.ExternalPreview) != "" {
-		builder.WriteString(message.ExternalPreview)
-	}
-	if builder.Len() > 0 {
-		builder.WriteString("\n\n")
-	}
-	builder.WriteString("[工具结果已外置保存")
-	if strings.TrimSpace(message.ToolCallID) != "" {
-		builder.WriteString(", artifact_id: ")
-		builder.WriteString(safeArtifactID(message.ToolCallID))
-	}
-	if message.ExternalBytes > 0 {
-		builder.WriteString(", 大小 ")
-		builder.WriteString(formatBytes(message.ExternalBytes))
-	}
-	builder.WriteString("。如需完整细节，请由本地用户显式查看该 artifact，不要根据预览或摘要脑补。]")
-	return builder.String()
-}
-
-func safeArtifactID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "tool_result"
-	}
-	var builder strings.Builder
-	for _, r := range value {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			builder.WriteRune(r)
-		} else {
-			builder.WriteByte('_')
-		}
-	}
-	return builder.String()
-}
-
-func formatBytes(size int64) string {
-	return strconv.FormatInt(size, 10) + " bytes"
-}
-
-func appendToolMessage(conversation *Conversation, message Message) {
-	if conversation == nil {
-		return
-	}
-	now := time.Now()
-	message.CreatedAt = now
-	conversation.Messages = append(conversation.Messages, message)
-	conversation.UpdatedAt = now
-}
-
-func EnsureContext(conversation *Conversation) *ContextMetadata {
-	return ensureContext(conversation)
-}
+func EnsureContext(conversation *Conversation) *ContextMetadata { return ensureContext(conversation) }
 
 func ensureContext(conversation *Conversation) *ContextMetadata {
 	if conversation == nil {
@@ -185,12 +92,12 @@ func appendMessage(conversation *Conversation, role MessageRole, text string) {
 		return
 	}
 	now := time.Now()
-	conversation.Messages = append(conversation.Messages, Message{
-		Role:      role,
-		Content:   text,
-		CreatedAt: now,
-	})
+	conversation.Messages = append(conversation.Messages, Message{Role: role, Content: compatibilitySafeText(text), CreatedAt: now})
 	conversation.UpdatedAt = now
+}
+
+func compatibilitySafeText(value string) redact.SafeText {
+	return redact.NewRuntimeRedactor().Redact(value)
 }
 
 func titleFromText(text string) string {

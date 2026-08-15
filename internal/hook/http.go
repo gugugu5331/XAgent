@@ -5,13 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"sort"
 	"strings"
-	"time"
+	"sync"
 
+	"xagent/internal/diagnostics"
+	"xagent/internal/netpolicy"
 	"xagent/internal/redact"
 )
 
@@ -37,19 +39,16 @@ type HTTPRunner interface {
 	Run(context.Context, HTTPRequest) (HTTPResult, error)
 }
 
-type Resolver interface {
-	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
-}
-
 type DefaultHTTPRunner struct {
-	Limits   Limits
-	Resolver Resolver
-	Dialer   *net.Dialer
-	Redactor *redact.RuntimeRedactor
+	Limits        Limits
+	Policy        netpolicy.HTTPPolicy
+	ClientFactory netpolicy.ClientFactory
+	ClientOptions netpolicy.ClientOptions
+	Redactor      *redact.RuntimeRedactor
 
-	// transport is an internal test seam. Production callers always use the
-	// hardened transport returned by newHTTPTransport.
-	transport http.RoundTripper
+	mu      sync.Mutex
+	clients map[string]netpolicy.Client
+	closed  bool
 }
 
 func compileHTTPAction(config ActionConfig, limits Limits, lookup func(string) (string, bool), runtimeRedactor *redact.RuntimeRedactor) (*httpAction, error) {
@@ -62,9 +61,6 @@ func compileHTTPAction(config ActionConfig, limits Limits, lookup func(string) (
 	parsed, err := url.Parse(config.URL)
 	if err != nil || validateURLStructure(parsed, limits.HTTPURLBytes) != nil {
 		return nil, fmt.Errorf("invalid static URL")
-	}
-	if err := validateTarget(parsed); err != nil {
-		return nil, err
 	}
 	method := config.Method
 	if method == "" && !config.present["method"] {
@@ -140,27 +136,6 @@ func containsURLControl(value string) bool {
 	return false
 }
 
-func validateTarget(target *url.URL) error {
-	if target == nil || target.Hostname() == "" {
-		return fmt.Errorf("invalid HTTP target")
-	}
-	if target.Scheme == "https" {
-		return nil
-	}
-	if target.Scheme != "http" {
-		return fmt.Errorf("unsupported HTTP scheme")
-	}
-	host := target.Hostname()
-	if host == "localhost" {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("plaintext HTTP requires loopback")
-	}
-	return nil
-}
-
 func validHeaderName(value string) bool {
 	if value == "" {
 		return false
@@ -183,6 +158,9 @@ func validHeaderValue(value string) bool {
 }
 
 func (r *DefaultHTTPRunner) Run(ctx context.Context, request HTTPRequest) (HTTPResult, error) {
+	if r == nil || ctx == nil || request.URL == nil {
+		return HTTPResult{}, fmt.Errorf("HTTP runner is unavailable")
+	}
 	limits := normalizeLimits(r.Limits)
 	body := []byte(nil)
 	if request.SendEvent {
@@ -191,113 +169,174 @@ func (r *DefaultHTTPRunner) Run(ctx context.Context, request HTTPRequest) (HTTPR
 		}
 		body = append([]byte(nil), request.EventJSON...)
 	}
-	resolver := r.Resolver
-	if resolver == nil {
-		resolver = net.DefaultResolver
+	rawURL := request.URL.String()
+	if err := validateURLText(rawURL, limits.HTTPURLBytes); err != nil {
+		return HTTPResult{}, fmt.Errorf("HTTP target rejected")
 	}
-	dialer := r.Dialer
-	if dialer == nil {
-		dialer = &net.Dialer{Timeout: 10 * time.Second}
+	var reader io.Reader
+	if request.SendEvent {
+		reader = bytes.NewReader(body)
 	}
-	transport := r.transport
-	if transport == nil {
-		transport = newHTTPTransport(limits, resolver, dialer)
+	req, err := http.NewRequestWithContext(ctx, request.Method, rawURL, reader)
+	if err != nil {
+		return HTTPResult{}, fmt.Errorf("create HTTP request")
 	}
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
-		defer closer.CloseIdleConnections()
+	req.Header = request.Headers.Clone()
+	if req.Header == nil {
+		req.Header = make(http.Header)
 	}
-	current := cloneURL(request.URL)
-	for redirects := 0; ; redirects++ {
-		if err := validateURLStructure(current, limits.HTTPURLBytes); err != nil {
-			return HTTPResult{}, err
-		}
-		if err := validateTarget(current); err != nil {
-			return HTTPResult{}, err
-		}
-		var reader io.Reader
-		if request.SendEvent {
-			reader = bytes.NewReader(body)
-		}
-		req, err := http.NewRequestWithContext(ctx, request.Method, current.String(), reader)
-		if err != nil {
-			return HTTPResult{}, fmt.Errorf("create HTTP request")
-		}
-		req.Header = request.Headers.Clone()
-		if req.Header == nil {
-			req.Header = make(http.Header)
-		}
-		if request.SendEvent {
-			req.Header.Set("Content-Type", "application/json")
-			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-		}
-		response, err := client.Do(req)
-		if err != nil {
-			return HTTPResult{}, fmt.Errorf("HTTP request failed")
-		}
-		if !responseHeadersWithinLimit(response.Header, limits.HTTPResponseBytes) {
+	if request.SendEvent {
+		req.Header.Set("Content-Type", "application/json")
+		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	}
+	if !requestHeadersWithinLimits(req.Header, limits) {
+		return HTTPResult{}, fmt.Errorf("request headers exceed limit")
+	}
+	policy, factory, err := r.networkComponents()
+	if err != nil {
+		return HTTPResult{}, err
+	}
+	endpoint, err := policy.ValidateInitial(ctx, rawURL, netpolicy.PurposeHook)
+	if err != nil {
+		return HTTPResult{}, fmt.Errorf("HTTP target rejected")
+	}
+	client, err := r.clientFor(endpoint, factory, req.Header)
+	if err != nil {
+		return HTTPResult{}, err
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
-			return HTTPResult{}, fmt.Errorf("HTTP response headers exceed limit")
 		}
-		if isRedirect(response.StatusCode) {
-			_ = response.Body.Close()
-			if redirects >= limits.HTTPRedirects {
-				return HTTPResult{}, fmt.Errorf("redirect limit exceeded")
-			}
-			rawLocation := response.Header.Get("Location")
-			if err := validateURLText(rawLocation, limits.HTTPURLBytes); err != nil {
-				return HTTPResult{}, fmt.Errorf("invalid redirect")
-			}
-			location, err := response.Location()
-			if err != nil {
-				return HTTPResult{}, fmt.Errorf("invalid redirect")
-			}
-			if err := validateURLStructure(location, limits.HTTPURLBytes); err != nil {
-				return HTTPResult{}, fmt.Errorf("invalid redirect")
-			}
-			if err := validateTarget(location); err != nil {
-				return HTTPResult{}, fmt.Errorf("invalid redirect")
-			}
-			if !sameOrigin(current, location) || (current.Scheme == "https" && location.Scheme != "https") {
-				return HTTPResult{}, fmt.Errorf("redirect violates origin policy")
-			}
-			current = location
-			continue
-		}
-		limited := io.LimitReader(response.Body, int64(limits.HTTPResponseBytes)+1)
-		responseBody, readErr := io.ReadAll(limited)
-		closeErr := response.Body.Close()
-		if readErr != nil || closeErr != nil {
-			return HTTPResult{}, fmt.Errorf("HTTP response read failed")
-		}
-		if len(responseBody) > limits.HTTPResponseBytes {
-			return HTTPResult{}, fmt.Errorf("HTTP response exceeds limit")
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return HTTPResult{}, fmt.Errorf("HTTP non-success status")
-		}
-		if r.Redactor != nil {
-			responseBody = []byte(r.Redactor.Text(string(responseBody)))
-		}
-		return HTTPResult{Body: responseBody}, nil
+		return HTTPResult{}, fmt.Errorf("HTTP request failed")
+	}
+	if response == nil || response.Body == nil {
+		return HTTPResult{}, fmt.Errorf("HTTP response is unavailable")
+	}
+	if !responseHeadersWithinLimit(response.Header, limits.HTTPResponseBytes) {
+		_ = response.Body.Close()
+		return HTTPResult{}, fmt.Errorf("HTTP response headers exceed limit")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		summary := diagnostics.SafeHTTPErrorSummary(response, diagnostics.HTTPErrorSummaryOptions{
+			MaxBodyBytes: limits.HTTPErrorPreviewBytes,
+			Redactor:     r.Redactor,
+		})
+		_ = response.Body.Close()
+		return HTTPResult{}, safeHTTPResponseError(summary)
+	}
+	if response.ContentLength > int64(limits.HTTPResponseBytes) {
+		_ = response.Body.Close()
+		return HTTPResult{}, fmt.Errorf("HTTP response exceeds limit")
+	}
+	limited := io.LimitReader(response.Body, int64(limits.HTTPResponseBytes)+1)
+	responseBody, readErr := io.ReadAll(limited)
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil {
+		return HTTPResult{}, fmt.Errorf("HTTP response read failed")
+	}
+	if len(responseBody) > limits.HTTPResponseBytes {
+		return HTTPResult{}, fmt.Errorf("HTTP response exceeds limit")
+	}
+	if r.Redactor != nil {
+		responseBody = []byte(r.Redactor.Text(string(responseBody)))
+	}
+	return HTTPResult{Body: responseBody}, nil
+}
+
+func (r *DefaultHTTPRunner) networkComponents() (netpolicy.HTTPPolicy, netpolicy.ClientFactory, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, nil, fmt.Errorf("HTTP runner is closed")
+	}
+	if r.Policy == nil && r.ClientFactory == nil {
+		policy := netpolicy.NewPolicy()
+		r.Policy = policy
+		r.ClientFactory = netpolicy.NewClientFactory(policy)
+	}
+	if r.Policy == nil || r.ClientFactory == nil {
+		return nil, nil, fmt.Errorf("HTTP network policy is unavailable")
+	}
+	return r.Policy, r.ClientFactory, nil
+}
+
+func (r *DefaultHTTPRunner) clientFor(endpoint netpolicy.Endpoint, factory netpolicy.ClientFactory, headers http.Header) (netpolicy.Client, error) {
+	headerNames := append([]string(nil), r.ClientOptions.SensitiveHeaders...)
+	for name := range headers {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	key := string(endpoint.Origin) + "\x00" + strings.Join(headerNames, "\x00")
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, fmt.Errorf("HTTP runner is closed")
+	}
+	if client := r.clients[key]; client != nil {
+		return client, nil
+	}
+	options := r.ClientOptions
+	options.SensitiveHeaders = headerNames
+	client, err := factory.New(endpoint, options)
+	if err != nil || client == nil {
+		return nil, fmt.Errorf("HTTP client creation failed")
+	}
+	if r.clients == nil {
+		r.clients = make(map[string]netpolicy.Client)
+	}
+	r.clients[key] = client
+	return client, nil
+}
+
+// CloseIdleConnections is the single close hook owned by the Hook Engine. It
+// permanently closes this runner to prevent clients from being created after
+// the Engine has started shutdown.
+func (r *DefaultHTTPRunner) CloseIdleConnections() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	clients := make([]netpolicy.Client, 0, len(r.clients))
+	for _, client := range r.clients {
+		clients = append(clients, client)
+	}
+	r.mu.Unlock()
+	for _, client := range clients {
+		client.CloseIdleConnections()
 	}
 }
 
-type contextDialer interface {
-	DialContext(context.Context, string, string) (net.Conn, error)
-}
-
-func newHTTPTransport(limits Limits, resolver Resolver, dialer contextDialer) *http.Transport {
-	return &http.Transport{
-		Proxy:                  nil,
-		MaxResponseHeaderBytes: int64(limits.HTTPResponseBytes),
-		DialContext:            secureDialer(resolver, dialer),
+func requestHeadersWithinLimits(headers http.Header, limits Limits) bool {
+	count := 0
+	for name, values := range headers {
+		if len(name) > limits.HTTPHeaderNameBytes || !validHeaderName(name) {
+			return false
+		}
+		if len(values) == 0 {
+			count++
+		}
+		for _, value := range values {
+			count++
+			if len(value) > limits.HTTPHeaderValueBytes || !validHeaderValue(value) {
+				return false
+			}
+		}
+		if count > limits.HTTPHeaderCount {
+			return false
+		}
 	}
+	return true
 }
 
 func responseHeadersWithinLimit(headers http.Header, limit int) bool {
-	// Count the encoded field lines and the terminating CRLF. The status line is
-	// not part of the response Header limit.
 	remaining := limit - 2
 	if remaining < 0 {
 		return false
@@ -314,35 +353,20 @@ func responseHeadersWithinLimit(headers http.Header, limit int) bool {
 	return true
 }
 
-func secureDialer(resolver Resolver, dialer contextDialer) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			return nil, err
-		}
-		if host != "localhost" {
-			return dialer.DialContext(ctx, network, address)
-		}
-		addresses, err := resolver.LookupIPAddr(ctx, host)
-		if err != nil || len(addresses) == 0 {
-			return nil, fmt.Errorf("localhost resolution failed")
-		}
-		for _, candidate := range addresses {
-			if !candidate.IP.IsLoopback() {
-				return nil, fmt.Errorf("localhost resolved outside loopback")
-			}
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].IP.String(), port))
+func safeHTTPResponseError(summary diagnostics.HTTPErrorSummary) error {
+	if summary.BodyPreview.Text() == "" {
+		return fmt.Errorf("HTTP non-success response: status=%d", summary.StatusCode)
 	}
+	return fmt.Errorf(
+		"HTTP non-success response: status=%d media_type=%q preview=%q truncated=%t observed_bytes=%d",
+		summary.StatusCode,
+		summary.MediaType,
+		summary.BodyPreview.Text(),
+		summary.Truncated,
+		summary.ObservedBytes,
+	)
 }
 
-func isRedirect(status int) bool {
-	switch status {
-	case 301, 302, 303, 307, 308:
-		return true
-	}
-	return false
-}
 func cloneURL(value *url.URL) *url.URL {
 	if value == nil {
 		return &url.URL{}
@@ -350,15 +374,3 @@ func cloneURL(value *url.URL) *url.URL {
 	clone := *value
 	return &clone
 }
-func origin(value *url.URL) string {
-	port := value.Port()
-	if port == "" {
-		if value.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-	return strings.ToLower(value.Scheme) + "://" + strings.ToLower(value.Hostname()) + ":" + port
-}
-func sameOrigin(left, right *url.URL) bool { return origin(left) == origin(right) }

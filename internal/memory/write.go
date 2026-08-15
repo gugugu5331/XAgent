@@ -5,15 +5,24 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"xagent/internal/redact"
 )
 
 type Writer struct {
-	mu sync.Mutex
+	mu           sync.Mutex
+	redactor     *redact.RuntimeRedactor
+	maxNoteBytes int
 }
 
 func (w *Writer) WriteNote(root string, note Note) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	var err error
+	note, err = sanitizeBoundedNote(note, w.redactor, w.maxNoteBytes)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}
@@ -23,6 +32,17 @@ func (w *Writer) WriteNote(root string, note Note) error {
 func (w *Writer) WriteIndex(root string, index Index, maxLines int, maxBytes int) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	redactor := w.redactor
+	if redactor == nil {
+		redactor = redact.NewRuntimeRedactor()
+	}
+	for entryIndex := range index.Entries {
+		entry := &index.Entries[entryIndex]
+		entry.ID = safeID(entry.ID)
+		entry.Title = redactor.Text(entry.Title)
+		entry.Body = redactor.Text(entry.Body)
+		entry.Path = noteFileName(entry.ID)
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("创建记忆目录失败: %w", err)
 	}

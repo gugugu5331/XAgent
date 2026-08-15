@@ -8,18 +8,24 @@ import (
 	"testing"
 
 	"xagent/internal/config"
+	"xagent/internal/mcpclient/protocol"
 	"xagent/internal/tool"
 )
 
 func TestManagerStartsServersAndRegistersTools(t *testing.T) {
-	server := fakeManagerHTTPServer(t, []RemoteTool{{Name: "echo", Description: "Echo tool", InputSchema: json.RawMessage(`{"type":"object"}`)}})
+	server := fakeManagerHTTPServer(t, []protocol.RemoteTool{{Name: "echo", Description: "Echo tool", InputSchema: json.RawMessage(`{"type":"object"}`)}})
 	defer server.Close()
-	manager := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{
+	manager, err := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{
 		"good/server": {Type: config.MCPTransportHTTP, URL: server.URL},
 		"disabled":    {Disabled: true},
 		"bad":         {Type: config.MCPTransportHTTP, URL: "http://example.invalid/mcp"},
-	}}, ManagerOptions{})
-	manager.Start(context.Background())
+	}}, ManagerOptions{}, managerHTTPTestDependencies(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	tools := manager.Tools()
 	if len(tools) != 1 {
 		t.Fatalf("expected one registered tool, got %d diagnostics=%#v", len(tools), manager.Diagnostics())
@@ -47,12 +53,17 @@ func TestManagerStartsServersAndRegistersTools(t *testing.T) {
 
 func TestManagerCallsOriginalRemoteToolName(t *testing.T) {
 	seenToolName := ""
-	server := fakeManagerHTTPServerWithCallObserver(t, []RemoteTool{{Name: "remote tool/name", InputSchema: json.RawMessage(`{"type":"object"}`)}}, func(params CallToolRequest) {
+	server := fakeManagerHTTPServerWithCallObserver(t, []protocol.RemoteTool{{Name: "remote tool/name", InputSchema: json.RawMessage(`{"type":"object"}`)}}, func(params protocol.CallToolRequest) {
 		seenToolName = params.Name
 	})
 	defer server.Close()
-	manager := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{"server": {Type: config.MCPTransportHTTP, URL: server.URL}}}, ManagerOptions{})
-	manager.Start(context.Background())
+	manager, err := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{"server": {Type: config.MCPTransportHTTP, URL: server.URL}}}, ManagerOptions{}, managerHTTPTestDependencies(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	tools := manager.Tools()
 	if len(tools) != 1 || tools[0].Name() == "mcp__server__remote tool/name" {
 		t.Fatalf("expected sanitized registered name, got %#v", tools)
@@ -66,10 +77,15 @@ func TestManagerCallsOriginalRemoteToolName(t *testing.T) {
 }
 
 func TestManagerDisablesProjectStdioUntilTrusted(t *testing.T) {
-	manager := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{
+	manager, err := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{
 		"local": {Type: config.MCPTransportStdio, Command: "echo", Source: "project"},
-	}}, ManagerOptions{})
-	manager.Start(context.Background())
+	}}, ManagerOptions{}, managerTestDependencies(t, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if len(manager.Tools()) != 0 {
 		t.Fatalf("project stdio should not register tools before trust")
 	}
@@ -80,14 +96,19 @@ func TestManagerDisablesProjectStdioUntilTrusted(t *testing.T) {
 }
 
 func TestManagerSkipsInvalidRemoteTools(t *testing.T) {
-	server := fakeManagerHTTPServer(t, []RemoteTool{
+	server := fakeManagerHTTPServer(t, []protocol.RemoteTool{
 		{Name: "", InputSchema: json.RawMessage(`{"type":"object"}`)},
 		{Name: "bad_schema", InputSchema: json.RawMessage(`{"type":"string"}`)},
 		{Name: "ok", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	})
 	defer server.Close()
-	manager := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{"server": {Type: config.MCPTransportHTTP, URL: server.URL}}}, ManagerOptions{})
-	manager.Start(context.Background())
+	manager, err := NewManager(config.MCPConfig{Servers: map[string]config.MCPServerConfig{"server": {Type: config.MCPTransportHTTP, URL: server.URL}}}, ManagerOptions{}, managerHTTPTestDependencies(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if len(manager.Tools()) != 1 || manager.Tools()[0].Name() != "mcp__server__ok" {
 		t.Fatalf("unexpected tools: %#v", manager.Tools())
 	}
@@ -96,12 +117,12 @@ func TestManagerSkipsInvalidRemoteTools(t *testing.T) {
 	}
 }
 
-func fakeManagerHTTPServer(t *testing.T, remoteTools []RemoteTool) *httptest.Server {
+func fakeManagerHTTPServer(t *testing.T, remoteTools []protocol.RemoteTool) *httptest.Server {
 	t.Helper()
 	return fakeManagerHTTPServerWithCallObserver(t, remoteTools, nil)
 }
 
-func fakeManagerHTTPServerWithCallObserver(t *testing.T, remoteTools []RemoteTool, observeCall func(CallToolRequest)) *httptest.Server {
+func fakeManagerHTTPServerWithCallObserver(t *testing.T, remoteTools []protocol.RemoteTool, observeCall func(protocol.CallToolRequest)) *httptest.Server {
 	t.Helper()
 	initialized := false
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,10 +134,10 @@ func fakeManagerHTTPServerWithCallObserver(t *testing.T, remoteTools []RemoteToo
 		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
 			t.Fatal(err)
 		}
-		w.Header().Set(headerContentType, contentTypeJSON)
+		w.Header().Set("Content-Type", "application/json")
 		switch message.Method {
 		case "initialize":
-			writeRPCResult(t, w, message.ID, map[string]any{"protocolVersion": SupportedProtocolVersion, "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "fake"}})
+			writeManagerRPCResult(t, w, message.ID, map[string]any{"protocolVersion": protocol.SupportedProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]any{"name": "fake"}})
 		case "notifications/initialized":
 			initialized = true
 			w.WriteHeader(http.StatusAccepted)
@@ -124,9 +145,9 @@ func fakeManagerHTTPServerWithCallObserver(t *testing.T, remoteTools []RemoteToo
 			if !initialized {
 				t.Fatal("tools/list before initialized")
 			}
-			writeRPCResult(t, w, message.ID, ListToolsResult{Tools: remoteTools})
+			writeManagerRPCResult(t, w, message.ID, protocol.ListToolsResult{Tools: remoteTools})
 		case "tools/call":
-			var params CallToolRequest
+			var params protocol.CallToolRequest
 			if err := json.Unmarshal(message.Params, &params); err != nil {
 				t.Fatal(err)
 			}
@@ -134,9 +155,16 @@ func fakeManagerHTTPServerWithCallObserver(t *testing.T, remoteTools []RemoteToo
 				observeCall(params)
 			}
 			text, _ := params.Arguments["message"].(string)
-			writeRPCResult(t, w, message.ID, CallToolResult{Content: []ContentBlock{{Type: "text", Text: text}}})
+			writeManagerRPCResult(t, w, message.ID, protocol.CallToolResult{Content: []protocol.ContentBlock{{Type: "text", Text: text}}})
 		default:
 			t.Fatalf("unexpected method %s", message.Method)
 		}
 	}))
+}
+
+func writeManagerRPCResult(t *testing.T, writer http.ResponseWriter, id any, result any) {
+	t.Helper()
+	if err := json.NewEncoder(writer).Encode(map[string]any{"jsonrpc": "2.0", "id": id, "result": result}); err != nil {
+		t.Fatal(err)
+	}
 }

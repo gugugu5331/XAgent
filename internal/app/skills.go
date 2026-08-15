@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -93,6 +94,9 @@ func skillCommandHandler(context command.ExecutionContext, invocation command.In
 }
 
 func (m *Model) executeSkill(name string, args string, raw string) (tea.Cmd, error) {
+	if !m.acceptsIntent() {
+		return nil, errors.New("App 正在关闭")
+	}
 	_ = m.refreshSkillCommands(context.Background())
 	if m.orchestrator == nil {
 		return nil, fmt.Errorf("Orchestrator 未启用")
@@ -133,34 +137,62 @@ func (m *Model) executeSkill(name string, args string, raw string) (tea.Cmd, err
 }
 
 func (m *Model) beginRequest(cancel context.CancelFunc, eventStream <-chan Event, requestModel string, independent bool) tea.Cmd {
+	if !m.acceptsIntent() {
+		if cancel != nil {
+			cancel()
+		}
+		return nil
+	}
 	timeout := time.Duration(0)
 	if m.deps.Config != nil {
 		timeout = time.Duration(m.deps.Config.LLM.RequestTimeoutMS) * time.Millisecond
 	}
+	if m.eventBoundary == nil {
+		m.eventBoundary = newRuntimeEventBoundaryState(&m.runtimeOptions, m.deps.RuntimeRedactor)
+	}
+	conversationID := ""
+	if m.conversation != nil {
+		conversationID = m.conversation.ID
+	}
+	envelope, err := m.eventBoundary.begin(conversationID)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		m.status.Error = m.redactError(err)
+		return nil
+	}
+	// SendRequest/SendSkill has already appended the submitted user message to
+	// the authoritative conversation. Re-project it here while clearing every
+	// buffer owned by the previous request; the matching UserSubmitted event is
+	// consumed once by Update instead of being rendered a second time.
+	m.resetRequestPresentation(m.conversation.Messages, true)
 	m.request = &RequestSession{
 		Cancel: cancel, StartedAt: time.Now(), Timeout: timeout, Independent: independent,
+		Generation: envelope.Generation, ConversationID: envelope.ConversationID,
 	}
 	if m.lifecycle == nil {
 		m.lifecycle = newLifecycleState()
 	}
-	m.lifecycle.begin(m.request)
+	if !m.lifecycle.begin(m.request) {
+		// Close linearized before this intent was published. Do not leave a
+		// request context or a disabled input behind a rejected intent.
+		if cancel != nil {
+			cancel()
+		}
+		m.request = nil
+		m.streaming = false
+		m.status.Streaming = false
+		m.input.SetEnabled(true)
+		return nil
+	}
 	m.input.Clear()
 	m.input.SetEnabled(false)
 	m.streaming = true
 	m.status.Streaming = true
-	m.status.WaitingConfirmation = false
-	m.status.AgentIteration = 0
-	m.status.AgentMaxIterations = 0
-	m.status.StopReason = ""
-	m.status.StopMessage = ""
-	m.status.InputTokens = 0
-	m.status.OutputTokens = 0
-	m.status.CacheCreationInputTokens = 0
-	m.status.CacheReadInputTokens = 0
 	m.status.RequestModel = m.redactSkillText(strings.TrimSpace(requestModel))
-	m.status.Error = nil
 	m.status.Notice = ""
-	return listen(eventStream)
+	return listen(eventStream, envelope)
 }
 
 func (m *Model) syncSkillStatus() {

@@ -52,6 +52,10 @@ func NewManager(options ManagerOptions) (*Manager, error) {
 	if err != nil {
 		return nil, safeManagerError("load skill snapshot", err, manager.options.Redact)
 	}
+	snapshot, err = prepareManagerSnapshot(context.Background(), snapshot, manager.options)
+	if err != nil {
+		return nil, safeManagerError("classify skill snapshot", err, manager.options.Redact)
+	}
 	manager.snapshot = snapshot.Clone()
 	manager.manifestFingerprint = manifest
 	return manager, nil
@@ -102,9 +106,58 @@ func (m *Manager) RefreshIfChanged(ctx context.Context) (RefreshResult, error) {
 		safeErr := safeManagerError("refresh skill snapshot", err, m.options.Redact)
 		return RefreshResult{Generation: m.snapshot.Generation, Diagnostics: []diagnostics.Diagnostic{managerFailureDiagnostic(safeErr, m.options.Redact)}}, safeErr
 	}
+	candidate, err = prepareManagerSnapshot(ctx, candidate, m.options)
+	if err != nil {
+		safeErr := safeManagerError("classify skill snapshot", err, m.options.Redact)
+		return RefreshResult{Generation: m.snapshot.Generation, Diagnostics: []diagnostics.Diagnostic{managerFailureDiagnostic(safeErr, m.options.Redact)}}, safeErr
+	}
 	m.snapshot = candidate.Clone()
 	m.manifestFingerprint = manifest
 	return RefreshResult{Changed: true, Generation: candidate.Generation, Diagnostics: append([]diagnostics.Diagnostic(nil), candidate.Diagnostics...)}, nil
+}
+
+func prepareManagerSnapshot(ctx context.Context, snapshot Snapshot, options ManagerOptions) (Snapshot, error) {
+	if !hasInvalidSkillEntryDiagnostic(snapshot.Diagnostics) {
+		return snapshot, nil
+	}
+	overLimit, err := overLimitHistoryEntries(ctx, options)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	changed := false
+	for index, item := range snapshot.Diagnostics {
+		identity := skillDiagnosticIdentity{source: item.Source, path: item.Path}
+		if item.Code != "skill_entry_invalid" {
+			continue
+		}
+		if _, exists := overLimit[identity]; !exists {
+			continue
+		}
+		snapshot.Diagnostics[index] = diagnostics.New(
+			"skill_history_migration_required",
+			diagnostics.SeverityWarning,
+			"lower history to 1000 or less and refresh to re-enable this Skill",
+		).WithSource(item.Source).WithPath(item.Path).WithAttributes(map[string]string{
+			"allowed_range":  "0..1000",
+			"field_path":     "history",
+			"migration_hint": "lower to 1000 or less",
+		})
+		changed = true
+	}
+	if changed {
+		sortDiagnostics(snapshot.Diagnostics)
+		snapshot.Fingerprint = snapshotFingerprint(snapshot)
+	}
+	return snapshot, nil
+}
+
+func hasInvalidSkillEntryDiagnostic(items []diagnostics.Diagnostic) bool {
+	for _, item := range items {
+		if item.Code == "skill_entry_invalid" {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneManagerOptions(options ManagerOptions) ManagerOptions {

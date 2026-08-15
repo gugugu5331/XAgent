@@ -28,7 +28,7 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 		}
 	}
 
-	view := &Registry{tools: make(map[string]Tool), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), immutable: true}
+	view := &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), immutable: true}
 	always := make(map[string]struct{}, len(options.AlwaysInclude))
 	for _, name := range options.AlwaysInclude {
 		always[name] = struct{}{}

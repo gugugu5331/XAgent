@@ -22,9 +22,10 @@ var errToolNotRegistered = errors.New("tool is not registered")
 // can flow through hooks, permission fingerprints, and actual execution.
 type ValidatedCall struct {
 	Call      Call
-	Tool      Tool
+	Tool      Definition
 	Arguments map[string]any
 
+	executor           Tool
 	canonicalArguments []byte
 	workingDirectory   *safefs.Identity
 	resourceBindings   []safefs.Binding
@@ -56,7 +57,11 @@ func (r *Registry) validateCall(call Call, validation *ValidationContext) (Valid
 	if r == nil {
 		return ValidatedCall{}, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name)
 	}
-	registeredTool, ok := r.executionTool(call.Name)
+	executionTool, ok := r.executionTool(call.Name)
+	if !ok {
+		return ValidatedCall{}, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name)
+	}
+	registeredTool, ok := r.Get(call.Name)
 	if !ok {
 		return ValidatedCall{}, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name)
 	}
@@ -92,6 +97,7 @@ func (r *Registry) validateCall(call Call, validation *ValidationContext) (Valid
 	validated := ValidatedCall{
 		Call:               call,
 		Tool:               registeredTool,
+		executor:           executionTool,
 		Arguments:          arguments,
 		canonicalArguments: append([]byte(nil), canonical...),
 		targetDigest:       cloneDigest(descriptor.TargetDigest),
@@ -159,7 +165,7 @@ func (v *ValidatedCall) bindResources(validation ValidationContext) error {
 	}
 	binding, err := validation.Root.Bind(relative)
 	if err != nil {
-		return errors.New("file tool resource binding failed")
+		return fmt.Errorf("%s: file tool resource binding failed", ErrPathOutsideProject)
 	}
 	v.resourceBindings = []safefs.Binding{binding}
 	return nil
@@ -188,14 +194,14 @@ func bindingArgument(name string) (string, bool) {
 func rootRelativeBindingPath(value, projectRoot string) (string, error) {
 	if filepath.IsAbs(value) {
 		if projectRoot == "" || !filepath.IsAbs(projectRoot) {
-			return "", errors.New("absolute file tool path requires a project root")
+			return "", fmt.Errorf("%s: absolute file tool path requires a project root", ErrPathOutsideProject)
 		}
 		if resolved, err := filepath.EvalSymlinks(value); err == nil {
 			value = filepath.Clean(resolved)
 		}
 		relative, err := filepath.Rel(projectRoot, value)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return "", errors.New("file tool path is outside the opened root")
+			return "", fmt.Errorf("%s: file tool path is outside the opened root", ErrPathOutsideProject)
 		}
 		value = relative
 	}

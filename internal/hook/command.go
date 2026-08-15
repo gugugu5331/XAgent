@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
+	"xagent/internal/proctree"
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 )
 
 type CommandRequest struct {
@@ -30,37 +32,21 @@ type CommandRunner interface {
 	Run(context.Context, CommandRequest) (CommandResult, error)
 }
 
+// ShellCommandRunner owns only the narrow capabilities required to start one
+// protected Hook command. Plans are created by the assembly-owned factory and
+// are handed directly to the shared proctree Runner; Hook rules cannot create,
+// serialize, replace, or weaken them.
 type ShellCommandRunner struct {
-	Limits         Limits
-	Redactor       *redact.RuntimeRedactor
-	TerminateGrace time.Duration
-	JoinGrace      time.Duration
-	pipeFactory    commandPipeFactory
+	Limits           Limits
+	Redactor         *redact.RuntimeRedactor
+	Runner           proctree.Runner
+	Plans            proctree.ProtectionPlanFactory
+	WorkingDirectory *safefs.Root
+	ProjectRoot      string
+	JoinGrace        time.Duration
 }
 
-// commandPipeFactory is deliberately limited to the three os/exec pipe
-// constructors. Besides keeping ownership of process creation in the runner,
-// the seam lets tests inject failures at the actual stdin-write and
-// stdout/stderr-read boundaries.
-type commandPipeFactory interface {
-	stdin(*exec.Cmd) (io.WriteCloser, error)
-	stdout(*exec.Cmd) (io.ReadCloser, error)
-	stderr(*exec.Cmd) (io.ReadCloser, error)
-}
-
-type execCommandPipeFactory struct{}
-
-func (execCommandPipeFactory) stdin(cmd *exec.Cmd) (io.WriteCloser, error) {
-	return cmd.StdinPipe()
-}
-
-func (execCommandPipeFactory) stdout(cmd *exec.Cmd) (io.ReadCloser, error) {
-	return cmd.StdoutPipe()
-}
-
-func (execCommandPipeFactory) stderr(cmd *exec.Cmd) (io.ReadCloser, error) {
-	return cmd.StderrPipe()
-}
+const maxCommandCleanupGrace = 2 * time.Second
 
 type limitBuffer struct {
 	mu       sync.Mutex
@@ -90,6 +76,12 @@ func (b *limitBuffer) bytes() ([]byte, bool) {
 }
 
 func (r *ShellCommandRunner) Run(ctx context.Context, request CommandRequest) (CommandResult, error) {
+	if ctx == nil {
+		return CommandResult{}, fmt.Errorf("command context is invalid")
+	}
+	if r == nil {
+		return CommandResult{}, fmt.Errorf("protected command runtime is unavailable")
+	}
 	limits := normalizeLimits(r.Limits)
 	if len(request.Command) > limits.CommandBytes {
 		return CommandResult{}, fmt.Errorf("command exceeds limit")
@@ -100,158 +92,37 @@ func (r *ShellCommandRunner) Run(ctx context.Context, request CommandRequest) (C
 	if err := ctx.Err(); err != nil {
 		return CommandResult{}, err
 	}
-	cmd := exec.Command("/bin/sh", "-c", request.Command)
-	cmd.Dir = request.ProjectRoot
-	cmd.Env = controlledEnvironment(request.ProjectRoot, request.Environment)
-	factory := r.pipeFactory
-	if factory == nil {
-		factory = execCommandPipeFactory{}
+	if !r.validRuntime(request.ProjectRoot) {
+		return CommandResult{}, fmt.Errorf("protected command runtime is unavailable")
 	}
-	stdin, err := factory.stdin(cmd)
+
+	executable, args, err := selectCommandShell(request.Command)
 	if err != nil {
-		return CommandResult{}, fmt.Errorf("command pipe setup failed")
+		return CommandResult{}, fmt.Errorf("protected command shell is unavailable")
 	}
-	stdoutPipe, err := factory.stdout(cmd)
+	plan, err := r.Plans.Create(ctx)
 	if err != nil {
-		_ = stdin.Close()
-		return CommandResult{}, fmt.Errorf("command pipe setup failed")
+		return CommandResult{}, fmt.Errorf("protected command plan is unavailable")
 	}
-	stderrPipe, err := factory.stderr(cmd)
-	if err != nil {
-		_ = stdin.Close()
-		_ = stdoutPipe.Close()
-		return CommandResult{}, fmt.Errorf("command pipe setup failed")
-	}
-	closePipes := func() {
-		_ = stdin.Close()
-		_ = stdoutPipe.Close()
-		_ = stderrPipe.Close()
-	}
-	setupCommand(cmd)
-	if err := cmd.Start(); err != nil {
-		closePipes()
+	process, err := r.Runner.Start(ctx, proctree.Request{
+		Executable: executable,
+		Args:       append([]string(nil), args...),
+		WorkingDir: r.WorkingDirectory,
+		Env:        controlledEnvironment(r.ProjectRoot, request.Environment),
+		Mode:       proctree.ProtectionRequired,
+		Protection: plan,
+	})
+	if err != nil || process == nil {
+		if process != nil {
+			_ = closeCommandProcess(process, r.cleanupGrace())
+		}
 		return CommandResult{}, fmt.Errorf("command start failed")
 	}
+
 	stdout := &limitBuffer{limit: limits.CommandStdoutBytes}
 	stderr := &limitBuffer{limit: limits.CommandStderrBytes}
-	type ioResult struct{ err error }
-	ioDone := make(chan ioResult, 3)
-	go func() {
-		err := writeCommandInput(stdin, request.EventJSON)
-		if closeErr := stdin.Close(); err == nil {
-			err = closeErr
-		}
-		ioDone <- ioResult{err: err}
-	}()
-	go func() {
-		_, err := io.Copy(stdout, stdoutPipe)
-		_ = stdoutPipe.Close()
-		ioDone <- ioResult{err: err}
-	}()
-	go func() {
-		_, err := io.Copy(stderr, stderrPipe)
-		_ = stderrPipe.Close()
-		ioDone <- ioResult{err: err}
-	}()
-
-	grace := r.TerminateGrace
-	if grace <= 0 {
-		grace = 100 * time.Millisecond
-	}
-	joinGrace := r.JoinGrace
-	if joinGrace <= 0 {
-		joinGrace = time.Second
-	}
-	terminated := false
-	var joinTimer *time.Timer
-	var joinDone <-chan time.Time
-	var waitDone chan error
-	var waitErr error
-	waitComplete := false
-	startWait := func() {
-		if waitDone != nil {
-			return
-		}
-		waitDone = make(chan error, 1)
-		go func() { waitDone <- cmd.Wait() }()
-	}
-	terminate := func() {
-		if terminated {
-			return
-		}
-		terminated = true
-		terminateCommand(cmd, grace)
-		// A descendant can leave the command's process group while retaining an
-		// inherited stdout/stderr descriptor. Killing the original group then
-		// cannot produce EOF, so explicitly close our pipe ends before joining
-		// the copy goroutines. The root process is already force-killed above,
-		// which makes cmd.Wait safe to start concurrently on this failure path.
-		closePipes()
-		startWait()
-		joinTimer = time.NewTimer(joinGrace)
-		joinDone = joinTimer.C
-	}
-	ctxDone := ctx.Done()
-	var contextErr, ioErr error
-	remaining := 3
-	for remaining > 0 || (terminated && !waitComplete) {
-		select {
-		case result := <-ioDone:
-			remaining--
-			if result.err != nil && ioErr == nil {
-				ioErr = result.err
-				terminate()
-			}
-		case waitErr = <-waitDone:
-			waitComplete = true
-			waitDone = nil
-		case <-ctxDone:
-			contextErr = ctx.Err()
-			ctxDone = nil
-			terminate()
-		case <-joinDone:
-			// Standard os/exec pipes unblock when closed and Process.Kill makes
-			// Wait reapable, so reaching this guard indicates an OS/pipe contract
-			// failure. Buffered completion channels ensure late settlement cannot
-			// block a goroutine while the caller still gets a bounded return.
-			_ = cmd.Process.Kill()
-			if contextErr != nil {
-				return CommandResult{}, contextErr
-			}
-			if ioErr != nil {
-				return CommandResult{}, fmt.Errorf("command I/O failed")
-			}
-			return CommandResult{}, fmt.Errorf("command settlement timed out")
-		}
-	}
-	if joinTimer != nil {
-		if !joinTimer.Stop() {
-			select {
-			case <-joinTimer.C:
-			default:
-			}
-		}
-	}
-	if !waitComplete {
-		startWait()
-	}
-	for !waitComplete {
-		select {
-		case waitErr = <-waitDone:
-			waitComplete = true
-		case <-ctxDone:
-			contextErr = ctx.Err()
-			ctxDone = nil
-			terminate()
-		case <-joinDone:
-			_ = cmd.Process.Kill()
-			if contextErr != nil {
-				return CommandResult{}, contextErr
-			}
-			return CommandResult{}, fmt.Errorf("command settlement timed out")
-		}
-	}
-	if contextErr != nil {
+	processResult, waitErr, ioErr, closeErr := runCommandProcess(ctx, process, request.EventJSON, stdout, stderr, r.cleanupGrace())
+	if contextErr := ctx.Err(); contextErr != nil {
 		return CommandResult{}, contextErr
 	}
 	out, outExceeded := stdout.bytes()
@@ -262,7 +133,13 @@ func (r *ShellCommandRunner) Run(ctx context.Context, request CommandRequest) (C
 	if ioErr != nil {
 		return CommandResult{}, fmt.Errorf("command I/O failed")
 	}
-	if waitErr != nil {
+	if waitErr != nil || closeErr != nil {
+		return CommandResult{}, fmt.Errorf("command settlement failed")
+	}
+	if processResult.Cancelled || processResult.TimedOut {
+		return CommandResult{}, fmt.Errorf("command interrupted")
+	}
+	if processResult.ExitCode != 0 {
 		return CommandResult{}, fmt.Errorf("command failed")
 	}
 	if r.Redactor != nil {
@@ -270,6 +147,125 @@ func (r *ShellCommandRunner) Run(ctx context.Context, request CommandRequest) (C
 		errOut = []byte(r.Redactor.Text(string(errOut)))
 	}
 	return CommandResult{Stdout: out, Stderr: errOut}, nil
+}
+
+func (r *ShellCommandRunner) validRuntime(requestRoot string) bool {
+	if r == nil || r.Runner == nil || r.Plans == nil || r.WorkingDirectory == nil ||
+		r.WorkingDirectory.Identity() == (safefs.Identity{}) {
+		return false
+	}
+	expected := stringsCleanAbsolutePath(r.ProjectRoot)
+	actual := stringsCleanAbsolutePath(requestRoot)
+	return expected != "" && actual == expected
+}
+
+func stringsCleanAbsolutePath(value string) string {
+	if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		return ""
+	}
+	return value
+}
+
+func (r *ShellCommandRunner) cleanupGrace() time.Duration {
+	if r != nil && r.JoinGrace > 0 && r.JoinGrace <= maxCommandCleanupGrace {
+		return r.JoinGrace
+	}
+	return time.Second
+}
+
+type commandIOResult struct {
+	err error
+}
+
+type commandWaitResult struct {
+	result proctree.Result
+	err    error
+}
+
+func runCommandProcess(
+	ctx context.Context,
+	process proctree.Process,
+	eventJSON []byte,
+	stdout *limitBuffer,
+	stderr *limitBuffer,
+	cleanupGrace time.Duration,
+) (proctree.Result, error, error, error) {
+	if process == nil || stdout == nil || stderr == nil {
+		return proctree.Result{}, fmt.Errorf("command process is unavailable"), nil, nil
+	}
+	pipes := process.Pipes()
+	if pipes.Stdin == nil || pipes.Stdout == nil || pipes.Stderr == nil {
+		return proctree.Result{}, fmt.Errorf("command pipes are unavailable"), nil, closeCommandProcess(process, cleanupGrace)
+	}
+
+	ioDone := make(chan commandIOResult, 3)
+	go func() {
+		err := writeCommandInput(pipes.Stdin, eventJSON)
+		if closeErr := process.CloseStdin(); err == nil {
+			err = closeErr
+		}
+		ioDone <- commandIOResult{err: err}
+	}()
+	go func() {
+		_, err := io.Copy(stdout, pipes.Stdout)
+		ioDone <- commandIOResult{err: err}
+	}()
+	go func() {
+		_, err := io.Copy(stderr, pipes.Stderr)
+		ioDone <- commandIOResult{err: err}
+	}()
+
+	waitDone := make(chan commandWaitResult, 1)
+	go func() {
+		result, err := process.Wait(context.Background())
+		waitDone <- commandWaitResult{result: result, err: err}
+	}()
+
+	remainingIO := 3
+	var waited commandWaitResult
+	waitComplete := false
+	var ioErr error
+	var closeErr error
+	var closeOnce sync.Once
+	closeProcess := func() {
+		closeOnce.Do(func() {
+			closeErr = closeCommandProcess(process, cleanupGrace)
+		})
+	}
+	ctxDone := ctx.Done()
+	for remainingIO > 0 || !waitComplete {
+		select {
+		case completed := <-ioDone:
+			remainingIO--
+			if completed.err != nil && ioErr == nil {
+				ioErr = completed.err
+				closeProcess()
+			}
+		case waited = <-waitDone:
+			waitComplete = true
+			closeProcess()
+		case <-ctxDone:
+			ctxDone = nil
+			closeProcess()
+		}
+	}
+	closeProcess()
+	return waited.result, waited.err, ioErr, closeErr
+}
+
+// closeCommandProcess deliberately derives cleanup from Background rather
+// than the request context. Cancellation stops the Hook action; this second,
+// bounded context still gives proctree time to terminate and reap descendants.
+func closeCommandProcess(process proctree.Process, grace time.Duration) error {
+	if process == nil {
+		return nil
+	}
+	if grace <= 0 {
+		grace = time.Second
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	return process.Close(cleanupCtx)
 }
 
 func writeCommandInput(writer io.Writer, data []byte) error {

@@ -12,7 +12,60 @@ import (
 	"xagent/internal/diagnostics"
 	"xagent/internal/memory"
 	"xagent/internal/prompt"
+	"xagent/internal/redact"
 )
+
+func TestSessionContextAndPromptAcceptOnlySafeText(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	const canary = "session-prompt-runtime-secret"
+	redactor.RegisterSecret(canary)
+	manager := &Manager{
+		Redactor:        redactor,
+		MaxSectionBytes: 96,
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+			Name: "runtime instruction", Content: strings.Repeat("a", 160) + canary, Stable: true,
+		}}},
+		Memory: fakeMemoryProvider{index: memory.Index{Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{
+			ID: "safe", Title: "memory " + canary, Body: strings.Repeat("b", 160) + canary,
+		}}}},
+	}
+	prepared := manager.PrepareStable(context.Background())
+	for _, section := range prepared.StableSections {
+		if strings.Contains(section.Content, canary) {
+			t.Fatalf("session context retained runtime secret: %#v", section)
+		}
+		if len([]byte(section.Content)) > manager.MaxSectionBytes {
+			t.Fatalf("session context section exceeded byte budget: %d", len([]byte(section.Content)))
+		}
+	}
+
+	safeRequestType := reflect.TypeOf(prompt.SafeDynamicRequest{})
+	safeTextType := reflect.TypeOf(redact.SafeText{})
+	for _, fieldName := range []string{"ProjectRoot", "ActiveSkills"} {
+		field, ok := safeRequestType.FieldByName(fieldName)
+		if !ok || field.Type != safeTextType {
+			t.Fatalf("SafeDynamicRequest.%s = %v, want redact.SafeText", fieldName, field.Type)
+		}
+	}
+	blocks, err := prompt.DynamicBlocksFromSafe(prompt.SafeDynamicRequest{
+		Mode:         prompt.RunModeDefault,
+		Iteration:    1,
+		ProjectRoot:  redactor.Redact("/repo/" + canary),
+		ActiveSkills: redactor.Redact("active " + canary),
+		MaxBytes:     1024,
+	})
+	if err != nil {
+		t.Fatalf("build safe dynamic prompt: %v", err)
+	}
+	if joined := prompt.JoinBlocks(blocks); strings.Contains(joined, canary) || !strings.Contains(joined, "[redacted]") {
+		t.Fatalf("safe dynamic prompt crossed boundary unsafely: %q", joined)
+	}
+	if _, err := prompt.DynamicBlocksFromSafe(prompt.SafeDynamicRequest{
+		ProjectRoot: redactor.Redact(strings.Repeat("x", 64)), MaxBytes: 8,
+	}); err == nil {
+		t.Fatal("safe dynamic prompt accepted content beyond its byte budget")
+	}
+}
 
 func TestSessionContextPreparesInstructionsMemoryAndBoundary(t *testing.T) {
 	manager := &Manager{
@@ -265,8 +318,8 @@ func TestNoHookSessionCompatibility(t *testing.T) {
 		len(baseline.newPrepared.Diagnostics) != 0 || len(baseline.resumePrepared.Diagnostics) != 0 ||
 		!strings.Contains(joinSections(baseline.newPrepared.StableSections), "same session policy") ||
 		!reflect.DeepEqual(baseline.newPrepared.StableSections, baseline.resumePrepared.StableSections) ||
-		len(baseline.newMessages) != 1 || baseline.newMessages[0].Content != "new message" ||
-		len(baseline.resumeMessages) != 1 || baseline.resumeMessages[0].Content != "restored message" {
+		len(baseline.newMessages) != 1 || baseline.newMessages[0].Content.Text() != "new message" ||
+		len(baseline.resumeMessages) != 1 || baseline.resumeMessages[0].Content.Text() != "restored message" {
 		t.Fatalf("legacy per-session golden changed: %#v", baseline)
 	}
 }

@@ -1,6 +1,6 @@
 # XAgent 安全、可靠性与交付质量提升 Plan（2026-07-30）
 
-> 状态：原设计及 C1–C17 已批准（2026-07-30 至 2026-07-31）
+> 状态：原设计及 C1–C18c 已批准（2026-07-30 至 2026-08-03）
 >
 > 前置文档：`spec.md`（已批准）
 >
@@ -955,6 +955,10 @@ internal/
 ├── proctree/
 │   ├── api.go / lifecycle.go               [新建]
 │   ├── protected_exec.go                   [新建]
+│   ├── runner_factory_darwin.go            [新建]
+│   ├── runner_factory_linux.go             [新建]
+│   ├── runner_factory_windows.go           [新建]
+│   ├── runner_factory_unsupported.go       [新建]
 │   ├── runner_posix.go                     [新建] darwin || linux
 │   ├── protected_darwin.go                 [新建]
 │   ├── protected_linux.go                  [新建]
@@ -962,6 +966,7 @@ internal/
 │   ├── protected_windows.go                [新建]
 │   ├── runner_unsupported.go               [新建]
 │   ├── lifecycle_test.go                   [新建]
+│   ├── assembly_contract_test.go           [新建]
 │   ├── runner_posix_test.go                [新建]
 │   └── runner_windows_test.go              [新建]
 ├── artifact/
@@ -1016,6 +1021,7 @@ internal/
 │   ├── path.go                             [迁移→删除候选]
 │   ├── executor_test.go / capture_test.go  [新建]
 │   ├── file_tools_test.go                  [新建/迁移]
+│   ├── bash_runtime_test.go                [新建]
 │   ├── bash_posix_test.go                  [新建]
 │   └── bash_windows_test.go                [新建]
 ├── instructions/
@@ -1420,6 +1426,12 @@ type ProtectionPlan struct {
 
 func NewProtectionPlan(roots []*safefs.Root, scratch *safefs.Root) (ProtectionPlan, error)
 
+type ProtectionPlanFactory interface {
+	Create(ctx context.Context) (ProtectionPlan, error)
+}
+
+func NewProtectionPlanFactory(roots []*safefs.Root, scratchParent string) (ProtectionPlanFactory, error)
+
 type Pipes struct {
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
@@ -1442,16 +1454,24 @@ type Request struct {
 
 type Process interface {
 	Pipes() Pipes
+	CloseStdin() error
 	Wait(ctx context.Context) (Result, error)
 	Terminate(ctx context.Context) error
 	Close(ctx context.Context) error
 }
+
+type Runner interface {
+	Start(ctx context.Context, request Request) (Process, error)
+}
+
+func NewRunner(options Options) (Runner, error)
 ```
 
+- `NewRunner` 通过互斥 build tag 只选择当前平台的受保护实现；unsupported 平台返回只会在目标启动前拒绝的 Runner，不能回退到裸 `exec`。`ProtectionPlanFactory` 固定已打开 roots 与私有 scratch parent，每次 `Create` 生成独立、不可序列化的 plan；plan 交付 `Start` 后即由 Runner 接管，任何启动失败或启动前取消均清理 scratch，成功启动则由 Process 终态清理；业务模块不能自行拼装或放宽 plan。
 - Bash、命令 Hook 和 stdio MCP 均必须传 `ProtectionRequired`；缺失、零值、能力不足或策略验证失败均在目标程序 exec 前 fail closed。
 - Runner 只有在保护层安装成功并收到 exec 成功握手后才返回 `Process`。返回 `StartError` 时 `TargetStarted` 必须为 false；已成功 exec 后的失败只通过 Process 终态报告。
 - `Process` 内部的 supervisor 是唯一 OS `Wait`/reap 所有者。外层 stdio supervisor 只能调用可重复等待的 `Process.Wait`，不得接触裸 `exec.Cmd` 或 OS handle。
-- Process 拥有三个 pipe；调用方只借用 `Pipes` 读写。Close 先阻止新写、终止进程树、reap，再关闭 pipe 并等待 I/O；任何层都不得关闭事件或 pending channel 来解除竞争。
+- Process 拥有三个 pipe；调用方只借用 `Pipes` 读写，借用句柄的 `Close` 仍 fail closed。无输入或写入完成后只能调用幂等 `CloseStdin`，由 Process 原子阻止新写并关闭 owner stdin 以向目标发送 EOF；Close 再按“阻止新写、终止进程树、reap、关闭其余 pipe、等待 I/O”收敛，任何层都不得关闭事件或 pending channel 来解除竞争。
 - Linux 通过同一 XAgent 可执行文件的隐藏 self-reexec launcher，在目标 exec 前安装 `no_new_privs` 与 Landlock；macOS 使用身份校验后的系统 Seatbelt launcher；Windows 在 suspended process 上安装 Job Object 与低完整性/受限 token 后才 resume。
 - 三个平台默认只给每次运行的私有 scratch 写能力；项目根和权限配置根对不受信子进程只读。该策略可能保守拒绝 Bash/Hook/MCP 对项目的写入，但不能放宽受保护文件约束。缺少所需平台能力时，AC31 的等价安全结果是“对应不受信进程没有启动”，而不是跳过测试或使用弱化 fallback。
 - `cmd/xagent/internal_mode.go` 与 `internal/proctree/launcher_linux.go` 纳入文件组织；内部 launcher 在普通 help 中隐藏，只接受父进程通过继承句柄传入的版本化 plan，拒绝从普通 CLI 参数构造或放宽 ProtectionPlan。
@@ -2640,6 +2660,102 @@ type ArchiveFinalizationRecord struct {
 `Preservation` 必须按 `after_r0`→`after_e` 恰好两项，二者 `Mode=verify-final`、`ManifestSHA256`、`TargetCount=35` 和批准的 `TargetDigest` 逐字相同，且各自 canonical safe argv、exit 0/result pass 独立存在。E 第二次 `verify-final`、generate、verify-record 与 provider 页面人工核验全部通过后，只能由 finalize-archive 的 prepared→manifest-delete→finalization 状态机删除含用户对象 identity 的 manifest；安全 summaries、provider evidence、R0 transition、performance reports、两份 preservation result、attestation、verification、preparation 与 finalization records 组成 durable evidence archive，并由 verify-archive 复验。archive 保留在 `XAGENT_EVIDENCE_DIR`，向用户报告实际位置和 record digest但不把路径写入 E。C17 不提供 archive、evidence dir、active sentinel、lease 或 control root 的删除/重命名 action；当前实现即使收到用户精确删除请求也必须先另开 Spec，定义持同一 lease 的 tombstone、等待者排空、children-first 删除与 lease-last 不可重建状态机并重新审批，不能直接 unlink 后复用同名 lock inode。失败时保留 ledger并只报告安全摘要，不能递归清理父目录或重建 manifest。
 
 C17 明确授权新增或调整 `internal/e2e/perfprotocol/{protocol,codec}.go`、`internal/repoaudit/{git_source,workspace,evidence}_{unix,windows,unsupported}.go`、`internal/repoaudit/{git_source,workspace,deletion_candidates,ci_workflow,attestation,evidence}.go`、`cmd/xagent-check/{main,run,evidence}.go`、`.github/workflows/ci.yml`、`.github/xagent-actions.lock.json` 及对应测试/fixture。平台文件只实现本节已批准的 handle/file-ID/DACL/no-follow/atomic-publish/lease 边界，不新增业务能力。C17 不授权实现外部存储客户端、增加 CI 写权限、运行时联网重取远端依赖或接触用户凭据；其余 production closed-world 约束不变。四份规格全部批准前仍禁止实现写入。
+
+### C18：ContextManager 安全结果扇出与唯一 Artifact 所有权（已批准，2026-08-03）
+
+T3.19 实施前复审发现：ContextManager 仍按 `context.tool_result_threshold_chars`/`context.tool_results_threshold_chars` 把 Conversation 中的安全文本重新写入 `context_blobs`，自行生成 `artifact.Ref`；与此同时，生产组装根尚未把 T2.18 的 Capture 接入全部工具结果生产者，Orchestrator 仍会在安全访问器为空时读取 `tool.Result` 的兼容公开字段。该状态形成第二套外置 owner，绕过 Artifact Store 的首字节预算、容量、保留期和原子 Commit，也无法证明 Provider、用户视图与持久化视图来自同一次 ResultFactory 构造。C18 只封闭 F7、F10、F18、F20 已批准的边界，不新增工具、协议或业务行为；未被本节改写的 C1–C17 条款继续有效。
+
+#### 唯一数据流与所有权
+
+```text
+工具输出第一字节
+  → tool.Capture（tool.inline_output_bytes / tool.capture_bytes）
+    → 阈值内：Abort staging，只保留有界预览
+    → 超阈值或已接受正字节后不完整：artifact.Store.Commit，得到 opaque artifact.Ref
+  → 唯一 ResultFactory 一次构造四个安全视图
+  → ContextManager.ProjectToolResult 只调用四个访问器并校验一致性
+    ├── ModelContent       → 当前 run 的 Provider 临时投影
+    ├── UserView          → Event / TUI / Hook
+    ├── PersistedContent  → Conversation / JSONL
+    └── OutputMeta        → opaque Ref / 截断元数据
+```
+
+- `artifact.Store` 是完整工具输出的唯一 owner。T3.19 只封闭 ResultFactory/安全投影契约，T3.19a 只封闭 `tool.Capture` 窄注入依赖与安全 candidate path，并在测试中注入真实或 poison Store；不得提前创建第二个生产组装入口。C8 artifact root 的解析和真实 Store 的唯一生产创建仍只属于既定 T4.24/T4.25b–e，最终组装根每次工具调用只通过该工具的窄构造闭包签发新的 Capture/Writer，不新增通用 CaptureFactory 类型或可替换注册表。ContextManager、Orchestrator、Conversation、TUI、Hook、Memory 和 Provider 均不能取得 Store、Writer、Reader、真实路径或 artifact payload。
+- `tool.inline_output_bytes` 是唯一内联阈值；`tool.capture_bytes` 是唯一单次原始采集上限。两者只在 Capture 构造时决定 Abort/Commit。ContextManager 只接收同一 Resolve 值用于 fail-closed 一致性校验，不能再次截断、写文件或生成 Ref。既有 `context.tool_result_threshold_chars`、`context.tool_results_threshold_chars` 与 `context.preview_chars` 不再参与生产外置决策；兼容配置输入仍按 C15 严格解析，但不得形成第二条运行时路径。
+- 删除 ContextManager 的 `dataDir`、`context_blobs`、`os`/`filepath` 文件能力、自建 SHA/Ref、外置 payload codec 和扫描候选逻辑。它不得依赖 `artifact.Store` 或任何含 Open/Read/Write 方法的接口，也不得通过 Ref 推导路径。
+
+#### ContextManager 唯一安全结果入口
+
+```go
+package contextmgr
+
+type ManagerOptions struct {
+	Context           config.ContextConfig
+	InlineOutputBytes int64
+	RuntimeRedactor   *redact.RuntimeRedactor
+}
+
+type ToolResultProjection struct {
+	ModelContent      redact.SafeText
+	UserView          tool.UserView
+	PersistedContent  redact.SafeText
+	OutputMeta        tool.OutputMeta
+}
+
+func New(provider provider.Provider, options ManagerOptions) (*Manager, error)
+func (m *Manager) ProjectToolResult(result tool.Result) (ToolResultProjection, error)
+func (m *Manager) UpdateUsage(conversation *conversation.Conversation, usage provider.Usage) error
+```
+
+为使 ContextManager 能在不接触 payload 的前提下验证 Capture/Ref 关系，C18 在既有 `tool.OutputMeta` 闭集末尾增加 `CapturedBytes int64`；ResultFactoryInput 同步接收该值。它是 Capture 实际接受的原始字节数，不是预览长度、rune 数或 JSON 长度。
+
+- `New` 是唯一构造入口；拒绝 nil RuntimeRedactor、无效 Context 数值和不在 C15 `1..1 MiB` 闭区间内的 `InlineOutputBytes`。Context 启用时 nil Provider 非法；显式禁用时允许 nil Provider，但 ProjectToolResult 和 UpdateUsage 仍可用。不保留旧 `(provider, dataDir, ContextConfig)` 构造器、variadic fallback、默认阈值或第二 options 类型。
+- `ProjectToolResult` 必须以本节精确签名存在，并且是 ContextManager 全部 production files 中唯一接收或持有 `tool.Result` 的入口；字段、接口、容器、其他函数/方法/闭包参数和返回值均不得持有该类型。方法体只允许对同一个参数标识符 `result` 形成 `result.ModelContent()`、`result.UserView()`、`result.PersistedContent()`、`result.OutputMeta()` 四个直接零参数调用且各恰好一次，随后只处理返回的不可变安全值；禁止别名、取址、装箱为 interface、传给 helper、method expression、反射或 marshal，也禁止读取或回退到 `Result.CallID/Name/Summary/Content/Data/Error/Truncated` 等兼容字段、解析 PersistedContent 恢复预览/路径。除 `internal/tool/result.go` 的访问器定义、`result_factory.go` 的唯一构造和测试外，repo production 中四访问器的唯一调用点就是该方法，Orchestrator 只能消费 `ToolResultProjection`。
+- UserView 与 OutputMeta 的 Artifact、Truncated、TruncationReason 必须逐字段相同；`CapturedBytes` 只存在于 OutputMeta 且非负。非 nil Ref 的 `ID` 恰为 64 位小写十六进制且不得含路径语义，`Bytes=OutputMeta.CapturedBytes`、`CreatedAt` 非零、`Available=true`；UserView/OutputMeta 两份 Ref 的 `ID`、`Bytes`、`CreatedAt`、`Available`、`Complete` 必须全部相同。有 Ref 时只允许 `Truncated=true`：`Complete=true` 只对应 `inline_preview_limit`，`Complete=false` 只对应 `capture_hard_limit`、`artifact_hard_limit`、`capture_write_failure` 或 `capture_canceled`。无 Ref 时只允许 `CapturedBytes <= InlineOutputBytes`、`Truncated=false` 且空 TruncationReason。零字节 after-start write failure 及 Commit failure 不发布 Capture 的不一致元数据或 unavailable Ref；caller 抛弃该 CaptureResult，规范化为 `CapturedBytes=0`、无 Ref、非截断、空 TruncationReason 的有界 synthetic error Result，并只通过 SafeError 表达失败。UserView.Preview 必须是有效 UTF-8 且 bytes 不超过 `InlineOutputBytes`。任一空视图、无效状态、不一致、超限、伪 Ref 或 CancelledBeforeStart 结果均 fail closed，且不发布部分 projection。
+- `UpdateUsage` 只接收 Provider 发布的最终 usage 值快照，拒绝负值和算术溢出；它只更新 Conversation 的数值元数据，不读取 Provider response、工具结果或 artifact。T3.26 仍负责最终 usage 的唯一有序提交时机。
+
+#### ResultFactory 闭环与 Orchestrator 扇出
+
+- T3.19 先完成 Result/ResultFactory/OutputMeta 的包内 seal、ContextManager 自身的无文件 capability、唯一 ProjectToolResult 和 usage 值边界；紧邻新增 T3.19a，只消费该已封闭结果契约并完成 producer safe candidate、Orchestrator 安全 projection 通道和临时 ModelContent 槽。二者不创建 Artifact Store、不解析 artifact root，也不依赖任何 T4 任务。
+- 内置工具、MCP、Hook synthetic result、拒绝、未知工具、参数错误、超时和取消后结果的目标状态是全部通过唯一 ResultFactory 构造；`CancelledBeforeStart` 继续没有 Result。T3.19a 先封闭构造和消费 API，并为尚未由最终 Assembly 注入的旧生产入口保留一个明确、不可进入 ContextManager 的迁移 adapter；迁移 adapter 不得写 Conversation v2 或伪造 Ref，其删除截止点固定为 T4.29a。
+- 字节流工具通过各自已注入的窄 Capture 构造闭包在执行前取得 Capture；Read/Grep/Glob/Bash/MCP 等用户数据输出从第一字节进入 Capture，不得完整读入内存后再补喂。Finish 后只把 preview、opaque Ref、CapturedBytes 与截断原因交给 ResultFactory。T3.19/T3.19a 的包级与编排测试使用 T1.25–T1.28 的真实测试 Store 封闭该链；非流式 synthetic result 只能提供有界输入且不得携带 Ref。
+- Orchestrator 的安全路径把 Result 先交给 `ContextManager.ProjectToolResult`，成功后才单点扇出。Event/TUI/Hook 只用 UserView；Conversation 的 tool-result Content/ToolState 只保存 PersistedContent、UserView 的安全状态/摘要/错误及 OutputMeta 的 opaque Ref。
+- ModelContent 槽由单次 `executionState` 独占，不使用 Orchestrator 全局 map。每项 key 为当前 conversation ID、request generation、iteration、run 内单调 ordinal 和 append 后的 message index；call ID 只作一致性字段，不能单独定位。每项 ModelContent 受 `session.max_record_bytes` 限制，槽累计受 `session.max_session_bytes` 限制，溢出或无法唯一映射时在 Provider/Store 副作用前失败。
+- Provider mapper 只在同一 executionState、同一 iteration 且 message index/ordinal 全部匹配时用临时 ModelContent 覆盖该条 PersistedContent；其余历史只使用 Conversation 中的 PersistedContent。槽在下一次 Provider request 完成规范化、计量并交给 StreamChat 后立即清除，run 的所有同步错误、Provider 错误、保存失败、取消、会话切换与正常出口再兜底清除。若 Prepare/摘要在交付前删除或移动对应消息，则删除已淘汰槽并按 survivor 原 index→新 index 的唯一映射 rebase；不能唯一映射就 fail closed。
+- T4.24 仍是 artifact root 的唯一解析点；T4.25b 创建并登记唯一 Store owner；T4.25c 用唯一 RuntimeRedactor 创建唯一 ResultFactory，并从该 Store/最终 limits 创建各内置 producer 的窄 Capture 闭包；T4.25d 向 MCP 注入同一 ResultFactory 与 Capture 闭包，向纯 synthetic Hook adapter 只注入同一 ResultFactory；T4.25e 注入 ContextManager 并使上述 Orchestrator 安全路径成为唯一生产扇出。T4.29a 原子切换 `main.go` 后，才删除 `tool.Result` 公开 payload、直接 composite literal、`Success`/`Failure` 兼容入口、raw fallback、旧 Registry/Bash 构造入口与全部迁移 adapter。协议兼容只能保留包内 wire DTO。
+
+#### 验证与授权文件面
+
+- `TestContextManagerNeverReadsRawArtifact` 同时验证 capability shape、生产 AST 和 canary：Manager 不含 path/Store/Reader/Writer；所有 ContextManager production/build variant 不导入 `artifact`、`os`、`filepath`、`io/fs`、`syscall`，没有 `context_blobs` 或 Open/Create/Read/Write/Rename/Walk 调用。生产 ContextManager 恰有一个接收 `tool.Result` 的声明，签名必须是上述 ProjectToolResult；方法体对同一未复制、未取址、未转 interface 的参数直接调用四个访问器各一次，禁止 helper、method expression、reflection 或 marshal。测试提供一旦 Open 即 panic 的 Store，但只把 opaque Ref 交给 ResultFactory；运行 projection、摘要、保存和重载后 open count 必须为零，所有安全渠道均无 raw/path canary。
+- 阈值矩阵固定 `InlineOutputBytes=8`：无 Ref 正例至少覆盖 ASCII `1234567`/`12345678` 的 `CapturedBytes=7/8`，以及 UTF-8 `你a🙂` 的 8 bytes，三者均非截断、空原因；ASCII `123456789` 与 UTF-8 `你ab🙂` 均为 9 bytes，只要无 Ref 就必须失败，任何无 Ref且 `Truncated=true` 也必须失败。有 Ref 正例覆盖 preview 0..8 bytes、`CapturedBytes>8` 的完整输出与 after-start 已接受正字节的不完整输出；逐字段变异 `ID`、`Bytes`、`CreatedAt`、`Available`、`Complete`、Truncated、TruncationReason 及 `OutputMeta.CapturedBytes`，证明两份 Ref 任一不一致、`Ref.Bytes != OutputMeta.CapturedBytes`、preview 9 bytes、有 Ref但非截断或 unavailable Ref 都失败。完整 Ref 覆盖 `inline_preview_limit`，不完整 Ref 覆盖 `capture_hard_limit`、`artifact_hard_limit`、`capture_write_failure`、`capture_canceled`；零字节 after-start write failure 按上述 synthetic error 规范化，Commit failure 不发布原 CaptureResult。旧 Context 三阈值以 `(tool_result, tool_results, preview)=(1,1,1)` 与 `(1048576,1048576,1048576)` 两组对照，除这些值外输入完全相同，同一个 Result 的完整 ToolResultProjection 必须 DeepEqual，Context 操作与摘要也一致；只有改变 `tool.inline_output_bytes` 才允许 Capture Abort/Commit 与 projection 验证变化。
+- T3.19a 集成测试证明安全路径的 Provider 得到 ModelContent，Event/TUI/Hook 得到 UserView，Conversation/JSONL/重启只得到 PersistedContent+Ref；并发 run 使用相同 call ID、跨 iteration ordinal 重置、摘要 survivor rebase、保存失败、Provider 错误、取消和会话切换后均无槽串用或残留。T4.25c/d/e 的 Assembly 测试再证明唯一 Store/Capture/ResultFactory 的真实生产注入；T4.29a 的 repoaudit 最终禁止直接 Result 构造、兼容字段读取、raw fallback 和 ModelContent 持久化。
+- 每个新增 required 根测试都进入闭合 `(Package, Test, ExpectedRuns=1)` manifest。T5.26 前人工核对 `go test -json` 中根测试恰好一次 run+pass、无 skip/fail、package pass且进程 exit 0；零匹配、同名跨包顶替、missing 或 excess 均失败。T5.26 后由 required-test gate 自动判定。
+- C18 不改变既有 Assembly 里程碑顺序。T3.19 只授权 `internal/contextmgr/{manager,test}.go`、`internal/tool/{capture,result,result_factory}.go`、`internal/repoaudit/context_result_refs_test.go` 及机械构造调用点；T3.19a 授权 `internal/orchestrator/{chat,agent_loop,tool_batches,stream_collector}.go`、`internal/conversation/{message,jsonl_record}.go`、`internal/events/events.go`、`internal/hook` 结果 adapter、`internal/tui/messages.go`、`internal/tool/{executor,bash,read,grep,glob,write,edit,registry}.go`、`internal/mcpclient/adapter.go` 及直接测试/fixture，用于建立安全路径与迁移 adapter，不得创建 Store owner。
+- `cmd/xagent/assembly.go` 仅在 T4.24、T4.25b–e 按原任务权限修改；`cmd/xagent/main.go` 在此前只允许保持编译且不产生第二 owner 的机械构造调用点更新，生产入口切换仍只属于 T4.29a。任何 T3.19 子任务不得依赖 T4.*；T4.25c 增加 T3.19a 依赖，最终零引用/删除门禁归 T4.29a。其余 closed-world 约束不变。
+
+#### C18a：executionState 临时槽文件授权（已批准，2026-08-03）
+
+C18 已批准的 ModelContent 临时槽必须由现有 `executionState` concrete owner 持有，而该类型实际定义在 `internal/orchestrator/execution_state.go`。因此 T3.19a 的授权文件面补充该文件及其直接测试，仅用于加入 C18 已定义的 conversation ID、request generation、iteration、ordinal、message index 键、checked byte accounting、survivor rebase 和全出口清理；不得在其中持有 `tool.Result`、UserView、Artifact payload/路径或 Store capability，不得创建 Orchestrator 全局 map、第二投影入口或新增业务行为。C18 其余接口、数据流、阶段边界与验证要求不变。
+
+#### C18b：Result 生产者与 Capture 注入闭环（已批准，2026-08-03）
+
+T3.19/T3.19a Task 终审确认两项实现信息必须在 Plan 层闭合：当前 `internal/orchestrator/skill_runtime.go` 的 load-skill 成功/失败路径和 `internal/tool/load_skill.go` 的内部路由失败仍直接构造兼容 Result；同时，C18 只描述“窄 Capture 构造闭包”，尚未固定其函数形状、Counter owner 和 T4 前后的生效边界。C18b 只补齐这些既有安全结果生产者及依赖注入细节，不新增工具、配置、Store owner 或业务行为；批准后以下条款取代 C18 中把 Result/ResultFactory/OutputMeta package seal 归给 T3.19a 的单句表述：
+
+- T3.19 完成 `Result`、`ResultFactory`、`ResultFactoryInput` 与 `OutputMeta` 的包内四视图契约/seal，并完成 ContextManager 投影验证；T3.19a 只消费该已封闭契约，将所有结果生产者迁入安全 candidate path、建立 Orchestrator 扇出与临时 ModelContent 槽。T3.19a 不再次定义 Result 类型、OutputMeta 字段或第二 factory。
+- T3.19a 的生产文件授权增加 `internal/orchestrator/skill_runtime.go` 与 `internal/tool/load_skill.go` 及直接测试。load-skill 成功、失败、内部路由拒绝、unknown/invalid/denied/timeout/cancel-after-start 与其他 synthetic 结果全部接收 Assembly 最终注入的同一个 ResultFactory；不得自行调用 `NewResultFactory`、直接构造 `tool.Result`、调用 `Success`/`Failure` 或形成专用第二 factory。T4.29a 的兼容入口删除与零引用门禁明确覆盖这两个文件。
+- 不新增命名的通用 CaptureFactory 类型或可替换 registry。每个需要采集用户字节流的 producer 只接收等价于 `func(context.Context, artifact.Metadata) (*tool.Capture, error)` 的未导出窄函数依赖；闭包由唯一 Assembly 创建并捕获唯一 Artifact Store、resolved `tool.inline_output_bytes`、resolved `tool.capture_bytes` 及对应不可变 hard cap。每次调用都新建只含 Bytes 维度的 operation-local `budget.Counter`，再创建一个新的 Capture/Writer；producer 永远不能取得 Store、Counter 构造参数、Reader、路径或其他调用的 Capture。
+- Read/Grep/Glob/Bash/MCP producer 必须在读取/接收用户输出第一字节前调用该闭包一次，所有接受字节只写该 Capture，并恰好调用一次 Finish；一次调用只能产生一次 Abort 或 Commit。Capture 创建失败在读取/启动用户输出前 fail closed；零字节 write failure 或 Commit failure 按 C18 规范转为无输出 synthetic SafeError。非流式 synthetic producer 只接收同一 ResultFactory，不接收 Capture 闭包；纯 synthetic Hook result adapter 尤其不得取得可触达 Store 的能力。
+- T3.19a 在 T4 Assembly 之前只建立显式 safe candidate path、窄依赖形状、迁移隔离和测试注入。旧 `main.go` 仍只能使用不可进入 ProjectToolResult、不可写 Conversation v2、不可伪造 Ref 的隔离迁移路径；不得宣称此时旧生产入口已获得首字节 Capture。T4.25c 用唯一 RuntimeRedactor 创建唯一 ResultFactory，并从 T4.25b 的唯一 Store/最终 resolved limits 创建内置工具闭包；T4.25d 向 MCP 注入同一 ResultFactory 与 Capture 闭包、向纯 synthetic Hook adapter 只注入同一 ResultFactory；T4.25e 注入 ContextManager/Orchestrator candidate。只有 T4.29a 原子发布该 candidate 并删除迁移 adapter/公开 Result payload/raw fallback 后，唯一安全链才成为生产事实。
+- C18b 不改变 T4.24、T4.25b–e、T4.29a 的顺序或 owner 数量；T3.19/T3.19a 仍不得解析 artifact root、创建生产 Store、修改 `cmd/xagent/assembly.go` 或提前切换 `main.go`。C18/C18a 其余数据矩阵、ModelContent 生命周期、required-test 与 closed-world 约束保持不变。
+
+#### C18c：Capture 不完整终态与 MCP 迁移选择文件授权（已批准，2026-08-03）
+
+T3.19a 最终 closed-world 审查确认，C18b 已批准的两项既有行为需要落在其 concrete owner 文件中：producer 在已接受正字节后因外部 I/O、等待或取消失败时，必须由 `Capture` 原子记录不完整终态；生产 MCP Manager 在 T4.25d 注入真实 Capture 前，必须显式选择 C18b 已批准的 legacy adapter。C18c 只补齐这两个文件授权，不改变 Spec、接口数据流、required 根、Assembly 顺序或发布边界。
+
+- T3.19a 的生产文件授权增加 `internal/tool/capture.go` 及直接测试，仅允许增加 `MarkIncomplete(error, CaptureTruncationReason)`：它与 `Write`、`Finish` 共用同一互斥和 first-terminal-error-wins 状态，拒绝 nil error、无效原因及 Finish 后调用；不得暴露 Writer、Store、Counter、路径或 payload，不得新增第二 Finish/Commit/Abort owner。该授权只实现 C18b 已批准的“已接受正字节后不完整即 Commit incomplete Ref”，不重新定义 T3.19 的 Capture/Result 契约。
+- T3.19a 的生产文件授权增加 `internal/mcpclient/manager.go` 的 `buildToolCandidates` 单一构造调用点及直接测试，仅允许在 T4.25d 前显式调用 `NewLegacyRemoteToolAdapter`。Manager 不接收 Capture 闭包，不创建 Store/Writer/Counter/Ref，不进入 `ProjectToolResult`，也不把 legacy Result 写入 Conversation v2；T4.25d 才注入真实 MCP Capture，T4.29a 才原子删除 legacy 选择。
+- `SafeResultProducer` 的声明留在已授权的 `internal/tool/registry.go`；`internal/tool/tool.go` 不增加 T3.19a 接口。Registry 的 immutable `View` 只能复用已经完成安全校验的 Tool，既不注册新 Tool，也不构造 candidate Executor，因此 `internal/tool/view.go` 不传播 `safeCandidate` 标志且不加入授权面。
+- MCP candidate 目前只能证明 Capture 在 adapter 调用已解码 `CallToolResult` 前创建、DTO 文本逐块写入且每次调用使用新的 Capture/Writer/Counter；不得把它描述为 transport/wire 首字节采集。真实 Manager/Transport 首字节链仍仅属于 T4.25d。C18/C18a/C18b 的其余约束保持不变。
 
 ## Spec 覆盖自检
 

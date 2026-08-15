@@ -11,9 +11,58 @@ import (
 	"testing"
 	"time"
 
+	"xagent/internal/artifact"
 	"xagent/internal/budget"
+	"xagent/internal/redact"
 	"xagent/internal/safefs"
 )
+
+func TestSafeGrepGlobStreamGeneratedOutput(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("needle one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("needle two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	factory, err := NewResultFactory(redact.NewRuntimeRedactor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grepStore := &captureTestStore{}
+	grepCaptureCalls := 0
+	grep, err := NewGrepToolWithResultBoundary(root, factory, func(ctx context.Context, _ artifact.Metadata) (*Capture, error) {
+		grepCaptureCalls++
+		return newTestCaptureWithContext(t, ctx, grepStore, 4096, 8192), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grepResult := grep.Execute(context.Background(), Input{Name: "Grep", CallID: "stream-grep", Arguments: map[string]any{"pattern": "needle", "path": "."}})
+	if grepResult.Status != StatusSuccess || grepCaptureCalls != 1 || grepStore.last == nil || grepStore.last.writeCalls < 3 || grepStore.last.aborts != 1 || grepStore.last.commits != 0 {
+		t.Fatalf("safe Grep did not stream generated matches: result=%#v calls=%d writer=%#v", grepResult, grepCaptureCalls, grepStore.last)
+	}
+	if grepResult.UserView().Preview.Text() != string(grepStore.last.data) || grepResult.ModelContent().Text() == "" {
+		t.Fatal("safe Grep result did not come from streamed CaptureResult and ResultFactory")
+	}
+
+	globStore := &captureTestStore{}
+	globCaptureCalls := 0
+	glob, err := NewGlobToolWithResultBoundary(root, factory, func(ctx context.Context, _ artifact.Metadata) (*Capture, error) {
+		globCaptureCalls++
+		return newTestCaptureWithContext(t, ctx, globStore, 4096, 8192), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	globResult := glob.Execute(context.Background(), Input{Name: "Glob", CallID: "stream-glob", Arguments: map[string]any{"pattern": "*.txt"}})
+	if globResult.Status != StatusSuccess || globCaptureCalls != 1 || globStore.last == nil || globStore.last.writeCalls < 3 || globStore.last.aborts != 1 || globStore.last.commits != 0 {
+		t.Fatalf("safe Glob did not stream generated paths: result=%#v calls=%d writer=%#v", globResult, globCaptureCalls, globStore.last)
+	}
+	if globResult.UserView().Preview.Text() != string(globStore.last.data) || globResult.ModelContent().Text() == "" {
+		t.Fatal("safe Glob result did not come from streamed CaptureResult and ResultFactory")
+	}
+}
 
 func TestReadCancellationLongLineAndBudget(t *testing.T) {
 	t.Run("canceled before open", func(t *testing.T) {

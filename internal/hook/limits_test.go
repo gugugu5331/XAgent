@@ -156,7 +156,7 @@ func TestSubAgentLimits(t *testing.T) {
 				Once:   true,
 				action: compiledAction{typeName: ActionSubAgent, agent: "agent", template: template},
 			}
-			engine, err := NewEngine(newSnapshot([]Rule{rule}), EngineOptions{ProjectRoot: t.TempDir(), Diagnostics: collector, Limits: limits})
+			engine, err := NewEngine(newSnapshot([]Rule{rule}), EngineOptions{ProjectRoot: t.TempDir(), LegacyDiagnostics: collector, Limits: limits})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -205,11 +205,11 @@ func TestOversizeEventActionRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine, err := NewEngine(newSnapshot(nil), EngineOptions{
-		ProjectRoot:   t.TempDir(),
-		CommandRunner: commandRecorder,
-		HTTPRunner:    httpRecorder,
-		Diagnostics:   collector,
-		Limits:        limits,
+		ProjectRoot:       t.TempDir(),
+		CommandRunner:     commandRecorder,
+		HTTPRunner:        httpRecorder,
+		LegacyDiagnostics: collector,
+		Limits:            limits,
 	})
 	if err != nil {
 		t.Fatal(err)

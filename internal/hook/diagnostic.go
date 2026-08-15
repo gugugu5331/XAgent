@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"xagent/internal/diagnostics"
+	"xagent/internal/redact"
 )
 
 const (
@@ -24,39 +25,47 @@ const (
 	DiagnosticActionPanic            = "hook_action_panic"
 )
 
-func hookDiagnostic(code string, rule Rule, event Event, stage string, duration time.Duration, summary string, limits Limits) diagnostics.Diagnostic {
+type diagnosticRule struct {
+	source           redact.SafeText
+	ordinal          int
+	effectiveOrdinal int
+	action           ActionType
+}
+
+func hookDiagnostic(code string, rule diagnosticRule, event Event, stage string, duration time.Duration, summary redact.SafeText, limits Limits) diagnostics.Diagnostic {
 	summary = safeSummary(summary, limits.DiagnosticBytes)
 	attributes := map[string]string{
 		"event":                  string(event),
-		"rule_ordinal":           strconv.Itoa(rule.Source.Ordinal),
-		"effective_rule_ordinal": strconv.Itoa(rule.Source.EffectiveOrdinal),
-		"action":                 string(rule.action.typeName),
+		"rule_ordinal":           strconv.Itoa(rule.ordinal),
+		"effective_rule_ordinal": strconv.Itoa(rule.effectiveOrdinal),
+		"action":                 string(rule.action),
 		"stage":                  stage,
 		"duration_ms":            strconv.FormatInt(duration.Milliseconds(), 10),
 	}
-	return diagnostics.New(code, diagnostics.SeverityWarning, summary).
-		WithSource(rule.Source.Path).
-		WithPath(fmt.Sprintf("hooks[%d]", rule.Source.Ordinal-1)).
+	return diagnostics.New(code, diagnostics.SeverityWarning, summary.Text()).
+		WithSource(rule.source.Text()).
+		WithPath(fmt.Sprintf("hooks[%d]", rule.ordinal-1)).
 		WithAttributes(attributes)
 }
 
-func safeSummary(value string, maxBytes int) string {
-	if value == "" {
-		value = "hook action failed"
+func safeSummary(value redact.SafeText, maxBytes int) redact.SafeText {
+	text := value.Text()
+	if text == "" {
+		text = "hook action failed"
 	}
-	result := make([]rune, 0, len(value))
-	for _, r := range value {
+	result := make([]rune, 0, len(text))
+	for _, r := range text {
 		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f) {
 			result = append(result, r)
 		}
 	}
-	value = string(result)
-	if len(value) <= maxBytes {
-		return value
+	text = string(result)
+	if len(text) <= maxBytes {
+		return redact.NewRuntimeRedactor().Redact(text)
 	}
 	end := maxBytes
-	for end > 0 && !utf8.RuneStart(value[end]) {
+	for end > 0 && !utf8.RuneStart(text[end]) {
 		end--
 	}
-	return value[:end]
+	return redact.NewRuntimeRedactor().Redact(text[:end])
 }

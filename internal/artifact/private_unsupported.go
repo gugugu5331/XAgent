@@ -7,6 +7,10 @@ import (
 	"os"
 )
 
+func openPrivateArtifactRoot(string, string, bool) (privateArtifactRoot, string, error) {
+	return nil, "", errors.New("artifact private storage is unsupported")
+}
+
 func ensurePrivateArtifactRoot(string) error {
 	return errors.New("artifact private storage is unsupported")
 }

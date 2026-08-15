@@ -2,40 +2,25 @@ package instructions
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
+	"xagent/internal/budget"
 	"xagent/internal/config"
 	"xagent/internal/diagnostics"
 	"xagent/internal/prompt"
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 )
 
-type Scope string
-
-const (
-	ScopeProjectRoot Scope = "project_root"
-	ScopeProjectDir  Scope = "project_dir"
-	ScopeUserDir     Scope = "user_dir"
-)
-
-const (
-	PriorityProjectRoot = 1000
-	PriorityProjectDir  = 1010
-	PriorityUserDir     = 1020
-)
-
-type Source struct {
-	Name     string
-	Path     string
-	Priority int
-	Scope    Scope
-	Content  string
-}
+const maxInstructionIncludeDepth = 32
 
 type Loader struct {
 	ProjectRoot string
@@ -43,40 +28,41 @@ type Loader struct {
 	Config      config.InstructionsConfig
 }
 
+// CachedLoader preserves the public loader shape while serializing loads.
+// Filesystem freshness is never decided through path-based Stat metadata;
+// every load re-enters the safefs Root chain and the graph cache remains
+// available only through its budget-aware ExpansionCache contract.
 type CachedLoader struct {
 	Loader Loader
-	mu     sync.RWMutex
-	cache  *loaderCache
+	mu     sync.Mutex
 }
 
 type loaderCache struct {
-	sections     []prompt.Section
-	diagnostics  []diagnostics.Diagnostic
-	dependencies []fileDependency
+	sections    []prompt.Section
+	diagnostics []diagnostics.Diagnostic
 }
 
-type fileDependency struct {
-	path    string
-	modTime time.Time
-	size    int64
-	missing bool
+type instructionRoot struct {
+	path   string
+	handle *safefs.Root
 }
 
 type candidate struct {
-	name        string
-	path        string
-	allowedRoot string
-	priority    int
-	scope       Scope
+	name     string
+	path     string
+	relative string
+	root     *instructionRoot
+	priority int
+	scope    Scope
 }
 
 func (l Loader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
-	result := l.load(ctx, false)
+	result := l.load(ctx)
 	return result.sections, result.diagnostics
 }
 
-func (l Loader) load(ctx context.Context, trackDeps bool) loaderCache {
-	sources, items, deps := l.loadSources(ctx, trackDeps)
+func (l Loader) load(ctx context.Context) loaderCache {
+	sources, items := l.loadSources(ctx)
 	sections := make([]prompt.Section, 0, len(sources))
 	for _, source := range sources {
 		content := strings.TrimSpace(source.Content)
@@ -90,164 +76,349 @@ func (l Loader) load(ctx context.Context, trackDeps bool) loaderCache {
 			Stable:   true,
 		})
 	}
-	return loaderCache{sections: sections, diagnostics: items, dependencies: deps}
+	return loaderCache{sections: sections, diagnostics: items}
 }
 
 func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagnostic) {
-	sources, items, _ := l.loadSources(ctx, false)
-	return sources, items
+	return l.loadSources(ctx)
 }
 
-func (l Loader) loadSources(ctx context.Context, trackDeps bool) ([]Source, []diagnostics.Diagnostic, []fileDependency) {
+func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagnostic) {
+	if ctx == nil {
+		return nil, []diagnostics.Diagnostic{newDiagnostic("instructions_context_cancelled", "指令加载上下文无效", "instructions", "")}
+	}
 	cfg := normalizedConfig(l.Config)
-	candidates, items := l.candidates(cfg)
+	counter, err := newInstructionCounter(cfg)
+	if err != nil {
+		return nil, []diagnostics.Diagnostic{newDiagnostic("instructions_budget_invalid", err.Error(), "instructions", "")}
+	}
+	candidates, roots, items := l.candidates(ctx, cfg)
 	sources := make([]Source, 0, len(candidates))
-	var deps []fileDependency
 
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
-			items = append(items, newDiagnostic("instructions_context_cancelled", err.Error(), candidate.name, candidate.path))
+			items = append(items, newDiagnostic("instructions_context_cancelled", err.Error(), candidate.name, candidate.relative))
 			break
 		}
-		content, actualPath, ok, diag := readInstructionFile(candidate.path, candidate.allowedRoot, cfg.MaxFileBytes, false, candidate.name)
+		rootFile, ok, diag := readSafefsInstructionFile(ctx, candidate.root.handle, candidate.relative, cfg.MaxFileBytes, false, candidate.name, counter)
 		if diag != nil {
 			items = append(items, *diag)
-		}
-		if trackDeps {
-			deps = append(deps, instructionDependency(candidate.path, actualPath, ok))
 		}
 		if !ok {
 			continue
 		}
-		expanded, includeDiagnostics, includeDeps := expandIncludesWithDeps(ctx, includeRequest{
-			content:     string(content),
-			baseDir:     filepath.Dir(actualPath),
-			allowedRoot: candidate.allowedRoot,
-			maxDepth:    cfg.MaxIncludeDepth,
-			maxBytes:    cfg.MaxFileBytes,
-			sourceName:  candidate.name,
-			visited:     map[string]bool{actualPath: true},
+		reader := func(ctx context.Context, relative, _ string, maxBytes int64, sourceName string) (includeFile, bool, *diagnostics.Diagnostic) {
+			return readSafefsInstructionFile(ctx, candidate.root.handle, relative, maxBytes, true, sourceName, counter)
+		}
+		expanded, includeDiagnostics, _ := expandIncludesWithDeps(ctx, includeRequest{
+			content:          string(rootFile.content),
+			baseDir:          pathpkg.Dir(candidate.relative),
+			allowedRoot:      candidate.path,
+			maxDepth:         cfg.MaxIncludeDepth,
+			maxBytes:         cfg.MaxFileBytes,
+			maxTotalBytes:    cfg.MaxTotalBytes,
+			maxFiles:         cfg.MaxFiles,
+			maxExpandedBytes: cfg.MaxExpandedBytes,
+			sourceName:       candidate.name,
+			rootIdentity:     rootFile.identity,
+			rootFile:         rootFile,
+			counter:          counter,
+			read:             reader,
 		})
 		items = append(items, includeDiagnostics...)
-		if trackDeps {
-			for _, depPath := range includeDeps {
-				deps = append(deps, instructionDependency(depPath, depPath, true))
-			}
-		}
 		sources = append(sources, Source{
 			Name:     candidate.name,
-			Path:     actualPath,
+			Path:     candidate.path,
 			Priority: candidate.priority,
 			Scope:    candidate.scope,
 			Content:  expanded,
 		})
 	}
 
+	for _, root := range roots {
+		if err := root.handle.Close(); err != nil {
+			items = append(items, newDiagnostic("instructions_root_close_failed", "无法关闭指令根目录", "instructions", root.path))
+		}
+	}
 	sort.SliceStable(sources, func(i, j int) bool {
 		if sources[i].Priority == sources[j].Priority {
 			return sources[i].Name < sources[j].Name
 		}
 		return sources[i].Priority < sources[j].Priority
 	})
-	return sources, items, deps
+	return sources, items
 }
 
 func (l *CachedLoader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
 	if l == nil {
 		return nil, nil
 	}
-	if cached, ok := l.cached(); ok {
-		return cloneSections(cached.sections), cloneDiagnostics(cached.diagnostics)
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.cache != nil && dependenciesFresh(l.cache.dependencies) {
-		return cloneSections(l.cache.sections), cloneDiagnostics(l.cache.diagnostics)
-	}
-	loaded := l.Loader.load(ctx, true)
-	l.cache = &loaderCache{sections: cloneSections(loaded.sections), diagnostics: cloneDiagnostics(loaded.diagnostics), dependencies: cloneDependencies(loaded.dependencies)}
-	return loaded.sections, loaded.diagnostics
+	return l.Loader.Load(ctx)
 }
 
-func (l *CachedLoader) cached() (loaderCache, bool) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	if l.cache == nil || !dependenciesFresh(l.cache.dependencies) {
-		return loaderCache{}, false
+func (l Loader) candidates(ctx context.Context, cfg config.InstructionsConfig) ([]candidate, []*instructionRoot, []diagnostics.Diagnostic) {
+	var candidates []candidate
+	var roots []*instructionRoot
+	var items []diagnostics.Diagnostic
+
+	addRoot := func(rootPath, sourceName string, build func(*instructionRoot)) {
+		if strings.TrimSpace(rootPath) == "" || ctx.Err() != nil {
+			return
+		}
+		root, diag := openInstructionRoot(ctx, rootPath, sourceName)
+		if diag != nil {
+			items = append(items, *diag)
+		}
+		if root == nil {
+			return
+		}
+		roots = append(roots, root)
+		build(root)
 	}
-	return loaderCache{sections: cloneSections(l.cache.sections), diagnostics: cloneDiagnostics(l.cache.diagnostics), dependencies: cloneDependencies(l.cache.dependencies)}, true
+	addCandidate := func(root *instructionRoot, name string, priority int, scope Scope, parts ...string) {
+		relative, err := canonicalInstructionRelative(parts...)
+		if err != nil {
+			items = append(items, newDiagnostic("instructions_path_invalid", "指令相对路径无效，已跳过", name, strings.Join(parts, "/")))
+			return
+		}
+		candidates = append(candidates, candidate{
+			name:     name,
+			path:     filepath.Join(root.path, filepath.FromSlash(relative)),
+			relative: relative,
+			root:     root,
+			priority: priority,
+			scope:    scope,
+		})
+	}
+
+	addRoot(strings.TrimSpace(l.ProjectRoot), "项目指令根目录", func(root *instructionRoot) {
+		for offset, projectFile := range projectFiles(cfg) {
+			addCandidate(root, "项目根指令", PriorityProjectRoot+offset, ScopeProjectRoot, projectFile)
+		}
+		addCandidate(root, "项目目录指令", PriorityProjectDir, ScopeProjectDir, cfg.ProjectDir, cfg.ProjectFile)
+	})
+	addRoot(l.userDir(cfg), "用户指令根目录", func(root *instructionRoot) {
+		addCandidate(root, "用户指令", PriorityUserDir, ScopeUserDir, cfg.ProjectFile)
+	})
+	if err := ctx.Err(); err != nil {
+		items = append(items, newDiagnostic("instructions_context_cancelled", err.Error(), "instructions", ""))
+	}
+	return candidates, roots, items
 }
 
-func instructionDependency(requestedPath string, actualPath string, exists bool) fileDependency {
-	path := requestedPath
-	if exists && actualPath != "" {
-		path = actualPath
+func openInstructionRoot(ctx context.Context, rootPath, sourceName string) (*instructionRoot, *diagnostics.Diagnostic) {
+	if err := ctx.Err(); err != nil {
+		item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, "")
+		return nil, &item
 	}
-	path = filepath.Clean(path)
-	if !filepath.IsAbs(path) {
-		if abs, err := filepath.Abs(path); err == nil {
-			path = abs
+	absolute, err := filepath.Abs(strings.TrimSpace(rootPath))
+	if err != nil {
+		item := newDiagnostic("instructions_root_open_failed", "无法解析指令根目录", sourceName, "")
+		return nil, &item
+	}
+	absolute = filepath.Clean(absolute)
+	if _, err := os.Lstat(absolute); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		item := newDiagnostic("instructions_root_open_failed", "无法检查指令根目录", sourceName, absolute)
+		return nil, &item
+	}
+	opened, err := safefs.Bootstrap(absolute, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		item := newDiagnostic("instructions_root_open_failed", "无法安全打开指令根目录", sourceName, absolute)
+		return nil, &item
+	}
+	if err := ctx.Err(); err != nil {
+		_ = opened.Root.Close()
+		item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, absolute)
+		return nil, &item
+	}
+	return &instructionRoot{path: absolute, handle: opened.Root}, nil
+}
+
+func readSafefsInstructionFile(ctx context.Context, root *safefs.Root, relative string, maxBytes int64, reportMissing bool, sourceName string, counter *budget.Counter) (includeFile, bool, *diagnostics.Diagnostic) {
+	if err := ctx.Err(); err != nil {
+		item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	before, err := root.Bind(relative)
+	if err != nil {
+		if !reportMissing {
+			return includeFile{}, false, nil
+		}
+		item := newDiagnostic("instructions_path_escape", "指令路径无法在允许根内安全绑定，已拒绝", sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	file, err := root.OpenRead(ctx, relative)
+	if err != nil {
+		if !reportMissing {
+			return includeFile{}, false, nil
+		}
+		item := newDiagnostic("instructions_include_missing", "@include 文件不存在或无法安全打开，已跳过", sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	if err := counter.Consume(budget.Files, 1); err != nil {
+		_ = file.Close()
+		item := instructionBudgetDiagnostic(budget.Files, err, sourceName, relative)
+		return includeFile{}, false, &item
+	}
+
+	content, readDiag := readBoundedInstructionContent(ctx, file, maxBytes, sourceName, relative, counter)
+	closeErr := file.Close()
+	if readDiag != nil {
+		return includeFile{}, false, readDiag
+	}
+	if closeErr != nil {
+		item := newDiagnostic("instructions_read_failed", "无法关闭已读取的指令文件", sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	if err := ctx.Err(); err != nil {
+		item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	after, err := root.Bind(relative)
+	if err != nil || before != after {
+		item := newDiagnostic("instructions_path_changed", "指令文件读取期间稳定身份发生变化，已拒绝", sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	identity, err := FileIdentityFromBinding(before)
+	if err != nil {
+		item := newDiagnostic("instructions_path_changed", "无法确认指令文件稳定身份，已拒绝", sourceName, relative)
+		return includeFile{}, false, &item
+	}
+	return includeFile{content: content, path: relative, identity: identity, budgeted: true}, true, nil
+}
+
+func readBoundedInstructionContent(ctx context.Context, file *safefs.File, maxBytes int64, sourceName, relative string, counter *budget.Counter) ([]byte, *diagnostics.Diagnostic) {
+	if maxBytes <= 0 {
+		item := newDiagnostic("instructions_budget_invalid", "指令单文件预算无效", sourceName, relative)
+		return nil, &item
+	}
+	capacity := maxBytes
+	if capacity > 32*1024 {
+		capacity = 32 * 1024
+	}
+	content := make([]byte, 0, int(capacity))
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, relative)
+			return nil, &item
+		}
+		remaining := maxBytes - int64(len(content))
+		readSize := int64(len(buffer))
+		if remaining < readSize {
+			readSize = remaining + 1
+		}
+		count, readErr := file.Read(buffer[:int(readSize)])
+		if count > 0 {
+			if err := counter.Consume(budget.Bytes, int64(count)); err != nil {
+				item := instructionBudgetDiagnostic(budget.Bytes, err, sourceName, relative)
+				return nil, &item
+			}
+			if int64(count) > remaining {
+				item := newDiagnostic("instructions_file_too_large", fmt.Sprintf("指令文件超过大小限制：>%d", maxBytes), sourceName, relative)
+				return nil, &item
+			}
+			content = append(content, buffer[:count]...)
+		}
+		if errors.Is(readErr, io.EOF) {
+			return content, nil
+		}
+		if readErr != nil {
+			item := newDiagnostic("instructions_read_failed", "无法读取指令文件", sourceName, relative)
+			return nil, &item
+		}
+		if count == 0 {
+			item := newDiagnostic("instructions_read_failed", "指令文件读取未取得进展", sourceName, relative)
+			return nil, &item
 		}
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fileDependency{path: path, missing: true}
-	}
-	return fileDependency{path: path, modTime: info.ModTime(), size: info.Size()}
 }
 
-func dependenciesFresh(deps []fileDependency) bool {
-	for _, dep := range deps {
-		info, err := os.Stat(dep.path)
-		if dep.missing {
-			if err == nil {
-				return false
-			}
+func instructionBudgetDiagnostic(dimension budget.Dimension, err error, sourceName, relative string) diagnostics.Diagnostic {
+	code := "instructions_budget_exceeded"
+	switch dimension {
+	case budget.Files:
+		code = "instructions_files_limit"
+	case budget.Bytes:
+		code = "instructions_total_bytes_limit"
+	case budget.ExpandedBytes:
+		code = "instructions_expanded_bytes_limit"
+	}
+	return newDiagnostic(code, err.Error(), sourceName, relative)
+}
+
+func newInstructionCounter(cfg config.InstructionsConfig) (*budget.Counter, error) {
+	requested := []struct {
+		scope budget.Scope
+		value int64
+	}{
+		{budget.InstructionsMaxFileBytes, cfg.MaxFileBytes},
+		{budget.InstructionsMaxTotalBytes, cfg.MaxTotalBytes},
+		{budget.InstructionsMaxFiles, cfg.MaxFiles},
+		{budget.InstructionsMaxExpandedBytes, cfg.MaxExpandedBytes},
+	}
+	var effectiveEntries []budget.Limit
+	var hardEntries []budget.Limit
+	for _, item := range requested {
+		spec, ok := instructionBudgetSpec(item.scope)
+		if !ok {
+			return nil, errors.New("instruction budget specification is unavailable")
+		}
+		if _, err := spec.Resolve(&item.value); err != nil {
+			return nil, err
+		}
+		if item.scope == budget.InstructionsMaxFileBytes {
 			continue
 		}
-		if err != nil || info.Size() != dep.size || !info.ModTime().Equal(dep.modTime) {
-			return false
+		effectiveEntries = append(effectiveEntries, budget.Limit{Dimension: spec.Dimension, Value: item.value})
+		hardEntries = append(hardEntries, budget.Limit{Dimension: spec.Dimension, Value: spec.HardCap})
+	}
+	if cfg.MaxIncludeDepth <= 0 || cfg.MaxIncludeDepth > maxInstructionIncludeDepth {
+		return nil, errors.New("instruction include depth is outside the approved limits")
+	}
+	effective, err := budget.NewLimits(effectiveEntries...)
+	if err != nil {
+		return nil, err
+	}
+	hard, err := budget.NewLimits(hardEntries...)
+	if err != nil {
+		return nil, err
+	}
+	return budget.NewCounter(effective, hard)
+}
+
+func instructionBudgetSpec(scope budget.Scope) (budget.Spec, bool) {
+	for _, spec := range budget.AllSpecs() {
+		if spec.Scope == scope {
+			return spec, true
 		}
 	}
-	return true
+	return budget.Spec{}, false
 }
 
-func cloneSections(sections []prompt.Section) []prompt.Section {
-	items := make([]prompt.Section, len(sections))
-	copy(items, sections)
-	return items
-}
-
-func cloneDiagnostics(items []diagnostics.Diagnostic) []diagnostics.Diagnostic {
-	copyItems := make([]diagnostics.Diagnostic, len(items))
-	copy(copyItems, items)
-	return copyItems
-}
-
-func cloneDependencies(deps []fileDependency) []fileDependency {
-	items := make([]fileDependency, len(deps))
-	copy(items, deps)
-	return items
-}
-
-func (l Loader) candidates(cfg config.InstructionsConfig) ([]candidate, []diagnostics.Diagnostic) {
-	var items []diagnostics.Diagnostic
-	projectRoot := strings.TrimSpace(l.ProjectRoot)
-	userDir := l.userDir(cfg)
-	candidates := make([]candidate, 0, 3)
-
-	if projectRoot != "" {
-		for offset, projectFile := range projectFiles(cfg) {
-			priority := PriorityProjectRoot + offset
-			candidates = append(candidates, candidate{name: "项目根指令", path: filepath.Join(projectRoot, projectFile), allowedRoot: projectRoot, priority: priority, scope: ScopeProjectRoot})
+func canonicalInstructionRelative(parts ...string) (string, error) {
+	if len(parts) == 0 {
+		return "", errors.New("instruction path is empty")
+	}
+	cleaned := make([]string, len(parts))
+	for index, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.Contains(part, "\\") || pathpkg.IsAbs(part) || pathpkg.Clean(part) != part {
+			return "", errors.New("instruction path is invalid")
 		}
-		projectDirPath := filepath.Join(projectRoot, cfg.ProjectDir, cfg.ProjectFile)
-		candidates = append(candidates, candidate{name: "项目目录指令", path: projectDirPath, allowedRoot: projectRoot, priority: PriorityProjectDir, scope: ScopeProjectDir})
+		for _, component := range strings.Split(part, "/") {
+			if component == "" || component == "." || component == ".." {
+				return "", errors.New("instruction path is invalid")
+			}
+		}
+		cleaned[index] = part
 	}
-	if userDir != "" {
-		candidates = append(candidates, candidate{name: "用户指令", path: filepath.Join(userDir, cfg.ProjectFile), allowedRoot: userDir, priority: PriorityUserDir, scope: ScopeUserDir})
-	}
-	return candidates, items
+	return pathpkg.Join(cleaned...), nil
 }
 
 func projectFiles(cfg config.InstructionsConfig) []string {
@@ -291,6 +462,15 @@ func normalizedConfig(cfg config.InstructionsConfig) config.InstructionsConfig {
 	}
 	if cfg.MaxFileBytes <= 0 {
 		cfg.MaxFileBytes = 64 * 1024
+	}
+	if cfg.MaxTotalBytes <= 0 {
+		cfg.MaxTotalBytes = defaultIncludeMaxTotalBytes
+	}
+	if cfg.MaxFiles <= 0 {
+		cfg.MaxFiles = defaultIncludeMaxFiles
+	}
+	if cfg.MaxExpandedBytes <= 0 {
+		cfg.MaxExpandedBytes = defaultIncludeMaxExpandedBytes
 	}
 	return cfg
 }

@@ -30,6 +30,14 @@ func ParseWithLimits(data []byte, limits Limits) (Metadata, string, error) {
 	if strings.TrimSpace(body) == "" {
 		return Metadata{}, "", fmt.Errorf("skill body is empty")
 	}
+	var document yaml.Node
+	if err := yaml.NewDecoder(bytes.NewReader(frontmatter)).Decode(&document); err != nil {
+		return Metadata{}, "", fmt.Errorf("skill frontmatter is invalid or contains unknown fields")
+	}
+	historySet, err := validateFrontmatterHistory(document)
+	if err != nil {
+		return Metadata{}, "", err
+	}
 
 	var metadata Metadata
 	decoder := yaml.NewDecoder(bytes.NewReader(frontmatter))
@@ -37,6 +45,7 @@ func ParseWithLimits(data []byte, limits Limits) (Metadata, string, error) {
 	if err := decoder.Decode(&metadata); err != nil {
 		return Metadata{}, "", fmt.Errorf("skill frontmatter is invalid or contains unknown fields")
 	}
+	metadata.historySet = historySet
 	var trailing any
 	if err := decoder.Decode(&trailing); err == nil {
 		return Metadata{}, "", fmt.Errorf("skill frontmatter must contain one YAML document")
@@ -67,17 +76,14 @@ func ValidateMetadata(metadata Metadata) (Metadata, error) {
 	if metadata.Description == "" {
 		return Metadata{}, fmt.Errorf("skill description is required")
 	}
-	metadata.Mode = Mode(strings.ToLower(strings.TrimSpace(string(metadata.Mode))))
+	metadata.Mode = normalizeSkillMode(metadata.Mode)
 	switch metadata.Mode {
 	case ModeShared, ModeIsolated:
 	default:
 		return Metadata{}, fmt.Errorf("skill mode must be shared or isolated")
 	}
-	if metadata.History < 0 {
-		return Metadata{}, fmt.Errorf("skill history cannot be negative")
-	}
-	if metadata.Mode == ModeShared && metadata.History != 0 {
-		return Metadata{}, fmt.Errorf("shared skill history must be zero")
+	if err := validateSkillHistory(metadata.History, metadata.Mode); err != nil {
+		return Metadata{}, err
 	}
 	metadata.Model = strings.TrimSpace(metadata.Model)
 

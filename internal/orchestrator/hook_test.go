@@ -21,6 +21,7 @@ import (
 	"xagent/internal/hook"
 	"xagent/internal/permission"
 	"xagent/internal/provider"
+	"xagent/internal/redact"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
 )
@@ -180,8 +181,8 @@ func TestValidatedCallFlowsEndToEnd(t *testing.T) {
 		t.Fatalf("hook counts = before %d after %d", before, after)
 	}
 	want := json.Number("9007199254740993123456789")
-	if hooks.before[0].Arguments["large"] != want {
-		t.Fatalf("hook lost json.Number: %#v", hooks.before[0].Arguments["large"])
+	if hooks.before[0].Arguments()["large"] != want {
+		t.Fatalf("hook lost json.Number: %#v", hooks.before[0].Arguments()["large"])
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -218,66 +219,71 @@ func TestHookDenyShortCircuit(t *testing.T) {
 }
 
 func TestToolAfterPayloadIsRedacted(t *testing.T) {
-	secret := "hook-after-super-secret"
+	canary := "hook-after-super-secret"
 	hooks := newToolHookRecorder(hook.Continue())
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "secret.txt"), []byte(secret), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := tool.NewRegistry(root)
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret(canary)
+	factory, err := tool.NewResultFactory(runtimeRedactor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor := tool.NewExecutor(registry, root, time.Second, 4096)
-	orch := NewWithOptions(OrchestratorOptions{Registry: registry, Executor: executor, Hooks: hooks, Redact: func(value string) string { return strings.ReplaceAll(value, secret, "[REDACTED]") }})
-	out := make(chan events.Event, 8)
-	execution := orch.prepareToolExecutionWithRegistryAndRef(context.Background(), RunModeDefault, registry, indexedToolCall{Call: tool.Call{ID: "read", Name: "Read", ArgumentsJSON: `{"path":"secret.txt"}`}}, hook.ExecutionRef{ExecutionID: "e"}, out)
-	execution = orch.executePreparedTool(context.Background(), execution, out)
-	if execution.Result.Status != tool.StatusSuccess {
-		t.Fatalf("read failed: %#v", execution.Result)
+	result, err := factory.Build(tool.ResultFactoryInput{
+		CallID: "read", Name: "Read", State: tool.Completed, Status: tool.StatusSuccess,
+		Summary: "read complete", Preview: "content=" + canary,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	orch := NewWithOptions(OrchestratorOptions{Hooks: hooks})
+	orch.dispatchToolAfter(context.Background(), ToolExecution{Ref: hook.ExecutionRef{ExecutionID: "e"}, HookInput: hook.ToolInput{CallID: "read", Name: "Read"}}, result, time.Millisecond)
 	_, after := hooks.counts()
-	if after != 1 || strings.Contains(hooks.after[0].Content, secret) || !strings.Contains(hooks.after[0].Content, "[REDACTED]") {
+	content := hooks.after[0].Content.Text()
+	if after != 1 || strings.Contains(content, canary) || !strings.Contains(content, "[redacted]") {
 		t.Fatalf("unsafe after payload: %#v", hooks.after)
 	}
 }
 
 func TestToolAfterPayloadBoundsEveryResultField(t *testing.T) {
-	const secret = "opaque-hook-output-canary-73f1"
+	const canary = "opaque-hook-output-canary-73f1"
 	const maxOutput = 8 << 10
 	hooks := newToolHookRecorder(hook.Continue())
-	executor := &tool.Executor{MaxOutputBytes: maxOutput}
-	orch := NewWithOptions(OrchestratorOptions{
-		Executor: executor,
-		Hooks:    hooks,
-		Redact: func(value string) string {
-			return strings.ReplaceAll(value, secret, "[REDACTED]")
-		},
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret(canary)
+	factory, err := tool.NewResultFactory(runtimeRedactor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safeResult, err := factory.Build(tool.ResultFactoryInput{
+		CallID: "large", Name: "MCP", State: tool.Completed, Status: tool.StatusError,
+		Summary: "command failed", Preview: canary + strings.Repeat("x", maxOutput/2),
+		Error: &tool.Error{Code: tool.ErrCommandFailed, Message: "failed: " + canary, Recoverable: true},
 	})
-	huge := secret + strings.Repeat("x", maxOutput*4) + secret
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := NewWithOptions(OrchestratorOptions{Hooks: hooks})
 	orch.dispatchToolAfter(context.Background(), ToolExecution{
 		Ref:       hook.ExecutionRef{ExecutionID: "e", TurnID: "t"},
 		HookInput: hook.ToolInput{CallID: "large", Name: "MCP"},
-	}, tool.Result{
-		Status:  tool.StatusError,
-		Summary: huge,
-		Content: huge,
-		Error:   &tool.Error{Code: tool.ErrCommandFailed, Message: huge, Recoverable: true},
-	}, time.Millisecond)
+	}, safeResult, time.Millisecond)
 
 	_, after := hooks.counts()
 	if after != 1 {
 		t.Fatalf("ToolAfter count=%d", after)
 	}
 	output := hooks.after[0]
-	if output.Error == nil || len(output.Content) > maxOutput || len(output.Error.Message) > maxOutput/4 {
-		t.Fatalf("ToolAfter output was not bounded: content=%d error=%#v", len(output.Content), output.Error)
+	if output.Error == nil {
+		t.Fatal("ToolAfter safe error is missing")
 	}
-	if strings.Contains(output.Content, secret) || strings.Contains(output.Error.Message, secret) {
+	content, message := output.Content.Text(), output.Error.Message.Text()
+	if len(content) > maxOutput || len(message) > maxOutput/4 {
+		t.Fatalf("ToolAfter output was not bounded: content=%d error=%#v", len(content), output.Error)
+	}
+	if strings.Contains(content, canary) || strings.Contains(message, canary) {
 		t.Fatalf("ToolAfter output leaked runtime secret: %#v", output)
 	}
-	if !strings.Contains(output.Content, "truncated") || !utf8.ValidString(output.Content) || !utf8.ValidString(output.Error.Message) {
-		t.Fatalf("ToolAfter output is not usable UTF-8 truncation: %#v", output)
+	if !strings.Contains(content, "[redacted]") || !utf8.ValidString(content) || !utf8.ValidString(message) {
+		t.Fatalf("ToolAfter output is not usable safe UTF-8: %#v", output)
 	}
 }
 
@@ -294,8 +300,8 @@ LINT {{args}}
 
 	t.Run("deny in Plan mode does not activate", func(t *testing.T) {
 		script := [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "load-denied", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":"lint","args":"now"}`}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "used safer path"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("load-denied", tool.LoadSkillToolName, `{"name":"lint","args":"now"}`)}},
+			{{Type: provider.StreamEventTextDelta, Delta: testSafeText("used safer path")}, {Type: provider.StreamEventDone}},
 		}
 		orch, conv, activity, _ := newSkillRuntimeFixture(t, skillFile, script)
 		hooks := newToolHookRecorder(hook.Deny("skill loading disabled here"))
@@ -304,30 +310,26 @@ LINT {{args}}
 		if err != nil {
 			t.Fatal(err)
 		}
+		var found bool
 		for event := range stream {
 			if event.Type == events.Error {
 				t.Fatal(event.Err)
 			}
+			found = found || event.Type == events.ToolDenied && event.Tool != nil && event.Tool.ErrorCode == tool.ErrHookDenied
 		}
 		before, after := hooks.counts()
 		if before != 1 || after != 0 || len(activity.Snapshot().Active) != 0 {
 			t.Fatalf("load_skill deny boundary failed: before=%d after=%d active=%#v", before, after, activity.Snapshot().Active)
 		}
-		var found bool
-		for _, message := range conv.Messages {
-			if message.Role == conversation.RoleToolResult && message.ToolName == tool.LoadSkillToolName {
-				found = message.ToolErrorCode == tool.ErrHookDenied && strings.Contains(message.Content, "skill loading disabled here")
-			}
-		}
 		if !found {
-			t.Fatalf("hook_denied did not flow into tool history: %#v", conv.Messages)
+			t.Fatal("hook_denied did not flow into the bounded legacy event")
 		}
 	})
 
 	t.Run("schema validation stops before hooks", func(t *testing.T) {
 		script := [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "load-invalid", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":42}`}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "recovered"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("load-invalid", tool.LoadSkillToolName, `{"name":42}`)}},
+			{{Type: provider.StreamEventTextDelta, Delta: testSafeText("recovered")}, {Type: provider.StreamEventDone}},
 		}
 		orch, conv, activity, _ := newSkillRuntimeFixture(t, skillFile, script)
 		hooks := newToolHookRecorder(hook.Continue())
@@ -336,23 +338,19 @@ LINT {{args}}
 		if err != nil {
 			t.Fatal(err)
 		}
+		var found bool
 		for event := range stream {
 			if event.Type == events.Error {
 				t.Fatal(event.Err)
 			}
+			found = found || event.Type == events.ToolError && event.Tool != nil && event.Tool.ErrorCode == tool.ErrInvalidArguments
 		}
 		before, after := hooks.counts()
 		if before != 0 || after != 0 || len(activity.Snapshot().Active) != 0 {
 			t.Fatalf("load_skill schema boundary failed: before=%d after=%d active=%#v", before, after, activity.Snapshot().Active)
 		}
-		var found bool
-		for _, message := range conv.Messages {
-			if message.Role == conversation.RoleToolResult && message.ToolName == tool.LoadSkillToolName {
-				found = message.ToolErrorCode == tool.ErrInvalidArguments
-			}
-		}
 		if !found {
-			t.Fatalf("handler error did not flow into tool history: %#v", conv.Messages)
+			t.Fatal("handler error did not flow into the bounded legacy event")
 		}
 	})
 }
@@ -527,7 +525,7 @@ type observingProvider struct {
 
 func (p *observingProvider) Name() string { return "hook-observer" }
 
-func (p *observingProvider) StreamChat(_ context.Context, request provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (p *observingProvider) StreamChat(_ context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
 	p.mu.Lock()
 	p.request = request
 	p.mu.Unlock()
@@ -535,10 +533,7 @@ func (p *observingProvider) StreamChat(_ context.Context, request provider.ChatR
 		request.Observer.MarkSent()
 		request.Observer.Finish(true)
 	}
-	out := make(chan provider.StreamEvent, 1)
-	out <- provider.StreamEvent{Type: provider.StreamEventDone}
-	close(out)
-	return out, nil
+	return newOrchestratorTestChatStream(provider.StreamEvent{Type: provider.StreamEventDone}), nil
 }
 
 func (p *observingProvider) lastRequest() provider.ChatRequest {
@@ -547,29 +542,51 @@ func (p *observingProvider) lastRequest() provider.ChatRequest {
 	return p.request
 }
 
-func TestAcquirePromptsBeforeProvider(t *testing.T) {
-	enabled := true
-	cfg := config.ContextConfig{
-		Enabled:                   &enabled,
-		ToolResultThresholdChars:  1,
-		ToolResultsThresholdChars: 1 << 20,
-		ModelWindowTokens:         1 << 30,
-		SummaryFailureLimit:       3,
-		PreviewChars:              16,
+type summarizingObservingProvider struct {
+	observingProvider
+}
+
+func (p *summarizingObservingProvider) StreamChat(ctx context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
+	if len(request.Messages) == 1 && strings.Contains(request.Messages[0].Content.Text(), "压缩较早的对话上下文") {
+		return newOrchestratorTestChatStream(
+			provider.StreamEvent{Type: provider.StreamEventTextDelta, Delta: testSafeText("safe compacted context")},
+			provider.StreamEvent{Type: provider.StreamEventDone},
+		), nil
 	}
-	providerRecorder := &observingProvider{}
+	return p.observingProvider.StreamChat(ctx, request)
+}
+
+func TestAcquirePromptsBeforeProvider(t *testing.T) {
+	cfg := hookTestContextConfig(true)
+	cfg.ModelWindowTokens = 100
+	cfg.AutoMarginTokens = 99
+	cfg.ManualMarginTokens = 10
+	cfg.RecentKeepTokens = 1
+	cfg.RecentKeepMessages = 1
+	providerRecorder := &summarizingObservingProvider{}
 	lease := &countingPromptLease{blocks: []hook.PromptBlock{{Name: "compact-policy", Content: "PROMPT FROM COMPACT AFTER", Source: "test"}}}
 	runtime := &acquiringHookRuntime{Runtime: hook.Noop(), lease: lease}
-	manager := contextmgr.New(providerRecorder, t.TempDir(), cfg)
+	manager, err := contextmgr.New(providerRecorder, contextmgr.ManagerOptions{
+		Context:           cfg,
+		InlineOutputBytes: 8,
+		RuntimeRedactor:   redact.NewRuntimeRedactor(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	orch := NewWithOptions(OrchestratorOptions{Provider: providerRecorder, ContextManager: manager, Hooks: runtime})
 	conv := conversation.NewConversation("session-compact", time.Now())
+	conversation.AppendUserMessage(conv, "older context")
 	conversation.AppendToolResultMessage(conv, "call", "Read", "success", "large", "large result", "", false, nil, nil)
 	ref := hook.ExecutionRef{SessionID: conv.ID, ExecutionID: "execution", TurnID: "turn", Kind: hook.ExecutionMain, Mode: hook.ModeDefault}
 	stream, err := orch.streamWithExecution(context.Background(), conv, RunModeDefault, skill.ExecutionProfile{Persist: true}, false, 1, ref)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range stream {
+	for range stream.Events() {
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	runtime.mu.Lock()
 	acquireAfter := runtime.acquireAfter
@@ -583,7 +600,7 @@ func TestAcquirePromptsBeforeProvider(t *testing.T) {
 	}
 	var found bool
 	for _, block := range request.System {
-		found = found || block.Content == "PROMPT FROM COMPACT AFTER"
+		found = found || block.Content.Text() == "PROMPT FROM COMPACT AFTER"
 	}
 	if !found || request.Cache.SystemBreakpointName == "" || request.Cache.CacheTools {
 		t.Fatalf("ordered prompt/cache contract failed: %#v", request)
@@ -605,7 +622,10 @@ func TestNoHookPromptKeepsLegacyRequestPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range stream {
+	for range stream.Events() {
+	}
+	if err := stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	request := providerRecorder.lastRequest()
 	if len(request.System) != 0 || request.Observer != nil || len(request.StableSystem) == 0 || len(request.DynamicSystem) == 0 {
@@ -644,7 +664,10 @@ func TestNoHookWireCompatibility(t *testing.T) {
 		if streamErr != nil {
 			t.Fatalf("%s: %v", item.name, streamErr)
 		}
-		for range stream {
+		for range stream.Events() {
+		}
+		if err := stream.Close(context.Background()); err != nil {
+			t.Fatalf("%s close: %v", item.name, err)
 		}
 		item.runtime.EndTurn(context.Background(), ref, hook.TurnCompleted, "")
 		item.runtime.SessionEnd(context.Background(), conv.ID, hook.SessionEndExit)
@@ -695,7 +718,7 @@ func TestNoHookToolChainCompatibility(t *testing.T) {
 		}
 		if runtimeName == "empty-engine" {
 			engine, err := hook.NewEngine(hook.Snapshot{}, hook.EngineOptions{
-				ProjectRoot: t.TempDir(), Diagnostics: collector,
+				ProjectRoot: t.TempDir(), LegacyDiagnostics: collector,
 			})
 			if err != nil {
 				t.Fatalf("create empty Hook engine: %v", err)
@@ -751,8 +774,13 @@ func TestNoHookToolChainCompatibility(t *testing.T) {
 				case event := <-out:
 					permissionEvents = append(permissionEvents, event.Type)
 					if event.Confirmation != nil {
-						event.Confirmation.Decision <- events.ToolConfirmationDecision{
-							CallID: call.ID, Allowed: true, Action: events.PermissionAllowOnce,
+						if !orch.ResolveToolConfirmation(events.ToolConfirmationDecision{
+							ConfirmationID: event.Confirmation.ConfirmationID,
+							CallID:         call.ID,
+							Allowed:        true,
+							Action:         events.PermissionAllowOnce,
+						}) {
+							t.Fatal("tool confirmation decision was not accepted")
 						}
 					}
 				}
@@ -796,8 +824,8 @@ mode: shared
 COMPAT ROUTE {{args}}
 `}
 		script := [][]provider.StreamEvent{
-			{{Type: provider.StreamEventToolCall, ToolCall: &tool.Call{ID: "load", Name: tool.LoadSkillToolName, ArgumentsJSON: `{"name":"compat","args":"same"}`}}},
-			{{Type: provider.StreamEventTextDelta, Delta: "loaded"}, {Type: provider.StreamEventDone}},
+			{{Type: provider.StreamEventToolCall, ToolCall: testSafeToolCall("load", tool.LoadSkillToolName, `{"name":"compat","args":"same"}`)}},
+			{{Type: provider.StreamEventTextDelta, Delta: testSafeText("loaded")}, {Type: provider.StreamEventDone}},
 		}
 		skillOrch, conv, activity, scripted := newSkillRuntimeFixture(t, skillFiles, script)
 		skillOrch.hooks = runtime
@@ -820,8 +848,8 @@ COMPAT ROUTE {{args}}
 			got.activeSkills = append(got.activeSkills, active.Name)
 		}
 		for _, message := range conv.Messages {
-			if message.Role == conversation.RoleToolResult && message.ToolName == tool.LoadSkillToolName {
-				got.loadResultStatus = message.ToolResultStatus
+			if message.Role == conversation.RoleToolResult && message.Tool != nil && message.Tool.Name == tool.LoadSkillToolName {
+				got.loadResultStatus = string(message.Tool.Status)
 			}
 		}
 		requests := scripted.Requests()
@@ -845,7 +873,7 @@ COMPAT ROUTE {{args}}
 		baseline.lines[0].validated != `{"path":"fixture.txt"}` || baseline.lines[1].name != "mcp__fixture__echo" ||
 		baseline.lines[1].validated != `{"query":"same"}` || baseline.lines[1].content != "echo:same" ||
 		!baseline.lines[0].ticketIssued || !baseline.lines[1].ticketIssued || baseline.mcpCalls != 1 || baseline.mcpQuery != "same" ||
-		strings.Join(baseline.activeSkills, ",") != "compat" || baseline.loadResultStatus != string(tool.StatusSuccess) ||
+		strings.Join(baseline.activeSkills, ",") != "compat" || baseline.loadResultStatus != "" ||
 		!baseline.loadSystemRoute || strings.Join(baseline.loadTools, ",") != "Read,load_skill" || baseline.loadOrderedSystem != 0 ||
 		baseline.loadObserver || baseline.diagnostics != 0 {
 		t.Fatalf("legacy tool-chain golden changed: %#v", baseline)
@@ -863,7 +891,14 @@ COMPAT ROUTE {{args}}
 
 func TestHookCompactAdapter(t *testing.T) {
 	runtime := &acquiringHookRuntime{Runtime: hook.Noop()}
-	manager := contextmgr.New(&observingProvider{}, t.TempDir(), config.ContextConfig{})
+	manager, err := contextmgr.New(&observingProvider{}, contextmgr.ManagerOptions{
+		Context:           hookTestContextConfig(true),
+		InlineOutputBytes: 8,
+		RuntimeRedactor:   redact.NewRuntimeRedactor(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	orch := NewWithOptions(OrchestratorOptions{ContextManager: manager, Hooks: runtime})
 	conv := conversation.NewConversation("manual-session", time.Now())
 	if _, err := orch.CompactContext(context.Background(), conv); err != nil {
@@ -879,15 +914,30 @@ func TestHookCompactAdapter(t *testing.T) {
 	}
 }
 
+func hookTestContextConfig(enabled bool) config.ContextConfig {
+	return config.ContextConfig{
+		Enabled:                   &enabled,
+		ToolResultThresholdChars:  8,
+		ToolResultsThresholdChars: 16,
+		ModelWindowTokens:         100_000,
+		AutoMarginTokens:          1_000,
+		ManualMarginTokens:        100,
+		RecentKeepTokens:          10,
+		RecentKeepMessages:        5,
+		SummaryFailureLimit:       3,
+		PreviewChars:              16,
+	}
+}
+
 func TestHookCompactErrorIsRedacted(t *testing.T) {
-	const secret = "compact-private-secret"
+	const canary = "compact-private-secret"
 	runtime := &acquiringHookRuntime{Runtime: hook.Noop()}
-	observer := hookCompactionObserver{runtime: runtime, binding: hook.CompactBinding{SessionID: "session"}, redact: func(value string) string { return strings.ReplaceAll(value, secret, "[REDACTED]") }}
+	observer := hookCompactionObserver{runtime: runtime, binding: hook.CompactBinding{SessionID: "session"}, redact: func(value string) string { return strings.ReplaceAll(value, canary, "[REDACTED]") }}
 	token := observer.Before(context.Background(), contextmgr.Attempt{Reason: string(contextmgr.ModeAuto), Messages: 3, EstimatedTokens: 9})
-	observer.After(context.Background(), token, contextmgr.Result{AfterMessages: 2, AfterEstimatedTokens: 4}, errors.New("failed with "+secret))
+	observer.After(context.Background(), token, contextmgr.Result{AfterMessages: 2, AfterEstimatedTokens: 4}, errors.New("failed with "+canary))
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.compactOut.Status != hook.CompactErrorStatus || strings.Contains(runtime.compactOut.Error, secret) || !strings.Contains(runtime.compactOut.Error, "[REDACTED]") {
+	if runtime.compactOut.Status != hook.CompactErrorStatus || strings.Contains(runtime.compactOut.Error, canary) || !strings.Contains(runtime.compactOut.Error, "[REDACTED]") {
 		t.Fatalf("unsafe compact error output: %#v", runtime.compactOut)
 	}
 }
@@ -919,10 +969,10 @@ func (r *lifecycleContextRuntime) AfterCompact(ctx context.Context, _ hook.Compa
 }
 
 func TestHookLifecycleFinalizersUseSafeContextAndError(t *testing.T) {
-	const secret = "provider-response-private-body"
+	const canary = "provider-response-private-body"
 	runtime := &lifecycleContextRuntime{Runtime: hook.Noop()}
 	orch := NewWithOptions(OrchestratorOptions{Hooks: runtime})
-	orch.endTurn(hook.ExecutionRef{ExecutionID: "execution"}, RunResult{Reason: StopReasonProviderError, Err: errors.New("provider failed: " + secret)})
+	orch.endTurn(hook.ExecutionRef{ExecutionID: "execution"}, RunResult{Reason: StopReasonProviderError, Err: errors.New("provider failed: " + canary)})
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -933,7 +983,7 @@ func TestHookLifecycleFinalizersUseSafeContextAndError(t *testing.T) {
 
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.turnError != "agent run failed" || strings.Contains(runtime.turnError, secret) {
+	if runtime.turnError != "agent run failed" || strings.Contains(runtime.turnError, canary) {
 		t.Fatalf("unsafe turn error: %q", runtime.turnError)
 	}
 	if runtime.toolAfterErr != nil || runtime.compactAfterErr != nil {

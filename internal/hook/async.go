@@ -22,6 +22,8 @@ type asyncPool struct {
 	root        context.Context
 	cancel      context.CancelFunc
 	workers     sync.WaitGroup
+	workersDone chan struct{}
+	stopOnce    sync.Once
 	closeOnce   sync.Once
 	outstanding atomic.Int64
 	closeResult int
@@ -43,7 +45,7 @@ func newAsyncPool(workerCount, queueSize int, drainGrace, joinGrace time.Duratio
 		joinGrace = time.Second
 	}
 	root, cancel := context.WithCancel(context.Background())
-	p := &asyncPool{accepting: true, queue: make(chan asyncJob, queueSize), root: root, cancel: cancel, drainGrace: drainGrace, joinGrace: joinGrace}
+	p := &asyncPool{accepting: true, queue: make(chan asyncJob, queueSize), root: root, cancel: cancel, workersDone: make(chan struct{}), drainGrace: drainGrace, joinGrace: joinGrace}
 	for i := 0; i < workerCount; i++ {
 		p.workers.Add(1)
 		go p.worker()
@@ -114,26 +116,106 @@ func (p *asyncPool) close() int {
 		return 0
 	}
 	p.closeOnce.Do(func() {
-		p.mu.Lock()
-		p.accepting = false
-		close(p.queue)
-		p.mu.Unlock()
-		done := make(chan struct{})
-		go func() { p.workers.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(p.drainGrace):
+		p.beginClose()
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), p.drainGrace)
+		if !p.waitWorkers(drainCtx) {
 			p.closeResult = int(p.outstanding.Load())
 			if p.closeResult < 0 {
 				p.closeResult = 0
 			}
-			p.cancel()
-			select {
-			case <-done:
-			case <-time.After(p.joinGrace):
-			}
+			p.cancelWorkers()
+			joinCtx, cancelJoin := context.WithTimeout(context.Background(), p.joinGrace)
+			p.waitWorkers(joinCtx)
+			cancelJoin()
 		}
-		p.cancel()
+		cancelDrain()
+		p.cancelWorkers()
 	})
 	return p.closeResult
+}
+
+// closeWithContext stops admission, gives already admitted jobs a bounded
+// drain window, then cancels them and waits through the bounded join window.
+// The caller owns the enclosing hard cleanup deadline.
+func (p *asyncPool) closeWithContext(ctx context.Context) (int, error) {
+	if p == nil {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	p.beginClose()
+	drainCtx, cancelDrain := context.WithTimeout(ctx, p.drainGrace)
+	drained := p.waitWorkers(drainCtx)
+	drainErr := drainCtx.Err()
+	cancelDrain()
+	if drained {
+		p.cancelWorkers()
+		return 0, nil
+	}
+
+	count := p.outstandingCount()
+	p.cancelWorkers()
+	if err := ctx.Err(); err != nil {
+		return count, err
+	}
+	joinCtx, cancelJoin := context.WithTimeout(ctx, p.joinGrace)
+	joined := p.waitWorkers(joinCtx)
+	joinErr := joinCtx.Err()
+	cancelJoin()
+	if joined {
+		return count, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return count, err
+	}
+	if joinErr != nil {
+		return count, joinErr
+	}
+	return count, drainErr
+}
+
+func (p *asyncPool) beginClose() {
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		p.accepting = false
+		close(p.queue)
+		p.mu.Unlock()
+		go func() {
+			p.workers.Wait()
+			close(p.workersDone)
+		}()
+	})
+}
+
+func (p *asyncPool) waitWorkers(ctx context.Context) bool {
+	if p == nil {
+		return true
+	}
+	select {
+	case <-p.workersDone:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (p *asyncPool) cancelWorkers() {
+	if p != nil && p.cancel != nil {
+		p.cancel()
+	}
+}
+
+func (p *asyncPool) outstandingCount() int {
+	if p == nil {
+		return 0
+	}
+	count := int(p.outstanding.Load())
+	if count < 0 {
+		return 0
+	}
+	return count
 }

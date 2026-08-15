@@ -59,19 +59,19 @@ func TestRequestObserverContract(t *testing.T) {
 	newRequestAttempt(recorder).finish()
 	assertObserverEvents(t, recorder, "finish:false")
 
-	// A strict observer can detect a Provider contract violation instead of
-	// requestAttempt silently hiding a late transport callback.
+	// A callback that arrives after the terminal state cannot mutate the
+	// observer-visible ordering.
 	recorder = &recordingRequestObserver{}
 	attempt = newRequestAttempt(recorder)
 	attempt.finish()
 	attempt.markSent()
-	assertObserverEvents(t, recorder, "finish:false", "sent")
+	assertObserverEvents(t, recorder, "finish:false")
 }
 
 func TestOpenAIRequestAttempt(t *testing.T) {
 	t.Run("pre-send failure", func(t *testing.T) {
 		recorder := &recordingRequestObserver{}
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "://bad", APIKey: "test"}, nil)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "://bad", APIKey: "test"}, nil, providerTestRuntimeRedactor())
 		if _, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder}); err == nil {
 			t.Fatal("invalid endpoint unexpectedly succeeded")
 		}
@@ -91,13 +91,13 @@ func TestOpenAIRequestAttempt(t *testing.T) {
 				Request:    request,
 			}, nil
 		})}
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 		stream, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder})
 		if err != nil {
 			t.Fatal(err)
 		}
 		seenTerminal := false
-		for event := range stream {
+		for event := range stream.Events() {
 			if event.Type == StreamEventDone {
 				seenTerminal = true
 				assertObserverEvents(t, recorder, "sent", "finish:true")
@@ -119,7 +119,7 @@ func TestOpenAIRequestAttempt(t *testing.T) {
 				Request:    request,
 			}, nil
 		})}
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 		if _, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder}); err == nil {
 			t.Fatal("HTTP status failure unexpectedly succeeded")
 		}
@@ -136,13 +136,13 @@ func TestOpenAIRequestAttempt(t *testing.T) {
 				Request:    request,
 			}, nil
 		})}
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 		stream, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder})
 		if err != nil {
 			t.Fatal(err)
 		}
 		seenError := false
-		for event := range stream {
+		for event := range stream.Events() {
 			if event.Type == StreamEventError {
 				seenError = true
 				assertObserverEvents(t, recorder, "sent", "finish:true")
@@ -169,13 +169,13 @@ func TestAnthropicRequestAttempt(t *testing.T) {
 			Request:    request,
 		}, nil
 	})}
-	provider := NewAnthropic(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+	provider := NewAnthropic(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder})
 	if err != nil {
 		t.Fatal(err)
 	}
 	seenTerminal := false
-	for event := range stream {
+	for event := range stream.Events() {
 		if event.Type == StreamEventError {
 			seenTerminal = true
 			assertObserverEvents(t, recorder, "sent", "finish:true")
@@ -197,7 +197,7 @@ func TestRequestObserverBarrier(t *testing.T) {
 		})}
 		recorder := &recordingRequestObserver{}
 		ctx, cancel := context.WithCancel(context.Background())
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 		done := make(chan error, 1)
 		go func() {
 			_, err := provider.StreamChat(ctx, ChatRequest{Observer: recorder})
@@ -228,7 +228,7 @@ func TestRequestObserverBarrier(t *testing.T) {
 			return nil, context.Canceled
 		})}
 		recorder := &recordingRequestObserver{}
-		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, client)
+		provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: "https://example.test", APIKey: "test"}, borrowProviderTestClient(client), providerTestRuntimeRedactor())
 		done := make(chan error, 1)
 		go func() {
 			_, err := provider.StreamChat(context.Background(), ChatRequest{Observer: recorder})

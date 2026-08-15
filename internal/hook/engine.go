@@ -13,9 +13,17 @@ import (
 
 var errActionPanic = errors.New("hook action panic")
 
+const maxHookCleanupTimeout = 2 * time.Second
+
+var errHookCleanupTimeout = errors.New("hook cleanup exceeded its hard deadline")
+
 type EngineOptions struct {
-	ProjectRoot       string
-	Diagnostics       *diagnostics.Collector
+	ProjectRoot string
+	// Diagnostics is the process-wide bounded C7 sink injected by Assembly.
+	// LegacyDiagnostics only feeds the staged user-facing Hook notice view and
+	// is removed with the old production composition path at T4.29a.
+	Diagnostics       diagnostics.BoundedSink
+	LegacyDiagnostics *diagnostics.Collector
 	Redactor          *redact.RuntimeRedactor
 	CommandRunner     CommandRunner
 	HTTPRunner        HTTPRunner
@@ -24,6 +32,7 @@ type EngineOptions struct {
 	Limits            Limits
 	AsyncWorkers      int
 	AsyncQueue        int
+	CleanupTimeout    time.Duration
 	ShutdownGrace     time.Duration
 	ShutdownJoinGrace time.Duration
 }
@@ -33,12 +42,19 @@ type Engine struct {
 	factory           *eventFactory
 	prompts           *promptState
 	once              *onceState
-	diagnostics       *diagnostics.Collector
+	diagnostics       diagnostics.BoundedSink
+	legacyDiagnostics *diagnostics.Collector
 	redactor          *redact.RuntimeRedactor
 	limits            Limits
 	command           CommandRunner
 	http              HTTPRunner
+	ownedHTTP         *DefaultHTTPRunner
+	ownedHTTPClose    sync.Once
 	async             *asyncPool
+	cleanupTimeout    time.Duration
+	shutdownOnce      sync.Once
+	shutdownDone      chan struct{}
+	shutdownErr       error
 	lifecycleMu       sync.Mutex
 	lifecycleCond     *sync.Cond
 	systemState       uint8
@@ -61,6 +77,13 @@ type actionOutcome struct {
 
 func NewEngine(snapshot Snapshot, options EngineOptions) (*Engine, error) {
 	limits := normalizeLimits(options.Limits)
+	cleanupTimeout := options.CleanupTimeout
+	if cleanupTimeout < 0 || cleanupTimeout > maxHookCleanupTimeout {
+		return nil, fmt.Errorf("hook cleanup timeout must be between 1ns and 2s")
+	}
+	if cleanupTimeout == 0 {
+		cleanupTimeout = maxHookCleanupTimeout
+	}
 	factory, err := newEventFactory(options.ProjectRoot, limits, options.Clock, options.IDSource)
 	if err != nil {
 		return nil, err
@@ -74,24 +97,46 @@ func NewEngine(snapshot Snapshot, options EngineOptions) (*Engine, error) {
 		command = &ShellCommandRunner{Limits: limits, Redactor: redactor}
 	}
 	httpRunner := options.HTTPRunner
+	var ownedHTTP *DefaultHTTPRunner
 	if httpRunner == nil {
-		httpRunner = &DefaultHTTPRunner{Limits: limits, Redactor: redactor}
+		ownedHTTP = &DefaultHTTPRunner{Limits: limits, Redactor: redactor}
+		httpRunner = ownedHTTP
 	}
 	rules := snapshot.Rules()
 	engine := &Engine{
 		rules: rules, factory: factory, prompts: newPromptState(limits), once: newOnceState(),
-		diagnostics: options.Diagnostics, redactor: redactor, limits: limits, command: command, http: httpRunner,
+		diagnostics: options.Diagnostics, legacyDiagnostics: options.LegacyDiagnostics,
+		redactor: redactor, limits: limits, command: command, http: httpRunner,
+		ownedHTTP: ownedHTTP, cleanupTimeout: cleanupTimeout, shutdownDone: make(chan struct{}),
 		sessions: map[string]bool{}, executions: map[string]bool{},
 		endingSessions: map[string]bool{}, endingExecutions: map[string]bool{},
 	}
 	engine.lifecycleCond = sync.NewCond(&engine.lifecycleMu)
+	drainGrace, joinGrace := cleanupWindows(cleanupTimeout, options.ShutdownGrace, options.ShutdownJoinGrace)
 	for _, rule := range rules {
 		if rule.Async {
-			engine.async = newAsyncPool(options.AsyncWorkers, options.AsyncQueue, options.ShutdownGrace, options.ShutdownJoinGrace)
+			engine.async = newAsyncPool(options.AsyncWorkers, options.AsyncQueue, drainGrace, joinGrace)
 			break
 		}
 	}
 	return engine, nil
+}
+
+func cleanupWindows(cleanupTimeout, drainGrace, joinGrace time.Duration) (time.Duration, time.Duration) {
+	if drainGrace <= 0 || drainGrace >= cleanupTimeout {
+		drainGrace = cleanupTimeout / 2
+	}
+	if drainGrace <= 0 {
+		drainGrace = cleanupTimeout
+	}
+	remaining := cleanupTimeout - drainGrace
+	if remaining <= 0 {
+		remaining = drainGrace
+	}
+	if joinGrace <= 0 || joinGrace > remaining {
+		joinGrace = remaining
+	}
+	return drainGrace, joinGrace
 }
 
 func (e *Engine) SystemStart(ctx context.Context) {
@@ -121,6 +166,34 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.shutdownOnce.Do(func() {
+		go e.cleanup()
+	})
+	select {
+	case <-e.shutdownDone:
+		return e.shutdownErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Engine) cleanup() {
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), e.cleanupTimeout)
+	err := e.shutdownInternal(ctx)
+	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+	cancel()
+	if timedOut {
+		e.forceCleanup()
+		e.shutdownErr = errHookCleanupTimeout
+		e.addCleanupTimeoutNotice(time.Since(started))
+	} else {
+		e.shutdownErr = err
+	}
+	close(e.shutdownDone)
+}
+
+func (e *Engine) shutdownInternal(ctx context.Context) error {
 	e.lifecycleMu.Lock()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -132,14 +205,12 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 			e.systemState = 4
 			e.lifecycleCond.Broadcast()
 			if err := e.waitLifecycleLocked(ctx, func() bool { return e.lifecycleInFlight == 0 }); err != nil {
-				e.systemState = 0
-				e.lifecycleCond.Broadcast()
 				e.lifecycleMu.Unlock()
 				return err
 			}
 			e.lifecycleMu.Unlock()
-			if e.async != nil {
-				e.closeAsyncWithNotice()
+			if err := e.closeResources(ctx); err != nil {
+				return err
 			}
 			e.lifecycleMu.Lock()
 			e.systemState = 2
@@ -150,15 +221,14 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 			e.systemState = 4
 			e.lifecycleCond.Broadcast()
 			if err := e.waitLifecycleLocked(ctx, func() bool { return e.lifecycleInFlight == 0 }); err != nil {
-				// No stop event has been emitted yet, so another caller may retry.
-				e.systemState = 1
-				e.lifecycleCond.Broadcast()
 				e.lifecycleMu.Unlock()
 				return err
 			}
 			e.lifecycleMu.Unlock()
 			e.dispatch(ctx, e.factory.freeze(e.factory.base(EventSystemStop)), false)
-			e.closeAsyncWithNotice()
+			if err := e.closeResources(ctx); err != nil {
+				return err
+			}
 			e.lifecycleMu.Lock()
 			e.systemState = 2
 			e.lifecycleCond.Broadcast()
@@ -233,22 +303,52 @@ func (e *Engine) ShutdownNotices() []diagnostics.Diagnostic {
 	return result
 }
 
-func (e *Engine) closeAsyncWithNotice() {
-	if e == nil || e.async == nil {
-		return
+func (e *Engine) closeResources(ctx context.Context) error {
+	if e == nil {
+		return nil
 	}
 	started := time.Now()
-	if count := e.async.close(); count > 0 {
-		e.addShutdownNotice(count, time.Since(started))
+	if e.async != nil {
+		count, err := e.async.closeWithContext(ctx)
+		if err != nil {
+			return err
+		}
+		if count > 0 {
+			e.addShutdownNotice(count, time.Since(started))
+		}
 	}
+	e.closeOwnedHTTP()
+	return nil
+}
+
+func (e *Engine) closeOwnedHTTP() {
+	if e == nil || e.ownedHTTP == nil {
+		return
+	}
+	e.ownedHTTPClose.Do(e.ownedHTTP.CloseIdleConnections)
+}
+
+func (e *Engine) forceCleanup() {
+	if e == nil {
+		return
+	}
+	if e.async != nil {
+		e.async.beginClose()
+		e.async.cancelWorkers()
+	}
+	e.closeOwnedHTTP()
+	e.lifecycleMu.Lock()
+	e.systemState = 2
+	e.lifecycleCond.Broadcast()
+	e.lifecycleMu.Unlock()
 }
 
 func (e *Engine) addShutdownNotice(count int, duration time.Duration) {
-	summary := fmt.Sprintf("%d background hook actions were cancelled or unfinished", count)
+	summary := e.redactor.Redact(fmt.Sprintf("%d background hook actions were cancelled or unfinished", count))
 	item := diagnostics.New(
 		DiagnosticShutdownCancelled,
 		diagnostics.SeverityWarning,
-		safeSummary(summary, e.limits.DiagnosticBytes),
+		safeSummary(summary, e.limits.DiagnosticBytes).Text(),
 	).WithAttributes(map[string]string{
 		"count":       fmt.Sprintf("%d", count),
 		"duration_ms": fmt.Sprintf("%d", duration.Milliseconds()),
@@ -264,9 +364,32 @@ func (e *Engine) addShutdownNotice(count int, duration time.Duration) {
 	if items := safeCollector.List(); len(items) == 1 {
 		item = items[0]
 	}
-	if e.diagnostics != nil {
-		e.diagnostics.Add(item)
+	e.publishDiagnostic(item, "shutdown")
+	e.lifecycleMu.Lock()
+	e.shutdownNotices = append(e.shutdownNotices, item.WithAttributes(item.Attributes))
+	e.lifecycleMu.Unlock()
+}
+
+func (e *Engine) addCleanupTimeoutNotice(duration time.Duration) {
+	item := diagnostics.New(
+		"hook_cleanup_timeout",
+		diagnostics.SeverityError,
+		safeSummary(e.redactor.Redact(errHookCleanupTimeout.Error()), e.limits.DiagnosticBytes).Text(),
+	).WithAttributes(map[string]string{
+		"duration_ms": fmt.Sprintf("%d", duration.Milliseconds()),
+		"event":       string(EventSystemStop),
+		"stage":       "cleanup",
+	})
+	safeCollector := diagnostics.NewCollector(diagnostics.CollectorOptions{
+		Limit:    1,
+		MaxBytes: e.limits.DiagnosticBytes,
+		Redactor: e.redactor.Text,
+	})
+	safeCollector.Add(item)
+	if items := safeCollector.List(); len(items) == 1 {
+		item = items[0]
 	}
+	e.publishDiagnostic(item, "cleanup_timeout")
 	e.lifecycleMu.Lock()
 	e.shutdownNotices = append(e.shutdownNotices, item.WithAttributes(item.Attributes))
 	e.lifecycleMu.Unlock()
@@ -413,7 +536,7 @@ func (e *Engine) BeforeTool(ctx context.Context, ref ExecutionRef, input ToolInp
 	c := e.factory.executionBase(EventToolBefore, ref)
 	// freeze performs the only deep copy after its bounded JSON preflight. Avoid
 	// cloning attacker-controlled arguments before that hard boundary.
-	c.Tool = &ToolContext{CallID: input.CallID, Name: input.Name, Arguments: input.Arguments}
+	c.Tool = &ToolContext{CallID: input.CallID, Name: input.Name, Arguments: input.arguments}
 	return e.dispatch(ctx, e.factory.freeze(c), true)
 }
 
@@ -426,12 +549,12 @@ func (e *Engine) AfterTool(ctx context.Context, ref ExecutionRef, input ToolInpu
 	}
 	defer e.finishLifecycleEvent()
 	c := e.factory.executionBase(EventToolAfter, ref)
-	result := &ToolResultContext{Content: output.Content}
+	result := &ToolResultContext{Content: output.Content.Text()}
 	if output.Error != nil {
-		result.Error = &ToolResultError{Code: output.Error.Code, Message: output.Error.Message, Recoverable: output.Error.Recoverable}
+		result.Error = &ToolResultError{Code: output.Error.Code, Message: output.Error.Message.Text(), Recoverable: output.Error.Recoverable}
 	}
 	durationMS := duration.Milliseconds()
-	c.Tool = &ToolContext{CallID: input.CallID, Name: input.Name, Arguments: input.Arguments, Status: output.Status, DurationMS: &durationMS, Result: result}
+	c.Tool = &ToolContext{CallID: input.CallID, Name: input.Name, Arguments: input.arguments, Status: output.Status, DurationMS: &durationMS, Result: result}
 	e.dispatch(ctx, e.factory.freeze(c), false)
 }
 
@@ -500,7 +623,7 @@ func (e *Engine) dispatch(ctx context.Context, event *frozenEvent, decisionEvent
 		}
 		matched, err := rule.condition.matches(event)
 		if err != nil {
-			e.addDiagnostic(rule, event.value.Event, DiagnosticConditionFailed, "condition", 0, "condition evaluation failed")
+			e.addDiagnostic(rule, event.value.Event, DiagnosticConditionFailed, "condition", 0, e.redactor.Redact("condition evaluation failed"))
 			continue
 		}
 		if !matched {
@@ -536,7 +659,7 @@ func (e *Engine) dispatch(ctx context.Context, event *frozenEvent, decisionEvent
 				if reserved {
 					e.once.release(rule.Source.Key())
 				}
-				e.addDiagnostic(rule, event.value.Event, DiagnosticAsyncQueueFull, "enqueue", 0, "background hook queue is full")
+				e.addDiagnostic(rule, event.value.Event, DiagnosticAsyncQueueFull, "enqueue", 0, e.redactor.Redact("background hook queue is full"))
 			}
 			continue
 		}
@@ -625,7 +748,7 @@ func (e *Engine) execute(ctx context.Context, rule Rule, event *frozenEvent) act
 		if _, err := rule.action.template.render(event, e.limits.SubAgentInputBytes, e.redactor); err != nil {
 			return actionOutcome{code: DiagnosticTemplateFailed, stage: "template", err: err}
 		}
-		e.addDiagnostic(rule, event.value.Event, DiagnosticSubAgentNotImplemented, "subagent", 0, "subagent hook action is not implemented")
+		e.addDiagnostic(rule, event.value.Event, DiagnosticSubAgentNotImplemented, "subagent", 0, e.redactor.Redact("subagent hook action is not implemented"))
 		return actionOutcome{success: true}
 	default:
 		return actionOutcome{stage: "action", err: fmt.Errorf("unknown action")}
@@ -672,7 +795,7 @@ func (e *Engine) prepareAsync(rule Rule, event *frozenEvent) (func(context.Conte
 		}
 		eventName := event.value.Event
 		return func(context.Context) actionOutcome {
-			e.addDiagnostic(rule, eventName, DiagnosticSubAgentNotImplemented, "subagent", 0, "subagent hook action is not implemented")
+			e.addDiagnostic(rule, eventName, DiagnosticSubAgentNotImplemented, "subagent", 0, e.redactor.Redact("subagent hook action is not implemented"))
 			return actionOutcome{success: true}
 		}, actionOutcome{}
 	default:
@@ -694,11 +817,30 @@ func (e *Engine) recordOutcome(rule Rule, event Event, outcome actionOutcome, du
 	if code == "" {
 		code = DiagnosticActionPanic
 	}
-	e.addDiagnostic(rule, event, code, outcome.stage, duration, "hook action failed")
+	e.addDiagnostic(rule, event, code, outcome.stage, duration, e.redactor.Redact("hook action failed"))
 }
-func (e *Engine) addDiagnostic(rule Rule, event Event, code, stage string, duration time.Duration, summary string) {
+func (e *Engine) addDiagnostic(rule Rule, event Event, code, stage string, duration time.Duration, summary redact.SafeText) {
+	safeRule := diagnosticRule{
+		source:           e.redactor.Redact(rule.Source.Path),
+		ordinal:          rule.Source.Ordinal,
+		effectiveOrdinal: rule.Source.EffectiveOrdinal,
+		action:           rule.action.typeName,
+	}
+	e.publishDiagnostic(hookDiagnostic(code, safeRule, event, stage, duration, summary, e.limits), stage)
+}
+
+func (e *Engine) publishDiagnostic(item diagnostics.Diagnostic, hint string) {
+	if e == nil {
+		return
+	}
 	if e.diagnostics != nil {
-		e.diagnostics.Add(hookDiagnostic(code, rule, event, stage, duration, summary, e.limits))
+		e.diagnostics.Add(diagnostics.SanitizeInput{
+			Code: item.Code, Source: item.Source, Hint: hint,
+			Severity: item.Severity, Err: errors.New(item.Message),
+		})
+	}
+	if e.legacyDiagnostics != nil {
+		e.legacyDiagnostics.Add(item)
 	}
 }
 func cloneStringMap(values map[string]string) map[string]string {

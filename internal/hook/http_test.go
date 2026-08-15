@@ -7,14 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"xagent/internal/diagnostics"
+	"xagent/internal/netpolicy"
 	"xagent/internal/redact"
 )
 
@@ -25,7 +27,7 @@ func TestHTTPURLValidation(t *testing.T) {
 			t.Fatalf("%s: %v", raw, err)
 		}
 	}
-	invalid := []string{"http://example.com", "ftp://example.com", "/relative", "https://user:pass@example.com", "https://example.com/#fragment", "http://LOCALHOST", "https://example.com/${TOKEN}", "https://example.com/{{event}}"}
+	invalid := []string{"/relative", "https://user:pass@example.com", "https://example.com/#fragment", "https://example.com/${TOKEN}", "https://example.com/{{event}}"}
 	for _, raw := range invalid {
 		if _, err := compileHTTPAction(ActionConfig{Type: ActionHTTP, URL: raw, present: map[string]bool{"type": true, "url": true}}, DefaultLimits(), func(string) (string, bool) { return "", false }, nil); err == nil {
 			t.Fatalf("accepted %s", raw)
@@ -60,18 +62,18 @@ func TestHTTPURLLengthExactAndPlusOne(t *testing.T) {
 func TestHTTPHeaderValidation(t *testing.T) {
 	config := ActionConfig{Type: ActionHTTP, URL: "https://example.invalid", Headers: map[string]string{"Authorization": "Bearer ${API_TOKEN}"}, present: map[string]bool{"type": true, "url": true, "headers": true}}
 	runtimeRedactor := redact.NewRuntimeRedactor()
-	const secret = "http-header-component-canary-12345"
-	action, err := compileHTTPAction(config, DefaultLimits(), func(name string) (string, bool) { return secret, name == "API_TOKEN" }, runtimeRedactor)
+	const canary = "http-header-component-canary-12345"
+	action, err := compileHTTPAction(config, DefaultLimits(), func(name string) (string, bool) { return canary, name == "API_TOKEN" }, runtimeRedactor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action.headers.Get("Authorization") != "Bearer "+secret {
+	if action.headers.Get("Authorization") != "Bearer "+canary {
 		t.Fatalf("header expansion = %q", action.headers.Get("Authorization"))
 	}
-	if got := runtimeRedactor.Text(secret); got != "[redacted]" {
+	if got := runtimeRedactor.Text(canary); got != "[redacted]" {
 		t.Fatalf("bare header component was not registered: %q", got)
 	}
-	if got := runtimeRedactor.Text("Bearer " + secret); got != "Bearer [redacted]" {
+	if got := runtimeRedactor.Text("Bearer " + canary); got != "Bearer [redacted]" {
 		t.Fatalf("registered composite header instead of component: %q", got)
 	}
 	for _, headers := range []map[string]string{{"Host": "x"}, {"Content-Length": "1"}, {"Bad\nName": "x"}, {"X": "bad\rvalue"}, {"x-a": "1", "X-A": "2"}, {"Content-Type": "application/json"}} {
@@ -83,11 +85,11 @@ func TestHTTPHeaderValidation(t *testing.T) {
 }
 
 func TestHTTPExpandedHeaderSecretRedactedFromDecisionHandoff(t *testing.T) {
-	const secret = "http-response-component-canary-12345"
+	const canary = "http-response-component-canary-12345"
 	authorization := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authorization <- r.Header.Get("Authorization")
-		_, _ = fmt.Fprintf(w, `{"decision":"deny","reason":%q}`, secret)
+		_, _ = fmt.Fprintf(w, `{"decision":"deny","reason":%q}`, canary)
 	}))
 	defer server.Close()
 
@@ -100,7 +102,7 @@ func TestHTTPExpandedHeaderSecretRedactedFromDecisionHandoff(t *testing.T) {
 		present:  map[string]bool{"type": true, "url": true, "headers": true, "decision": true},
 	}
 	action, err := compileAction(EventToolBefore, false, Duration{}, config, DefaultLimits(), func(name string) (string, bool) {
-		return secret, name == "API_TOKEN"
+		return canary, name == "API_TOKEN"
 	}, runtimeRedactor)
 	if err != nil {
 		t.Fatal(err)
@@ -115,11 +117,11 @@ func TestHTTPExpandedHeaderSecretRedactedFromDecisionHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "session", ExecutionID: "execution", TurnID: "turn"}, ToolInput{CallID: "call", Name: "Read", Arguments: map[string]any{}})
-	if got := <-authorization; got != "Bearer "+secret {
+	decision := engine.BeforeTool(context.Background(), ExecutionRef{SessionID: "session", ExecutionID: "execution", TurnID: "turn"}, NewToolInput("call", "Read", map[string]any{}))
+	if got := <-authorization; got != "Bearer "+canary {
 		t.Fatalf("Authorization header = %q", got)
 	}
-	if !decision.IsDeny() || decision.Reason != "[redacted]" || strings.Contains(decision.Reason, secret) {
+	if !decision.IsDeny() || decision.Reason() != "[redacted]" || strings.Contains(decision.Reason(), canary) {
 		t.Fatalf("unsafe Provider-facing decision = %#v", decision)
 	}
 }
@@ -128,7 +130,7 @@ func TestHTTPSendEventDefaultAndFalse(t *testing.T) {
 	falseValue := false
 	defaultAction, err := compileHTTPAction(ActionConfig{
 		Type:    ActionHTTP,
-		URL:     "https://hook.test/default",
+		URL:     "http://127.0.0.1/default",
 		present: map[string]bool{"type": true, "url": true},
 	}, DefaultLimits(), func(string) (string, bool) { return "", false }, nil)
 	if err != nil {
@@ -136,7 +138,7 @@ func TestHTTPSendEventDefaultAndFalse(t *testing.T) {
 	}
 	falseAction, err := compileHTTPAction(ActionConfig{
 		Type:      ActionHTTP,
-		URL:       "https://hook.test/false",
+		URL:       "http://127.0.0.1/false",
 		SendEvent: &falseValue,
 		Headers:   map[string]string{"Content-Type": "text/plain"},
 		present:   map[string]bool{"type": true, "url": true, "send_event": true, "headers": true},
@@ -154,7 +156,7 @@ func TestHTTPSendEventDefaultAndFalse(t *testing.T) {
 		body        string
 	}
 	var observed []observedRequest
-	runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	runner := newTestHTTPRunner(DefaultLimits(), nil, func(request *http.Request) (*http.Response, error) {
 		var body []byte
 		if request.Body != nil {
 			var readErr error
@@ -165,7 +167,7 @@ func TestHTTPSendEventDefaultAndFalse(t *testing.T) {
 		}
 		observed = append(observed, observedRequest{path: request.URL.Path, contentType: request.Header.Get("Content-Type"), body: string(body)})
 		return testHTTPResponse(request, http.StatusOK, nil, "ok"), nil
-	})}
+	})
 	payload := []byte(`{"sequence":1}`)
 	for _, action := range []*httpAction{defaultAction, falseAction} {
 		_, runErr := runner.Run(context.Background(), HTTPRequest{
@@ -193,7 +195,7 @@ func TestHTTPSendEventDefaultAndFalse(t *testing.T) {
 func TestHTTPRequestAndResponseBodyLimitsExactAndPlusOne(t *testing.T) {
 	limits := DefaultLimits()
 	var calls []string
-	runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	runner := newTestHTTPRunner(limits, nil, func(request *http.Request) (*http.Response, error) {
 		calls = append(calls, request.URL.Path)
 		switch request.URL.Path {
 		case "/request-exact":
@@ -212,26 +214,84 @@ func TestHTTPRequestAndResponseBodyLimitsExactAndPlusOne(t *testing.T) {
 		default:
 			return nil, fmt.Errorf("unexpected request path %q", request.URL.Path)
 		}
-	})}
+	})
 
-	requestExactURL := mustURL(t, "https://hook.test/request-exact")
+	requestExactURL := mustURL(t, "http://127.0.0.1/request-exact")
 	if _, err := runner.Run(context.Background(), HTTPRequest{URL: requestExactURL, Method: http.MethodPost, SendEvent: true, EventJSON: bytes.Repeat([]byte("q"), limits.HTTPRequestBytes)}); err != nil {
 		t.Fatalf("request exact: %v", err)
 	}
 	callsBeforeOver := len(calls)
-	if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/request-over"), Method: http.MethodPost, SendEvent: true, EventJSON: bytes.Repeat([]byte("q"), limits.HTTPRequestBytes+1)}); err == nil {
+	if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/request-over"), Method: http.MethodPost, SendEvent: true, EventJSON: bytes.Repeat([]byte("q"), limits.HTTPRequestBytes+1)}); err == nil {
 		t.Fatal("request limit+1 accepted")
 	}
 	if len(calls) != callsBeforeOver {
 		t.Fatal("oversize request reached the transport")
 	}
 
-	result, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/response-exact"), Method: http.MethodGet})
+	result, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/response-exact"), Method: http.MethodGet})
 	if err != nil || len(result.Body) != limits.HTTPResponseBytes {
 		t.Fatalf("response exact = %d bytes, %v", len(result.Body), err)
 	}
-	if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/response-over"), Method: http.MethodGet}); err == nil {
+	if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/response-over"), Method: http.MethodGet}); err == nil {
 		t.Fatal("response limit+1 accepted")
+	}
+}
+
+func TestHTTPRequestAndResponseBudgetsApplyBeforeFirstByte(t *testing.T) {
+	limits := DefaultLimits()
+	policy := netpolicy.NewPolicy()
+	client := &testPolicyClient{do: func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("request unexpectedly reached client")
+	}}
+	factory := &testClientFactory{client: client}
+	runner := &DefaultHTTPRunner{Limits: limits, Policy: policy, ClientFactory: factory}
+
+	requests := []HTTPRequest{
+		{
+			URL:       mustURL(t, "http://127.0.0.1/body"),
+			Method:    http.MethodPost,
+			SendEvent: true,
+			EventJSON: bytes.Repeat([]byte("x"), limits.HTTPRequestBytes+1),
+		},
+		{
+			URL:    mustURL(t, "http://127.0.0.1/headers"),
+			Method: http.MethodGet,
+			Headers: http.Header{
+				"X-Many": make([]string, limits.HTTPHeaderCount+1),
+			},
+		},
+		{
+			URL:       mustURL(t, "http://127.0.0.1/generated-header"),
+			Method:    http.MethodPost,
+			SendEvent: true,
+			Headers:   distinctHeaders(limits.HTTPHeaderCount),
+			EventJSON: []byte(`{}`),
+		},
+	}
+	for index, request := range requests {
+		if _, err := runner.Run(context.Background(), request); err == nil {
+			t.Fatalf("oversize request %d accepted", index)
+		}
+	}
+	if got := factory.news.Load(); got != 0 {
+		t.Fatalf("request budget created %d policy clients", got)
+	}
+
+	body := &countingReadCloser{Reader: strings.NewReader("must not be read")}
+	responseRunner := newTestHTTPRunner(limits, nil, func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        make(http.Header),
+			Body:          body,
+			ContentLength: int64(limits.HTTPResponseBytes + 1),
+			Request:       request,
+		}, nil
+	})
+	if _, err := responseRunner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/known-over"), Method: http.MethodGet}); err == nil {
+		t.Fatal("known oversize response accepted")
+	}
+	if got := body.reads.Load(); got != 0 {
+		t.Fatalf("known oversize response consumed %d body reads", got)
 	}
 }
 
@@ -252,13 +312,10 @@ func TestHTTPResponseHeaderLimitExactAndPlusOne(t *testing.T) {
 		{name: "plus one", valueBytes: limits.HTTPResponseBytes - baseBytes + 1, wantErr: true},
 	} {
 		t.Run(item.name, func(t *testing.T) {
-			runner := &DefaultHTTPRunner{
-				Limits: limits,
-				transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-					return testHTTPResponse(request, http.StatusOK, http.Header{name: []string{strings.Repeat("h", item.valueBytes)}}, "ok"), nil
-				}),
-			}
-			_, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/header"), Method: http.MethodGet})
+			runner := newTestHTTPRunner(limits, nil, func(request *http.Request) (*http.Response, error) {
+				return testHTTPResponse(request, http.StatusOK, http.Header{name: []string{strings.Repeat("h", item.valueBytes)}}, "ok"), nil
+			})
+			_, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/header"), Method: http.MethodGet})
 			if (err != nil) != item.wantErr {
 				t.Fatalf("run error = %v, wantErr %v", err, item.wantErr)
 			}
@@ -322,171 +379,183 @@ func TestHTTPFailures(t *testing.T) {
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
-			runner := &DefaultHTTPRunner{transport: item.transport}
-			if _, err := runner.Run(item.ctx, HTTPRequest{URL: mustURL(t, "https://hook.test/failure"), Method: http.MethodGet}); err == nil {
+			runner := newTestHTTPRunner(DefaultLimits(), nil, item.transport)
+			if _, err := runner.Run(item.ctx, HTTPRequest{URL: mustURL(t, "http://127.0.0.1/failure"), Method: http.MethodGet}); err == nil {
 				t.Fatal("failure accepted")
 			}
 		})
 	}
 }
 
-func TestHTTPTransportDisablesProxy(t *testing.T) {
-	t.Setenv("HTTP_PROXY", "http://proxy.invalid:8080")
-	transport := newHTTPTransport(DefaultLimits(), fakeResolver{}, &recordingDialer{})
-	if transport.Proxy != nil {
-		t.Fatal("HTTP transport can use an environment proxy")
-	}
-}
+func TestHTTPHookRejectsUnsafeRedirectWithoutCredentialLeak(t *testing.T) {
+	const canary = "http-hook-redirect-credential-canary-12345"
+	var destinationCalls atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		destinationCalls.Add(1)
+	}))
+	defer destination.Close()
 
-func TestHTTPRedirectPreservesMethodAndBody(t *testing.T) {
-	for _, status := range []int{301, 302, 303, 307, 308} {
-		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
-			type seenRequest struct {
-				method string
-				body   string
-			}
-			var seen []seenRequest
-			runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				body, err := io.ReadAll(request.Body)
-				if err != nil {
-					return nil, err
-				}
-				seen = append(seen, seenRequest{method: request.Method, body: string(body)})
-				if request.URL.Path == "/start" {
-					return testHTTPResponse(request, status, http.Header{"Location": []string{"/final"}}, "redirect"), nil
-				}
-				return testHTTPResponse(request, http.StatusOK, nil, "done"), nil
-			})}
-			result, err := runner.Run(context.Background(), HTTPRequest{
-				URL:       mustURL(t, "https://hook.test/start"),
-				Method:    http.MethodPatch,
-				SendEvent: true,
-				EventJSON: []byte("payload"),
-			})
-			if err != nil || string(result.Body) != "done" {
-				t.Fatalf("redirect result = %q, %v", result.Body, err)
-			}
-			if len(seen) != 2 {
-				t.Fatalf("saw %d requests", len(seen))
-			}
-			for index, request := range seen {
-				if request.method != http.MethodPatch || request.body != "payload" {
-					t.Fatalf("request %d = %#v", index, request)
-				}
-			}
-		})
-	}
-}
+	authorization := make(chan string, 1)
+	redirector := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		authorization <- request.Header.Get("Authorization")
+		writer.Header().Set("Location", destination.URL+"/steal?token="+canary)
+		writer.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
 
-func TestHTTPRedirectCountBoundary(t *testing.T) {
-	for _, item := range []struct {
-		name          string
-		redirectCount int
-		wantErr       bool
-		wantCalls     int
-	}{
-		{name: "three redirects succeed", redirectCount: 3, wantCalls: 4},
-		{name: "fourth redirect fails", redirectCount: 4, wantErr: true, wantCalls: 4},
-	} {
-		t.Run(item.name, func(t *testing.T) {
-			calls := 0
-			runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				calls++
-				if calls <= item.redirectCount {
-					location := fmt.Sprintf("/step-%d", calls)
-					return testHTTPResponse(request, http.StatusTemporaryRedirect, http.Header{"Location": []string{location}}, "redirect"), nil
-				}
-				return testHTTPResponse(request, http.StatusOK, nil, "done"), nil
-			})}
-			result, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/start"), Method: http.MethodPost, SendEvent: true, EventJSON: []byte("payload")})
-			if (err != nil) != item.wantErr {
-				t.Fatalf("run result = %q, %v", result.Body, err)
-			}
-			if calls != item.wantCalls {
-				t.Fatalf("transport calls = %d, want %d", calls, item.wantCalls)
-			}
-		})
-	}
-}
-
-func TestHTTPRedirectRejectsCrossOriginAndHTTPSDowngrade(t *testing.T) {
-	for _, item := range []struct {
-		name     string
-		location string
-	}{
-		{name: "cross origin", location: "https://other.test/final"},
-		{name: "HTTPS downgrade", location: "http://hook.test:443/final"},
-	} {
-		t.Run(item.name, func(t *testing.T) {
-			calls := 0
-			runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				calls++
-				return testHTTPResponse(request, http.StatusFound, http.Header{"Location": []string{item.location}}, "redirect"), nil
-			})}
-			if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/start"), Method: http.MethodGet}); err == nil {
-				t.Fatal("unsafe redirect accepted")
-			}
-			if calls != 1 {
-				t.Fatalf("unsafe redirect made %d requests", calls)
-			}
-		})
-	}
-}
-
-func TestHTTPRedirectRejectsUnsafeURLStructure(t *testing.T) {
-	for _, item := range []struct {
-		name     string
-		location string
-	}{
-		{name: "same origin userinfo", location: "https://user:secret@hook.test/final"},
-		{name: "same origin fragment", location: "/final#fragment"},
-		{name: "raw control", location: "/final\x7f"},
-		{name: "escaped control", location: "/final%0a"},
-		{name: "opaque", location: "https:opaque"},
-	} {
-		t.Run(item.name, func(t *testing.T) {
-			calls := 0
-			runner := &DefaultHTTPRunner{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				calls++
-				return testHTTPResponse(request, http.StatusFound, http.Header{"Location": []string{item.location}}, "redirect"), nil
-			})}
-			if _, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "https://hook.test/start"), Method: http.MethodGet}); err == nil {
-				t.Fatal("unsafe redirect accepted")
-			}
-			if calls != 1 {
-				t.Fatalf("unsafe redirect made %d requests", calls)
-			}
-		})
-	}
-}
-
-func TestHTTPLoopbackDialerPositiveAndRebinding(t *testing.T) {
-	resolver := &sequenceResolver{responses: [][]string{
-		{"127.0.0.1", "::1"},
-		{"127.0.0.1", "192.0.2.1"},
-	}}
-	dialer := &recordingDialer{}
-	dial := secureDialer(resolver, dialer)
-	connection, err := dial(context.Background(), "tcp", "localhost:443")
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	action, err := compileAction(EventToolBefore, false, Duration{}, ActionConfig{
+		Type:    ActionHTTP,
+		URL:     redirector.URL,
+		Headers: map[string]string{"Authorization": "Bearer ${HOOK_TOKEN}"},
+		present: map[string]bool{"type": true, "url": true, "headers": true},
+	}, DefaultLimits(), func(name string) (string, bool) {
+		return canary, name == "HOOK_TOKEN"
+	}, runtimeRedactor)
 	if err != nil {
-		t.Fatalf("pure loopback resolution: %v", err)
+		t.Fatal(err)
 	}
-	_ = connection.Close()
-	if len(dialer.addresses) != 1 || dialer.addresses[0] != "127.0.0.1:443" {
-		t.Fatalf("dialed addresses = %#v", dialer.addresses)
+	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: runtimeRedactor.Text})
+	engine, err := NewEngine(newSnapshot([]Rule{{
+		Event:  EventToolBefore,
+		Source: Source{Path: "redirect.yaml", Ordinal: 1, EffectiveOrdinal: 1},
+		action: action,
+	}}), EngineOptions{
+		ProjectRoot:       t.TempDir(),
+		LegacyDiagnostics: collector,
+		Redactor:          runtimeRedactor,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := dial(context.Background(), "tcp", "localhost:443"); err == nil {
-		t.Fatal("mixed rebinding resolution accepted")
+	t.Cleanup(func() {
+		if runner, ok := engine.http.(*DefaultHTTPRunner); ok {
+			runner.CloseIdleConnections()
+		}
+	})
+
+	decision := engine.BeforeTool(context.Background(), ExecutionRef{
+		SessionID: "session", ExecutionID: "execution", TurnID: "turn",
+	}, NewToolInput("call", "Read", map[string]any{}))
+	if decision.IsDeny() {
+		t.Fatalf("non-decision HTTP failure changed permission: %#v", decision)
 	}
-	if len(dialer.addresses) != 1 {
-		t.Fatalf("mixed DNS reached dialer: %#v", dialer.addresses)
+	if got := <-authorization; got != "Bearer "+canary {
+		t.Fatalf("intended origin Authorization = %q", got)
+	}
+	if got := destinationCalls.Load(); got != 0 {
+		t.Fatalf("unsafe redirect reached destination %d times", got)
+	}
+	diagnosticsText := ""
+	for _, item := range collector.List() {
+		diagnosticsText += item.Text()
+	}
+	if !strings.Contains(diagnosticsText, DiagnosticHTTPFailed) {
+		t.Fatalf("missing safe HTTP failure diagnostic: %q", diagnosticsText)
+	}
+	if strings.Contains(diagnosticsText, canary) {
+		t.Fatalf("credential leaked through HTTP failure diagnostic: %q", diagnosticsText)
+	}
+}
+
+func TestHTTPErrorUsesBoundedSafeSummary(t *testing.T) {
+	const canary = "http-hook-error-body-canary-12345"
+	runtimeRedactor := redact.NewRuntimeRedactor()
+	runtimeRedactor.RegisterSecret(canary)
+	limits := DefaultLimits()
+	limits.HTTPErrorPreviewBytes = 64
+	runner := newTestHTTPRunner(limits, runtimeRedactor, func(request *http.Request) (*http.Response, error) {
+		response := testHTTPResponse(request, http.StatusBadGateway, http.Header{"Content-Type": []string{"text/plain"}}, canary+strings.Repeat("x", 256))
+		return response, nil
+	})
+	_, err := runner.Run(context.Background(), HTTPRequest{URL: mustURL(t, "http://127.0.0.1/error"), Method: http.MethodGet})
+	if err == nil {
+		t.Fatal("non-success response accepted")
+	}
+	if strings.Contains(err.Error(), canary) || len(err.Error()) > 512 {
+		t.Fatalf("unsafe or unbounded HTTP summary: %q", err)
+	}
+	if !strings.Contains(err.Error(), "status=502") || !strings.Contains(err.Error(), "truncated=true") {
+		t.Fatalf("HTTP summary lacks safe metadata: %q", err)
+	}
+}
+
+func TestHTTPRunnerOwnsAndClosesPolicyClientOnce(t *testing.T) {
+	client := &testPolicyClient{do: func(request *http.Request) (*http.Response, error) {
+		return testHTTPResponse(request, http.StatusOK, nil, "ok"), nil
+	}}
+	policy := netpolicy.NewPolicy()
+	runner := &DefaultHTTPRunner{
+		Policy:        policy,
+		ClientFactory: &testClientFactory{client: client},
+	}
+	request := HTTPRequest{URL: mustURL(t, "http://127.0.0.1/owned"), Method: http.MethodGet}
+	if _, err := runner.Run(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	runner.CloseIdleConnections()
+	runner.CloseIdleConnections()
+	if got := client.closes.Load(); got != 1 {
+		t.Fatalf("policy client closed %d times", got)
+	}
+	if _, err := runner.Run(context.Background(), request); err == nil {
+		t.Fatal("closed HTTP runner created or reused a client")
 	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
-func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return fn(request)
+type testPolicyClient struct {
+	do     roundTripFunc
+	closes atomic.Int32
+}
+
+func (c *testPolicyClient) Do(request *http.Request) (*http.Response, error) {
+	return c.do(request)
+}
+
+func (*testPolicyClient) SDKHTTPClient() *http.Client { return nil }
+
+func (c *testPolicyClient) CloseIdleConnections() { c.closes.Add(1) }
+
+type testClientFactory struct {
+	client netpolicy.Client
+	news   atomic.Int32
+}
+
+func (f *testClientFactory) New(netpolicy.Endpoint, netpolicy.ClientOptions) (netpolicy.Client, error) {
+	f.news.Add(1)
+	return f.client, nil
+}
+
+type countingReadCloser struct {
+	io.Reader
+	reads atomic.Int32
+}
+
+func (r *countingReadCloser) Read(buffer []byte) (int, error) {
+	r.reads.Add(1)
+	return r.Reader.Read(buffer)
+}
+
+func (*countingReadCloser) Close() error { return nil }
+
+func distinctHeaders(count int) http.Header {
+	headers := make(http.Header, count)
+	for index := 0; index < count; index++ {
+		headers.Set(fmt.Sprintf("X-Budget-%d", index), "value")
+	}
+	return headers
+}
+
+func newTestHTTPRunner(limits Limits, runtimeRedactor *redact.RuntimeRedactor, do roundTripFunc) *DefaultHTTPRunner {
+	policy := netpolicy.NewPolicy()
+	return &DefaultHTTPRunner{
+		Limits:        limits,
+		Policy:        policy,
+		ClientFactory: &testClientFactory{client: &testPolicyClient{do: do}},
+		Redactor:      runtimeRedactor,
+	}
 }
 
 func testHTTPResponse(request *http.Request, status int, headers http.Header, body string) *http.Response {
@@ -508,41 +577,4 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return parsed
-}
-
-type fakeResolver struct{ addresses []string }
-
-func (f fakeResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
-	return ipAddresses(f.addresses), nil
-}
-
-type sequenceResolver struct {
-	responses [][]string
-	calls     int
-}
-
-func (r *sequenceResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
-	if r.calls >= len(r.responses) {
-		return nil, errors.New("unexpected resolution")
-	}
-	addresses := ipAddresses(r.responses[r.calls])
-	r.calls++
-	return addresses, nil
-}
-
-func ipAddresses(rawAddresses []string) []net.IPAddr {
-	result := make([]net.IPAddr, 0, len(rawAddresses))
-	for _, raw := range rawAddresses {
-		result = append(result, net.IPAddr{IP: net.ParseIP(raw)})
-	}
-	return result
-}
-
-type recordingDialer struct{ addresses []string }
-
-func (d *recordingDialer) DialContext(_ context.Context, _, address string) (net.Conn, error) {
-	d.addresses = append(d.addresses, address)
-	local, remote := net.Pipe()
-	_ = remote.Close()
-	return local, nil
 }

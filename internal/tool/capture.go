@@ -142,6 +142,32 @@ func (c *Capture) Write(input []byte) (int, error) {
 	return written, nil
 }
 
+// MarkIncomplete records that the producer stopped after its output source
+// had started, even when Capture itself did not observe a write failure. This
+// lets source read, scan, process, and cancellation failures preserve already
+// accepted bytes in one incomplete artifact instead of publishing them as a
+// complete result. The first terminal reason wins.
+func (c *Capture) MarkIncomplete(err error, reason CaptureTruncationReason) error {
+	if c == nil {
+		return errors.New("capture is unavailable")
+	}
+	if err == nil {
+		return errors.New("capture incomplete error is unavailable")
+	}
+	switch reason {
+	case CaptureTruncatedHardLimit, CaptureTruncatedArtifact, CaptureTruncatedWriteFailure, CaptureTruncatedCanceled:
+	default:
+		return errors.New("capture incomplete reason is invalid")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.finished {
+		return errors.New("capture is already finalized")
+	}
+	c.stop(err, reason)
+	return nil
+}
+
 // Finish finalizes staging exactly once. Inline-complete output is aborted;
 // output above the inline threshold or stopped after accepting bytes is
 // committed. A hard-limit error is returned together with the safe metadata.
@@ -162,25 +188,34 @@ func (c *Capture) Finish(ctx context.Context) (CaptureResult, error) {
 	if err := ctx.Err(); err != nil {
 		abortErr := c.writer.Abort()
 		if abortErr != nil {
-			return c.result(nil), errors.New("abort canceled tool output artifact")
+			return CaptureResult{}, errors.New("abort canceled tool output artifact")
 		}
-		return c.result(nil), err
+		return CaptureResult{}, err
 	}
 
 	shouldCommit := c.captured > c.inlineBytes || c.incomplete && c.captured > 0
 	if !shouldCommit {
 		if err := c.writer.Abort(); err != nil {
-			return c.result(nil), errors.New("abort inline tool output artifact")
+			return CaptureResult{}, errors.New("abort inline tool output artifact")
 		}
-		return c.result(nil), c.terminalErr
+		if c.terminalErr != nil {
+			return CaptureResult{}, c.terminalErr
+		}
+		return c.result(nil), nil
 	}
 
 	ref, err := c.writer.Commit(ctx)
 	if err != nil {
-		return c.result(nil), errors.New("commit tool output artifact")
+		return CaptureResult{}, errors.New("commit tool output artifact")
 	}
 	if c.incomplete {
 		ref.Complete = false
+	}
+	if err := validateOpaqueArtifactRef(&ref, c.captured); err != nil {
+		return CaptureResult{}, errors.New("commit returned an invalid artifact reference")
+	}
+	if !c.incomplete && !ref.Complete {
+		return CaptureResult{}, errors.New("commit returned an incomplete artifact reference")
 	}
 	return c.result(&ref), c.terminalErr
 }

@@ -8,12 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"xagent/internal/budget"
 	"xagent/internal/permission"
@@ -32,6 +29,7 @@ type Executor struct {
 	ScanMaxDirs    int64
 	ScanMaxLines   int64
 	TicketVerifier permission.TicketVerifier
+	resultFactory  *ResultFactory
 
 	rootOnce                sync.Once
 	root                    *safefs.Root
@@ -42,7 +40,23 @@ type Executor struct {
 	extraRoots   map[string]*safefs.Root
 }
 
+// NewExecutor is the legacy execution adapter retained until T4.29a. Results
+// produced through it are compatibility values and must not be projected or
+// persisted by the safe candidate path.
 func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, maxOutputBytes int) *Executor {
+	return newExecutor(registry, projectRoot, timeout, maxOutputBytes, nil)
+}
+
+// NewExecutorWithResultFactory constructs the safe candidate executor. The
+// injected factory is shared with every registered safe-candidate producer.
+func NewExecutorWithResultFactory(registry *Registry, projectRoot string, timeout time.Duration, maxOutputBytes int, factory *ResultFactory) (*Executor, error) {
+	if registry == nil || !registry.safeCandidate || factory == nil {
+		return nil, errors.New("safe tool executor dependencies are unavailable")
+	}
+	return newExecutor(registry, projectRoot, timeout, maxOutputBytes, factory), nil
+}
+
+func newExecutor(registry *Registry, projectRoot string, timeout time.Duration, maxOutputBytes int, factory *ResultFactory) *Executor {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -60,6 +74,7 @@ func NewExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 		ScanMaxFiles:   defaultBudgetValue(budget.FilesScanMaxFiles),
 		ScanMaxDirs:    defaultBudgetValue(budget.FilesScanMaxDirectories),
 		ScanMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
+		resultFactory:  factory,
 	}
 }
 
@@ -83,6 +98,28 @@ func NewExecutorWithWriteAccess(
 	return executor
 }
 
+// NewExecutorWithWriteAccessAndResultFactory is the write-capable safe
+// candidate constructor. It does not construct a factory or any capture.
+func NewExecutorWithWriteAccessAndResultFactory(
+	registry *Registry,
+	projectRoot string,
+	timeout time.Duration,
+	maxOutputBytes int,
+	root *safefs.Root,
+	capability safefs.Capability,
+	factory *ResultFactory,
+) (*Executor, error) {
+	executor, err := NewExecutorWithResultFactory(registry, projectRoot, timeout, maxOutputBytes, factory)
+	if err != nil {
+		return nil, err
+	}
+	executor.rootOnce.Do(func() {
+		executor.root = root
+	})
+	executor.ordinaryWriteCapability = capability
+	return executor, nil
+}
+
 func (e *Executor) NeedsConfirmation(call Call) bool {
 	tool, ok := e.Registry.Get(call.Name)
 	return ok && tool.Risk() == RiskDangerous
@@ -103,7 +140,7 @@ func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated Val
 	if ctx == nil || ctx.Err() != nil {
 		return Result{}
 	}
-	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.Arguments == nil || len(validated.CanonicalArguments()) == 0 {
+	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.executor == nil || validated.executor.Name() != call.Name || validated.Arguments == nil || len(validated.CanonicalArguments()) == 0 {
 		return e.validationFailure(call, fmt.Errorf("validated call is inconsistent"))
 	}
 
@@ -174,8 +211,12 @@ func (e *Executor) CallIdentity(validated ValidatedCall) (permission.CallIdentit
 	if !ok {
 		return permission.CallIdentity{}, errors.New("bash command is invalid")
 	}
+	selection, err := selectShell(command)
+	if err != nil {
+		return permission.CallIdentity{}, errors.New("bash shell is unavailable")
+	}
 	return permission.NewBashIdentity(permission.BashIdentityInput{
-		Shell:             executionShell(),
+		Shell:             selection.identity,
 		WorkingDirectory:  root.Identity(),
 		RawCommand:        []byte(command),
 		EnvironmentDigest: executionEnvironmentDigest(os.Environ()),
@@ -234,20 +275,13 @@ func (e *Executor) bindingRootPath(ctx context.Context, call Call) (string, erro
 	}
 	scope, err := effectiveReadScope(ctx, e.ProjectRoot)
 	if err != nil {
-		return "", errors.New("executor read scope is unavailable")
+		return "", fmt.Errorf("%s: executor read scope is unavailable", ErrPathOutsideProject)
 	}
 	target, err := resolveReadPath(scope, path)
 	if err != nil {
-		return "", errors.New("file tool path is outside the opened roots")
+		return "", fmt.Errorf("%s: file tool path is outside the opened roots", ErrPathOutsideProject)
 	}
 	return target.root, nil
-}
-
-func executionShell() string {
-	if runtime.GOOS == "windows" {
-		return "cmd"
-	}
-	return "/bin/sh"
 }
 
 func executionEnvironmentDigest(environment []string) [32]byte {
@@ -263,22 +297,6 @@ func executionEnvironmentDigest(environment []string) [32]byte {
 	var digest [32]byte
 	copy(digest[:], hash.Sum(nil))
 	return digest
-}
-
-func (e *Executor) Execute(ctx context.Context, call Call) Result {
-	validated, err := e.Registry.ValidateCall(call)
-	if err != nil {
-		return e.validationFailure(call, err)
-	}
-	if call.Name == "Write" || call.Name == "Edit" {
-		root, rootErr := e.openRoot()
-		if rootErr != nil {
-			return e.validationFailure(call, rootErr)
-		}
-		validated.executionRoot = root
-		validated.executionRootPath = e.ProjectRoot
-	}
-	return e.executeValidated(ctx, validated)
 }
 
 func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall) Result {
@@ -311,9 +329,21 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 		})
 	}
 
+	input := Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: validated.Arguments}
+	execute := func() Result {
+		return validated.executor.Execute(execCtx, input)
+	}
+
+	if e.resultFactory != nil {
+		// Candidate producers own their cancellation and Capture terminal state.
+		// Execute synchronously so no second synthetic timeout can race a later
+		// producer Commit or leave an unreferenced artifact behind.
+		return execute()
+	}
+
 	resultCh := make(chan Result, 1)
 	go func() {
-		resultCh <- validated.Tool.Execute(execCtx, Input{Name: call.Name, CallID: call.ID, RawArguments: call.ArgumentsJSON, Arguments: validated.Arguments})
+		resultCh <- execute()
 	}()
 
 	select {
@@ -327,11 +357,31 @@ func (e *Executor) executeValidated(ctx context.Context, validated ValidatedCall
 			Data:    map[string]any{"timed_out": true},
 		}
 	case result := <-resultCh:
-		return e.truncate(result)
+		return result
 	}
 }
 
 func (e *Executor) validationFailure(call Call, err error) Result {
+	if e != nil && e.resultFactory != nil {
+		input := ResultFactoryInput{
+			CallID: call.ID,
+			Name:   call.Name,
+			State:  Rejected,
+			Status: StatusError,
+		}
+		switch {
+		case errors.Is(err, errToolNotRegistered):
+			input.Summary = "未知工具"
+			input.Error = &Error{Code: ErrToolNotFound, Message: "工具未注册", Recoverable: true}
+		case errorCode(err) == ErrPathOutsideProject:
+			input.Summary = "工具路径位于已打开根目录外"
+			input.Error = &Error{Code: ErrPathOutsideProject, Message: "工具路径位于已打开根目录外", Recoverable: true}
+		default:
+			input.Summary = "工具参数不是有效 JSON"
+			input.Error = &Error{Code: ErrInvalidArguments, Message: "工具参数无效", Recoverable: true}
+		}
+		return buildSyntheticResult(e.resultFactory, input)
+	}
 	if errors.Is(err, errToolNotRegistered) {
 		return Result{
 			CallID:  call.ID,
@@ -339,6 +389,15 @@ func (e *Executor) validationFailure(call Call, err error) Result {
 			Status:  StatusError,
 			Summary: fmt.Sprintf("未知工具: %s", call.Name),
 			Error:   &Error{Code: ErrToolNotFound, Message: fmt.Sprintf("工具 %q 未注册", call.Name), Recoverable: true},
+		}
+	}
+	if errorCode(err) == ErrPathOutsideProject {
+		return Result{
+			CallID:  call.ID,
+			Name:    call.Name,
+			Status:  StatusError,
+			Summary: "工具路径位于已打开根目录外",
+			Error:   &Error{Code: ErrPathOutsideProject, Message: "工具路径位于已打开根目录外", Recoverable: true},
 		}
 	}
 	return Result{
@@ -352,6 +411,17 @@ func (e *Executor) validationFailure(call Call, err error) Result {
 
 func (e *Executor) permissionDenied(call Call, decision permission.Decision) Result {
 	message := permission.DeniedModelMessage(decision)
+	if e != nil && e.resultFactory != nil {
+		return buildSyntheticResult(e.resultFactory, ResultFactoryInput{
+			CallID:  call.ID,
+			Name:    call.Name,
+			State:   Rejected,
+			Status:  StatusDenied,
+			Summary: "Permission denied before executing tool",
+			Preview: message,
+			Error:   &Error{Code: ErrPermissionDenied, Message: message, Recoverable: true},
+		})
+	}
 	return Result{
 		CallID:  call.ID,
 		Name:    call.Name,
@@ -364,6 +434,17 @@ func (e *Executor) permissionDenied(call Call, decision permission.Decision) Res
 }
 
 func (e *Executor) Denied(call Call) Result {
+	if e != nil && e.resultFactory != nil {
+		return buildSyntheticResult(e.resultFactory, ResultFactoryInput{
+			CallID:  call.ID,
+			Name:    call.Name,
+			State:   Rejected,
+			Status:  StatusDenied,
+			Summary: "用户拒绝执行工具",
+			Preview: "用户拒绝执行该工具调用。",
+			Error:   &Error{Code: ErrPermissionDenied, Message: "用户拒绝执行该工具调用", Recoverable: true},
+		})
+	}
 	return Result{
 		CallID:  call.ID,
 		Name:    call.Name,
@@ -374,85 +455,51 @@ func (e *Executor) Denied(call Call) Result {
 	}
 }
 
-func (e *Executor) truncate(result Result) Result {
-	outputLimit := e.MaxOutputBytes
-	if outputLimit <= 0 {
-		outputLimit = 32 * 1024
+func buildSyntheticResult(factory *ResultFactory, input ResultFactoryInput) Result {
+	if factory == nil {
+		return Result{}
 	}
-	fieldLimit := outputLimit
-	if fieldLimit < len("（输出已截断）") {
-		fieldLimit = len("（输出已截断）")
-	}
-	originalSummary := result.Summary
-	result.Summary, _ = truncateString(result.Summary, fieldLimit)
-	if result.Error != nil {
-		cloned := *result.Error
-		cloned.Message, result.Truncated = truncateAndMark(cloned.Message, fieldLimit, result.Truncated)
-		result.Error = &cloned
-	}
-	content, truncated := truncateString(result.Content, outputLimit)
-	result.Content = content
-	if truncated {
-		result.Truncated = true
-	}
-	dataLimit := outputLimit / 2
-	if dataLimit < 1 {
-		dataLimit = 1
-	}
-	for _, key := range []string{"stdout", "stderr", "content"} {
-		if value, ok := result.Data[key].(string); ok {
-			truncatedValue, wasTruncated := truncateString(value, dataLimit)
-			result.Data[key] = truncatedValue
-			if wasTruncated {
-				result.Truncated = true
-			}
-		}
-	}
-	if len(originalSummary) > fieldLimit {
-		result.Truncated = true
-	}
-	if result.Truncated && !strings.Contains(result.Summary, "截断") {
-		result.Summary = truncatedSummary(originalSummary, fieldLimit)
+	input.Artifact = nil
+	input.CapturedBytes = int64(len(input.Preview))
+	input.Truncated = false
+	input.TruncationReason = ""
+	result, err := factory.Build(input)
+	if err != nil {
+		return Result{}
 	}
 	return result
 }
 
-func truncateAndMark(value string, maxBytes int, alreadyTruncated bool) (string, bool) {
-	value, truncated := truncateString(value, maxBytes)
-	return value, alreadyTruncated || truncated
-}
-
-func truncatedSummary(value string, maxBytes int) string {
-	const suffix = "（输出已截断）"
-	if maxBytes < len(suffix) {
-		maxBytes = len(suffix)
+func buildCapturedResult(factory *ResultFactory, input ResultFactoryInput, captured CaptureResult, finishErr error) Result {
+	if finishErr != nil && captured == (CaptureResult{}) {
+		input.Preview = ""
+		input.Artifact = nil
+		input.CapturedBytes = 0
+		input.Truncated = false
+		input.TruncationReason = ""
+		if input.Status == StatusSuccess {
+			input.Status = StatusError
+		}
+		if input.Error == nil {
+			input.Error = &Error{Code: ErrCommandFailed, Message: "工具输出采集失败", Recoverable: true}
+		}
+		return buildSyntheticResult(factory, input)
 	}
-	prefix, _ := utf8Prefix(value, maxBytes-len(suffix))
-	return prefix + suffix
-}
-
-func truncateString(value string, maxBytes int) (string, bool) {
-	if maxBytes <= 0 || len(value) <= maxBytes {
-		return value, false
+	input.Preview = captured.Preview
+	input.Artifact = cloneArtifactRef(captured.Artifact)
+	input.CapturedBytes = captured.CapturedBytes
+	input.Truncated = captured.Truncated
+	input.TruncationReason = string(captured.TruncationReason)
+	if finishErr != nil && input.Status == StatusSuccess {
+		input.Status = StatusError
+		input.Error = &Error{Code: ErrCommandFailed, Message: "工具输出未完整采集", Recoverable: true}
 	}
-	const marker = "\n...[truncated]"
-	if maxBytes <= len(marker) {
-		return marker[:maxBytes], true
+	if factory == nil {
+		return Result{}
 	}
-	prefix, _ := utf8Prefix(value, maxBytes-len(marker))
-	return prefix + marker, true
-}
-
-func utf8Prefix(value string, maxBytes int) (string, bool) {
-	if maxBytes <= 0 {
-		return "", value != ""
+	result, err := factory.Build(input)
+	if err != nil {
+		return Result{}
 	}
-	if len(value) <= maxBytes {
-		return value, false
-	}
-	prefix := value[:maxBytes]
-	for !utf8.ValidString(prefix) && len(prefix) > 0 {
-		prefix = prefix[:len(prefix)-1]
-	}
-	return prefix, true
+	return result
 }

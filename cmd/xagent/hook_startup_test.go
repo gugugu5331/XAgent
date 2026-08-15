@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 	"xagent/internal/diagnostics"
 	"xagent/internal/hook"
 	"xagent/internal/mcpclient"
+	"xagent/internal/netpolicy"
 	"xagent/internal/provider"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
@@ -38,7 +40,7 @@ func TestHookConfigLoadsBeforeDependencies(t *testing.T) {
 	factories := defaultStartupFactories()
 	factories.stderr = ioDiscardBuffer{}
 	factories.loadConfig = func(string, config.LoadOptions) (*config.AppConfig, error) {
-		return &config.AppConfig{}, nil
+		return startupTestConfig(), nil
 	}
 	factories.getwd = func() (string, error) { return projectRoot, nil }
 	factories.userHomeDir = func() (string, error) { return homeDir, nil }
@@ -47,11 +49,11 @@ func TestHookConfigLoadsBeforeDependencies(t *testing.T) {
 		downstream.Add(1)
 		return nil, errors.New("must not run")
 	}
-	factories.newStore = func(conversation.JSONLStoreOptions) (conversation.ConversationStore, error) {
+	factories.newStore = func(conversation.JSONLStoreOptions) (conversation.Store, error) {
 		downstream.Add(1)
 		return nil, errors.New("must not run")
 	}
-	factories.newProvider = func(config.LLMConfig) (provider.Provider, error) {
+	factories.newProvider = func(config.LLMConfig, provider.ProviderOptions) (provider.Provider, error) {
 		downstream.Add(1)
 		return nil, errors.New("must not run")
 	}
@@ -59,9 +61,9 @@ func TestHookConfigLoadsBeforeDependencies(t *testing.T) {
 		downstream.Add(1)
 		return nil, errors.New("must not run")
 	}
-	factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions) mcpRuntime {
+	factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions, mcpclient.ManagerDependencies) (mcpRuntime, error) {
 		downstream.Add(1)
-		return nil
+		return nil, nil
 	}
 	factories.newSkillManager = func(string, string, *tool.Registry, func(string) string) (*skill.Manager, error) {
 		downstream.Add(1)
@@ -89,17 +91,19 @@ func TestFallbackBeforeSystemStart(t *testing.T) {
 	factories := defaultStartupFactories()
 	factories.stderr = ioDiscardBuffer{}
 	factories.loadConfig = func(string, config.LoadOptions) (*config.AppConfig, error) {
-		return &config.AppConfig{Session: config.SessionConfig{Dir: "sessions"}}, nil
+		return startupTestConfig(), nil
 	}
 	factories.getwd = func() (string, error) { return projectRoot, nil }
 	factories.userHomeDir = func() (string, error) { return homeDir, nil }
 	factories.buildRuntime = func(hook.Snapshot, hook.EngineOptions) (hook.Runtime, error) {
 		return runtime, nil
 	}
-	factories.newProvider = func(config.LLMConfig) (provider.Provider, error) {
+	factories.newProvider = func(config.LLMConfig, provider.ProviderOptions) (provider.Provider, error) {
 		return startupProvider{}, nil
 	}
-	factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions) mcpRuntime { return mcp }
+	factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions, mcpclient.ManagerDependencies) (mcpRuntime, error) {
+		return mcp, nil
+	}
 	factories.newSkillManager = func(string, string, *tool.Registry, func(string) string) (*skill.Manager, error) {
 		return nil, errors.New("injected downstream failure")
 	}
@@ -162,6 +166,7 @@ func TestCompositeCloseOrder(t *testing.T) {
 		record("mcp:" + ctx.Value(contextKey{}).(string))
 		return nil
 	}))
+	closer.SetProviderClient(&recordingProviderClient{close: func() { record("provider") }})
 
 	var group sync.WaitGroup
 	for range 16 {
@@ -175,7 +180,7 @@ func TestCompositeCloseOrder(t *testing.T) {
 	}
 	group.Wait()
 
-	want := []string{"app:app-context", "hook:hook-context", "mcp:mcp-context"}
+	want := []string{"app:app-context", "mcp:mcp-context", "provider", "hook:hook-context"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("close order = %#v, want %#v", order, want)
 	}
@@ -259,7 +264,7 @@ func TestNoHookProcessCompatibility(t *testing.T) {
 			factories := defaultStartupFactories()
 			factories.stderr = &stderr
 			factories.loadConfig = func(string, config.LoadOptions) (*config.AppConfig, error) {
-				return &config.AppConfig{Session: config.SessionConfig{Dir: "sessions"}}, nil
+				return startupTestConfig(), nil
 			}
 			factories.getwd = func() (string, error) { return projectRoot, nil }
 			factories.userHomeDir = func() (string, error) { return homeDir, nil }
@@ -272,8 +277,12 @@ func TestNoHookProcessCompatibility(t *testing.T) {
 				runtime = &recordingRuntime{Runtime: engine}
 				return runtime, nil
 			}
-			factories.newProvider = func(config.LLMConfig) (provider.Provider, error) { return startupProvider{}, nil }
-			factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions) mcpRuntime { return mcp }
+			factories.newProvider = func(config.LLMConfig, provider.ProviderOptions) (provider.Provider, error) {
+				return startupProvider{}, nil
+			}
+			factories.newMCP = func(config.MCPConfig, mcpclient.ManagerOptions, mcpclient.ManagerDependencies) (mcpRuntime, error) {
+				return mcp, nil
+			}
 			factories.runTUI = func(model tea.Model) (tea.Model, error) { return model, nil }
 
 			if err := runWithFactories(nil, factories); err != nil {
@@ -339,7 +348,7 @@ type recordingMCP struct {
 	closes atomic.Int32
 }
 
-func (m *recordingMCP) Start(context.Context)               { m.starts.Add(1) }
+func (m *recordingMCP) Start(context.Context) error         { m.starts.Add(1); return nil }
 func (m *recordingMCP) Tools() []tool.Tool                  { return nil }
 func (m *recordingMCP) StatusLine() string                  { return "" }
 func (m *recordingMCP) Summary() mcpclient.StatusSummary    { return mcpclient.StatusSummary{} }
@@ -349,10 +358,68 @@ func (m *recordingMCP) Close(context.Context) error         { m.closes.Add(1); r
 type startupProvider struct{}
 
 func (startupProvider) Name() string { return "startup-test" }
-func (startupProvider) StreamChat(context.Context, provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (startupProvider) StreamChat(context.Context, provider.ChatRequest) (provider.ChatStream, error) {
 	return nil, errors.New("not used")
 }
 
 type ioDiscardBuffer struct{}
 
 func (ioDiscardBuffer) Write(data []byte) (int, error) { return len(data), nil }
+
+type recordingProviderClient struct {
+	close func()
+}
+
+func (*recordingProviderClient) Do(*http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
+
+func (*recordingProviderClient) SDKHTTPClient() *http.Client { return nil }
+
+func (client *recordingProviderClient) CloseIdleConnections() {
+	if client.close != nil {
+		client.close()
+	}
+}
+
+var _ netpolicy.Client = (*recordingProviderClient)(nil)
+
+func startupTestConfig() *config.AppConfig {
+	return &config.AppConfig{
+		LLM: config.LLMConfig{
+			BaseURL:          "http://127.0.0.1:18443/provider",
+			RequestTimeoutMS: 1_000,
+		},
+		Session: config.SessionConfig{
+			Dir:             "sessions",
+			MaxRecordBytes:  16 * 1024 * 1024,
+			MaxSessionBytes: 256 * 1024 * 1024,
+			MaxScanFiles:    1_000,
+			MaxScanBytes:    10 * 1024 * 1024,
+			RetentionDays:   30,
+			GapReminderDays: 7,
+		},
+		Tool: config.ToolConfig{
+			TimeoutMS:         config.DefaultToolTimeoutMS,
+			MaxOutputBytes:    config.DefaultToolMaxOutputBytes,
+			InlineOutputBytes: config.DefaultToolMaxOutputBytes,
+		},
+		Context: config.ContextConfig{
+			ToolResultThresholdChars:  config.DefaultContextToolResultThreshold,
+			ToolResultsThresholdChars: config.DefaultContextToolResultsThreshold,
+			ModelWindowTokens:         config.DefaultContextModelWindowTokens,
+			AutoMarginTokens:          config.DefaultContextAutoMarginTokens,
+			ManualMarginTokens:        config.DefaultContextManualMarginTokens,
+			RecentKeepTokens:          config.DefaultContextRecentKeepTokens,
+			RecentKeepMessages:        config.DefaultContextRecentKeepMessages,
+			SummaryFailureLimit:       config.DefaultContextSummaryFailureLimit,
+			PreviewChars:              config.DefaultContextPreviewChars,
+		},
+		Diagnostics: config.DiagnosticsConfig{
+			MaxItems:      100,
+			MaxItemBytes:  2 * 1024,
+			MaxTotalBytes: 2 * 1024 * 1024,
+		},
+		Lifecycle: config.LifecycleConfig{CleanupTimeoutMS: 1_000},
+	}
+}

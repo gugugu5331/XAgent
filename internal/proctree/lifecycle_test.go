@@ -128,6 +128,37 @@ func TestPipeOwnership(t *testing.T) {
 	}
 }
 
+func TestProcessCloseStdinSignalsEOFWithoutClosingBorrowedPipes(t *testing.T) {
+	controller := newFakeController()
+	controller.closeStdinOnStop = true
+	process, err := newManagedProcess(controller, Options{CleanupTimeout: time.Second, Diagnostics: &recordingSink{}})
+	if err != nil {
+		t.Fatal("create managed process failed")
+	}
+	if !errors.Is(process.Pipes().Stdin.Close(), errBorrowedPipeClose) {
+		t.Fatal("borrowed stdin close reached its owner")
+	}
+	if err := process.CloseStdin(); err != nil {
+		t.Fatal("close process stdin failed")
+	}
+	if err := process.CloseStdin(); err != nil {
+		t.Fatal("repeated close process stdin failed")
+	}
+	if controller.stdin.closeCount() != 1 || controller.stdout.closeCount() != 0 || controller.stderr.closeCount() != 0 {
+		t.Fatal("CloseStdin did not close only the owner stdin exactly once")
+	}
+	if _, err := process.Pipes().Stdin.Write(nil); !errors.Is(err, errPipeStopped) {
+		t.Fatal("CloseStdin accepted a new borrowed write")
+	}
+	controller.finish(Result{}, nil)
+	if err := process.Close(context.Background()); err != nil {
+		t.Fatal("close process after stdin EOF failed")
+	}
+	if controller.ownerCloseCount() != 3 {
+		t.Fatal("terminal cleanup did not close every owner pipe exactly once")
+	}
+}
+
 func TestBlockedWriteCloseOrder(t *testing.T) {
 	controller := newFakeController()
 	controller.finishOnTerminate = true
@@ -200,15 +231,17 @@ type fakeController struct {
 	stdin      *blockingWriteCloser
 	stdout     *trackedReadCloser
 	stderr     *trackedReadCloser
+	stdinOnce  sync.Once
 
 	mu                sync.Mutex
 	events            []string
 	finishOnTerminate bool
 
-	waitCalls      int
-	killCalls      int
-	forceCalls     int
-	closePipeCalls int
+	waitCalls        int
+	killCalls        int
+	forceCalls       int
+	closePipeCalls   int
+	closeStdinOnStop bool
 }
 
 func newFakeController() *fakeController {
@@ -232,7 +265,12 @@ func (c *fakeController) Pipes() Pipes {
 	return c.ownerPipes
 }
 
-func (c *fakeController) StopWrites() { c.record("stop_writes") }
+func (c *fakeController) StopWrites() {
+	c.record("stop_writes")
+	if c.closeStdinOnStop {
+		c.closeStdin()
+	}
+}
 
 func (c *fakeController) TerminateTree() error {
 	c.record("terminate")
@@ -257,9 +295,13 @@ func (c *fakeController) Wait() (Result, error) {
 func (c *fakeController) ClosePipes() {
 	c.closePipeCalls++
 	c.record("close_pipes")
-	_ = c.ownerPipes.Stdin.Close()
+	c.closeStdin()
 	_ = c.ownerPipes.Stdout.Close()
 	_ = c.ownerPipes.Stderr.Close()
+}
+
+func (c *fakeController) closeStdin() {
+	c.stdinOnce.Do(func() { _ = c.ownerPipes.Stdin.Close() })
 }
 
 func (c *fakeController) ForceClose() {

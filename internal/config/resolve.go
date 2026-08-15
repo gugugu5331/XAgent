@@ -567,6 +567,9 @@ func resolveToolArtifactFiles(config *AppConfig, partial PartialAppConfig) error
 	if config == nil {
 		return errors.New("resolved config target is nil")
 	}
+	if partial.Artifact.Root.Set && partial.Artifact.Root.Value == "" {
+		return errors.New("config field \"artifact.root\" must not be empty")
+	}
 	inlineCandidate := partial.Tool.InlineOutputBytes
 	if partial.Tool.MaxOutputBytes.Set {
 		if inlineCandidate.Set {
@@ -608,7 +611,12 @@ func resolveToolArtifactFiles(config *AppConfig, partial PartialAppConfig) error
 	config.Tool.MaxOutputBytes = int(values[0])
 	config.Tool.CaptureBytes = values[1]
 	config.Tool.TimeoutMS = int(values[2])
-	config.Artifact = ArtifactConfig{MaxFileBytes: values[3], MaxTotalBytes: values[4], RetentionDays: values[5]}
+	config.Artifact = ArtifactConfig{
+		Root:          partial.Artifact.Root.Value,
+		MaxFileBytes:  values[3],
+		MaxTotalBytes: values[4],
+		RetentionDays: values[5],
+	}
 	config.Files = FilesConfig{
 		ReadMaxBytes:       values[6],
 		ScanMaxBytes:       values[7],

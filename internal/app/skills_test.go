@@ -15,8 +15,10 @@ import (
 
 	"xagent/internal/command"
 	"xagent/internal/config"
+	"xagent/internal/contextmgr"
 	"xagent/internal/conversation"
 	"xagent/internal/hook"
+	"xagent/internal/orchestrator"
 	"xagent/internal/provider"
 	"xagent/internal/skill"
 	"xagent/internal/tool"
@@ -26,24 +28,20 @@ type skillAppProvider struct {
 	mu       sync.Mutex
 	requests []provider.ChatRequest
 	events   []provider.StreamEvent
+	tracker  appTestStreamTracker
 }
 
 func (p *skillAppProvider) Name() string { return "skill-test" }
 
-func (p *skillAppProvider) StreamChat(_ context.Context, request provider.ChatRequest) (<-chan provider.StreamEvent, error) {
+func (p *skillAppProvider) StreamChat(_ context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, request)
 	events := append([]provider.StreamEvent(nil), p.events...)
 	p.mu.Unlock()
 	if len(events) == 0 {
-		events = []provider.StreamEvent{{Type: provider.StreamEventTextDelta, Delta: "completed"}, {Type: provider.StreamEventDone}}
+		events = []provider.StreamEvent{{Type: provider.StreamEventTextDelta, Delta: appSafeText("completed")}, {Type: provider.StreamEventDone}}
 	}
-	stream := make(chan provider.StreamEvent, len(events))
-	for _, event := range events {
-		stream <- event
-	}
-	close(stream)
-	return stream, nil
+	return newAppTestChatStream(events, &p.tracker), nil
 }
 
 func (p *skillAppProvider) Requests() []provider.ChatRequest {
@@ -115,9 +113,14 @@ func newSkillAppModel(t *testing.T, skillRoot string, providerImpl provider.Prov
 	cfg := testAppConfig()
 	cfg.UI.StartMode = config.StartModeNew
 	executor := tool.NewExecutor(registry, projectRoot, time.Second, 1024)
+	historyPolicy, err := orchestrator.NewSkillHistoryPolicy(1<<30, 10_000_000, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deps := Deps{
-		Config: cfg, Provider: providerImpl, Store: &fakeRecoveringStore{}, Resources: fakeResources{},
+		Config: cfg, Provider: providerImpl, Store: &fakeConversationStore{}, Resources: fakeResources{},
 		Registry: registry, Executor: executor, SkillManager: manager,
+		SkillHistoryPolicy: historyPolicy, RequestBudgeter: contextmgr.NewRequestBudgeter(),
 	}
 	if len(hooks) > 0 {
 		deps.Hooks = hooks[0]
@@ -174,7 +177,7 @@ func TestNoHookCommandSkillCompatibility(t *testing.T) {
 		got.visibleMessages = model.messages.View()
 		got.visibleStatus = model.status.View()
 		for _, message := range model.conversation.Messages {
-			got.conversationText = append(got.conversationText, string(message.Role)+":"+message.Content)
+			got.conversationText = append(got.conversationText, string(message.Role)+":"+message.Content.Text())
 		}
 		requests := providerImpl.Requests()
 		if len(requests) != 1 {
@@ -239,7 +242,7 @@ func TestSkillActivityLifecycle(t *testing.T) {
 	}
 
 	model = runCommandInput(t, model, "/commit second")
-	store := model.deps.Store.(*fakeRecoveringStore)
+	store := model.deps.Store.(*fakeConversationStore)
 	store.conversation = conversation.NewConversation("other", time.Now())
 	model.loadConversation("other")
 	if active := model.skillActivity.Snapshot().Active; len(active) != 0 {
@@ -362,10 +365,10 @@ func TestExecuteSharedSkillCommandAndPinnedSnapshot(t *testing.T) {
 	if len(requests) != 1 || requests[0].Model != "skill-model" || !requestContainsDynamic(requests[0], "SHARED OLD SOP Target  One") {
 		t.Fatalf("shared Skill was not applied to the request: %#v", requests)
 	}
-	if len(model.conversation.Messages) < 2 || model.conversation.Messages[0].Content != "/commit Target  One" {
+	if len(model.conversation.Messages) < 2 || model.conversation.Messages[0].Content.Text() != "/commit Target  One" {
 		t.Fatalf("raw Skill command was not persisted: %#v", model.conversation.Messages)
 	}
-	if strings.Contains(model.conversation.Messages[0].Content, "SHARED OLD SOP") {
+	if strings.Contains(model.conversation.Messages[0].Content.Text(), "SHARED OLD SOP") {
 		t.Fatal("SOP leaked into user history")
 	}
 	if model.status.ActiveSkills != "commit" || model.status.RequestModel != "" {
@@ -398,8 +401,8 @@ func TestExecuteIsolatedSkillCommandAndReviewShim(t *testing.T) {
 		name: "review", mode: skill.ModeIsolated, history: 1, model: "review-model", body: "ISOLATED SOP {{args}}",
 	})
 	providerImpl := &skillAppProvider{events: []provider.StreamEvent{
-		{Type: provider.StreamEventThinkingDelta, Delta: "temporary reasoning"},
-		{Type: provider.StreamEventTextDelta, Delta: "review summary"},
+		{Type: provider.StreamEventThinkingDelta, Delta: appSafeText("temporary reasoning")},
+		{Type: provider.StreamEventTextDelta, Delta: appSafeText("review summary")},
 		{Type: provider.StreamEventDone},
 	}}
 	model := newSkillAppModel(t, root, providerImpl)
@@ -408,7 +411,7 @@ func TestExecuteIsolatedSkillCommandAndReviewShim(t *testing.T) {
 	model.messages.SetMessages(model.conversation.Messages)
 
 	model = runCommandInput(t, model, "/review current changes")
-	if got := model.conversation.Messages; len(got) != 4 || got[2].Content != "/review current changes" || got[3].Content != "review summary" {
+	if got := model.conversation.Messages; len(got) != 4 || got[2].Content.Text() != "/review current changes" || got[3].Content.Text() != "review summary" {
 		t.Fatalf("isolated Skill polluted main history: %#v", got)
 	}
 	if strings.Contains(model.messages.View(), "temporary reasoning") || !strings.Contains(model.messages.View(), "review summary") {
@@ -426,7 +429,7 @@ func TestExecuteIsolatedSkillCommandAndReviewShim(t *testing.T) {
 	}
 
 	model = runCommandInput(t, model, "/rv shim args")
-	if got := model.conversation.Messages; got[len(got)-2].Content != "/rv shim args" || got[len(got)-1].Content != "review summary" {
+	if got := model.conversation.Messages; got[len(got)-2].Content.Text() != "/rv shim args" || got[len(got)-1].Content.Text() != "review summary" {
 		t.Fatalf("/rv did not forward to review Skill: %#v", got)
 	}
 }
@@ -539,7 +542,7 @@ func TestCloseCleansBuiltinSkillResources(t *testing.T) {
 	cfg := testAppConfig()
 	cfg.UI.StartMode = config.StartModeNew
 	model := New(Deps{
-		Config: cfg, Provider: &skillAppProvider{}, Store: &fakeRecoveringStore{}, Resources: fakeResources{},
+		Config: cfg, Provider: &skillAppProvider{}, Store: &fakeConversationStore{}, Resources: fakeResources{},
 		Registry: registry, Executor: tool.NewExecutor(registry, projectRoot, time.Second, 1024), SkillManager: manager,
 	})
 	model = runCommandInput(t, model, "/commit")
@@ -575,7 +578,7 @@ func TestClearCleansBuiltinSkillResources(t *testing.T) {
 	cfg := testAppConfig()
 	cfg.UI.StartMode = config.StartModeNew
 	model := New(Deps{
-		Config: cfg, Provider: &skillAppProvider{}, Store: &fakeRecoveringStore{}, Resources: fakeResources{},
+		Config: cfg, Provider: &skillAppProvider{}, Store: &fakeConversationStore{}, Resources: fakeResources{},
 		Registry: registry, Executor: tool.NewExecutor(registry, projectRoot, time.Second, 1024), SkillManager: manager,
 	})
 	model = runCommandInput(t, model, "/commit")

@@ -1,13 +1,16 @@
 package tool
 
 import (
+	"encoding/hex"
+	"errors"
+	"strings"
+
 	"xagent/internal/artifact"
 	"xagent/internal/redact"
 )
 
-// Result contains bounded, model-visible execution data. Raw stdout and
-// stderr are not represented as dedicated fields; later capture stages build
-// the independent safe views from bounded previews and artifact metadata.
+// Result contains the four bounded safe views built together by ResultFactory.
+// Raw stdout and stderr are not represented as dedicated fields.
 type Result struct {
 	CallID    string         `json:"call_id"`
 	Name      string         `json:"name"`
@@ -40,10 +43,12 @@ type UserView struct {
 }
 
 // OutputMeta describes bounded output without retaining its raw bytes.
+// CapturedBytes is the number of raw bytes accepted by Capture.
 type OutputMeta struct {
 	Artifact         *artifact.Ref
 	Truncated        bool
 	TruncationReason redact.SafeText
+	CapturedBytes    int64
 }
 
 // SafeError is an error projection whose message has crossed the runtime
@@ -101,6 +106,26 @@ func cloneSafeError(safe *SafeError) *SafeError {
 	}
 	cloned := *safe
 	return &cloned
+}
+
+func validateOpaqueArtifactRef(ref *artifact.Ref, capturedBytes int64) error {
+	if ref == nil {
+		return errors.New("artifact reference is unavailable")
+	}
+	if len(ref.ID) != 64 || ref.ID != strings.ToLower(ref.ID) {
+		return errors.New("artifact reference identity is invalid")
+	}
+	decoded, err := hex.DecodeString(ref.ID)
+	if err != nil || len(decoded) != 32 {
+		return errors.New("artifact reference identity is invalid")
+	}
+	if capturedBytes <= 0 || ref.Bytes != capturedBytes {
+		return errors.New("artifact reference byte count is invalid")
+	}
+	if ref.CreatedAt.IsZero() || !ref.Available {
+		return errors.New("artifact reference is unavailable")
+	}
+	return nil
 }
 
 type ResultStatus string

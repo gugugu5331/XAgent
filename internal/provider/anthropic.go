@@ -2,258 +2,120 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 
 	"xagent/internal/config"
-	"xagent/internal/conversation"
-	"xagent/internal/tool"
+	"xagent/internal/netpolicy"
+	"xagent/internal/redact"
 )
 
 type AnthropicProvider struct {
-	cfg    config.LLMConfig
-	client anthropic.Client
+	cfg           config.LLMConfig
+	client        anthropic.Client
+	ready         bool
+	redactor      *redact.RuntimeRedactor
+	streamOptions ChatStreamOptions
 }
 
-func NewAnthropic(cfg config.LLMConfig, client *http.Client) *AnthropicProvider {
+func NewAnthropic(cfg config.LLMConfig, client netpolicy.Client, runtimeRedactor *redact.RuntimeRedactor) *AnthropicProvider {
 	options := []option.RequestOption{option.WithAPIKey(cfg.APIKey)}
+	var sdkClient *http.Client
 	if client != nil {
-		options = append(options, option.WithHTTPClient(client))
+		sdkClient = client.SDKHTTPClient()
+	}
+	if sdkClient != nil {
+		options = append(options, option.WithHTTPClient(sdkClient))
 	}
 	if strings.TrimRight(cfg.BaseURL, "/") != "https://api.anthropic.com" {
 		options = append(options, option.WithBaseURL(strings.TrimRight(cfg.BaseURL, "/")))
 	}
-	return &AnthropicProvider{cfg: cfg, client: anthropic.NewClient(options...)}
+	runtimeRedactor.RegisterSecret(cfg.APIKey)
+	return &AnthropicProvider{cfg: cfg, client: anthropic.NewClient(options...), ready: sdkClient != nil, redactor: runtimeRedactor}
 }
 
 func (p *AnthropicProvider) Name() string {
 	return "Anthropic Claude"
 }
 
-func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
-	attempt := newRequestAttempt(req.Observer)
-	ctx = attempt.traceContext(ctx)
-	out := make(chan StreamEvent)
-	params := anthropicMessageParams(p.cfg.Model, req)
+func (p *AnthropicProvider) StreamChat(ctx context.Context, req ChatRequest) (ChatStream, error) {
+	streamOptions := ChatStreamOptions{}
+	if p != nil {
+		streamOptions = p.streamOptions
+	}
+	return p.StreamChatWithOptions(ctx, req, streamOptions)
+}
 
-	go func() {
-		defer close(out)
-		defer attempt.finish()
-		stream := p.client.Messages.NewStreaming(ctx, params)
-		toolCalls := map[int64]*anthropicToolCallState{}
-		for stream.Next() {
-			event := stream.Current()
-			switch value := event.AsAny().(type) {
-			case anthropic.ContentBlockStartEvent:
-				if block, ok := value.ContentBlock.AsAny().(anthropic.ToolUseBlock); ok {
-					toolCalls[value.Index] = &anthropicToolCallState{ID: block.ID, Name: block.Name}
-				}
-			case anthropic.ContentBlockDeltaEvent:
-				switch delta := value.Delta.AsAny().(type) {
-				case anthropic.TextDelta:
-					if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventTextDelta, Delta: delta.Text}) {
-						return
-					}
-				case anthropic.ThinkingDelta:
-					if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventThinkingDelta, Delta: delta.Thinking}) {
-						return
-					}
-				case anthropic.InputJSONDelta:
-					if state := toolCalls[value.Index]; state != nil {
-						state.Arguments.WriteString(delta.PartialJSON)
-					}
-				}
-			case anthropic.MessageDeltaEvent:
-				if !emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventUsage, Usage: &Usage{
-					InputTokens:              value.Usage.InputTokens,
-					OutputTokens:             value.Usage.OutputTokens,
-					CacheCreationInputTokens: value.Usage.CacheCreationInputTokens,
-					CacheReadInputTokens:     value.Usage.CacheReadInputTokens,
-				}}) {
-					return
-				}
-			case anthropic.MessageStopEvent:
-				attempt.finish()
-				if len(toolCalls) > 0 {
-					emitStreamEvent(ctx, out, newToolCallsEvent(anthropicToolCalls(toolCalls)))
-					return
-				}
-				emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventDone})
-				return
-			}
-		}
-		if err := stream.Err(); err != nil {
+// StreamChatWithOptions is the lifecycle-aware Provider entry point used by
+// Orchestrator.  StreamChat remains a compatibility wrapper for callers that
+// do not yet provide the process-level C7 options.
+func (p *AnthropicProvider) StreamChatWithOptions(ctx context.Context, req ChatRequest, streamOptions ChatStreamOptions) (ChatStream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	attempt := newRequestAttempt(req.Observer)
+	streamCtx = attempt.traceContext(streamCtx)
+	returnedStream := false
+	defer func() {
+		if !returnedStream {
+			cancelStream()
 			attempt.finish()
-			emitStreamEvent(ctx, out, StreamEvent{Type: StreamEventError, Err: err})
 		}
 	}()
-	return out, nil
-}
-
-func anthropicMessageParams(defaultModel string, req ChatRequest) anthropic.MessageNewParams {
-	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(reqModel(requestModel(req.Model, defaultModel))),
-		MaxTokens: 64000,
-		Messages:  toAnthropicMessages(req.Messages),
-		Tools:     toAnthropicTools(req),
-		System:    toAnthropicSystemBlocks(req),
-	}
-	if req.Thinking.Enabled {
-		adaptive := anthropic.ThinkingConfigAdaptiveParam{}
-		if req.Thinking.Show {
-			adaptive.Display = anthropic.ThinkingConfigAdaptiveDisplaySummarized
+	if p == nil || !p.ready {
+		var redactor *redact.RuntimeRedactor
+		if p != nil {
+			redactor = p.redactor
 		}
-		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
+		return nil, safeProviderError(redactor, "anthropic_controlled_client_required", "anthropic", errors.New("Anthropic 受控网络客户端不可用"), false)
 	}
 
-	return params
-}
-
-type anthropicToolCallState struct {
-	ID        string
-	Name      string
-	Arguments strings.Builder
-}
-
-func anthropicToolCalls(calls map[int64]*anthropicToolCallState) []tool.Call {
-	indexes := make([]int64, 0, len(calls))
-	for index := range calls {
-		indexes = append(indexes, index)
+	limits, err := newStreamLimits(p.cfg.Stream)
+	if err != nil {
+		return nil, safeProviderError(p.redactor, "anthropic_stream_limits_invalid", "anthropic", err, false)
 	}
-	sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
-
-	toolCalls := make([]tool.Call, 0, len(indexes))
-	for _, index := range indexes {
-		call := calls[index]
-		if call == nil {
-			continue
+	out := make(chan StreamEvent)
+	params := anthropicMessageParams(p.cfg.Model, req)
+	sdkStream := newAnthropicSDKStreamOwner(p.client.Messages.NewStreaming(streamCtx, params))
+	producerDone := make(chan struct{})
+	stream, err := newChatStream(out, streamOptions, func(cleanupCtx context.Context) error {
+		cancelStream()
+		closeErr := sdkStream.close()
+		select {
+		case <-producerDone:
+			return closeErr
+		case <-cleanupCtx.Done():
+			return cleanupCtx.Err()
 		}
-		toolCalls = append(toolCalls, tool.Call{ID: call.ID, Name: call.Name, ArgumentsJSON: call.Arguments.String()})
+	}, func() {
+		cancelStream()
+		_ = sdkStream.close()
+	})
+	if err != nil {
+		_ = sdkStream.close()
+		return nil, err
 	}
-	return toolCalls
-}
 
-func reqModel(model string) string {
-	if strings.TrimSpace(model) == "" {
-		return "claude-opus-4-7"
-	}
-	return model
-}
-
-func toAnthropicMessages(messages []conversation.Message) []anthropic.MessageParam {
-	result := make([]anthropic.MessageParam, 0, len(messages))
-	for _, message := range messages {
-		switch message.Role {
-		case conversation.RoleUser, conversation.RoleContextSummary, conversation.RoleContextBoundary:
-			result = append(result, anthropic.NewUserMessage(anthropic.NewTextBlock(message.Content)))
-		case conversation.RoleAssistant:
-			result = append(result, anthropic.NewAssistantMessage(anthropic.NewTextBlock(message.Content)))
-		case conversation.RoleToolCall:
-			var input any = map[string]any{}
-			if strings.TrimSpace(message.RawToolArguments) != "" {
-				_ = json.Unmarshal([]byte(message.RawToolArguments), &input)
-			}
-			result = append(result, anthropic.NewAssistantMessage(anthropic.NewToolUseBlock(message.ToolCallID, input, message.ToolName)))
-		case conversation.RoleToolResult:
-			isError := message.ToolResultStatus != string(tool.StatusSuccess)
-			result = append(result, anthropic.NewUserMessage(anthropic.NewToolResultBlock(message.ToolCallID, message.ToolResultContent, isError)))
+	go func() {
+		defer close(producerDone)
+		defer close(out)
+		defer cancelStream()
+		defer sdkStream.close()
+		defer attempt.finish()
+		processor := newAnthropicStreamProcessor(streamCtx, stream, limits, p.redactor, attempt)
+		if failure := processor.run(sdkStream); failure != nil {
+			attempt.finish()
+			stream.emit(streamCtx, StreamEvent{
+				Type:  StreamEventError,
+				Error: safeProviderError(p.redactor, failure.code, "anthropic", failure.err, failure.recoverable),
+			})
 		}
-	}
-	return result
-}
-
-func toAnthropicSystemBlocks(req ChatRequest) []anthropic.TextBlockParam {
-	blocks := systemBlocks(req)
-	if len(blocks) == 0 {
-		return nil
-	}
-	params := make([]anthropic.TextBlockParam, 0, len(blocks))
-	breakpoint := -1
-	targetName := strings.TrimSpace(req.Cache.SystemBreakpointName)
-	for _, block := range blocks {
-		param := anthropic.TextBlockParam{Text: block.Content}
-		if usesOrderedSystem(req) {
-			if breakpoint < 0 && targetName != "" && block.Cacheable && block.Name == targetName {
-				breakpoint = len(params)
-			}
-		} else if block.Cacheable {
-			breakpoint = len(params)
-		}
-		params = append(params, param)
-	}
-	if req.Cache.EnablePromptCache && breakpoint >= 0 {
-		params[breakpoint].CacheControl = anthropic.NewCacheControlEphemeralParam()
-	}
-	return params
-}
-
-func toAnthropicTools(req ChatRequest) []anthropic.ToolUnionParam {
-	definitions := toolDefinitions(req)
-	if len(definitions) == 0 {
-		return nil
-	}
-	tools := make([]anthropic.ToolUnionParam, 0, len(definitions))
-	for _, definition := range definitions {
-		param := anthropic.ToolParam{
-			Name:        definition.Name,
-			Description: anthropic.String(definition.Description),
-			InputSchema: toAnthropicInputSchema(definition.Schema),
-		}
-		tools = append(tools, anthropic.ToolUnionParam{OfTool: &param})
-	}
-	if req.Cache.EnablePromptCache && (!usesOrderedSystem(req) || req.Cache.CacheTools) {
-		last := len(tools) - 1
-		tools[last].OfTool.CacheControl = anthropic.NewCacheControlEphemeralParam()
-	}
-	return tools
-}
-
-func toAnthropicInputSchema(schema tool.Schema) anthropic.ToolInputSchemaParam {
-	if len(schema.Raw) == 0 {
-		return anthropic.ToolInputSchemaParam{
-			Properties: schema.Properties,
-			Required:   schema.Required,
-		}
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(schema.Raw, &raw); err != nil {
-		return anthropic.ToolInputSchemaParam{
-			Properties: schema.Properties,
-			Required:   schema.Required,
-		}
-	}
-
-	param := anthropic.ToolInputSchemaParam{ExtraFields: map[string]any{}}
-	for key, value := range raw {
-		switch key {
-		case "properties":
-			param.Properties = value
-		case "required":
-			if required, ok := value.([]any); ok {
-				param.Required = make([]string, 0, len(required))
-				for _, item := range required {
-					if name, ok := item.(string); ok {
-						param.Required = append(param.Required, name)
-					}
-				}
-			}
-		case "type":
-			if value == "object" {
-				param.Type = constant.Object("object")
-			}
-		default:
-			param.ExtraFields[key] = value
-		}
-	}
-	if len(param.ExtraFields) == 0 {
-		param.ExtraFields = nil
-	}
-	return param
+	}()
+	returnedStream = true
+	return stream, nil
 }

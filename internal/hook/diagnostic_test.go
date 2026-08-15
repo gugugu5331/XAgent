@@ -12,15 +12,17 @@ import (
 )
 
 func TestHookDiagnostic(t *testing.T) {
+	runtimeRedactor := redact.NewRuntimeRedactor()
 	codes := []string{DiagnosticConditionFailed, DiagnosticTemplateFailed, DiagnosticCommandFailed, DiagnosticHTTPFailed, DiagnosticDecisionInvalid, DiagnosticActionTimeout, DiagnosticAsyncQueueFull, DiagnosticShutdownCancelled, DiagnosticSubAgentNotImplemented, DiagnosticPromptScopeUnavailable, DiagnosticLimitExceeded, DiagnosticActionPanic}
 	seen := map[string]bool{}
 	rule := Rule{Source: Source{Path: "/safe/hooks.yaml", Ordinal: 2, EffectiveOrdinal: 3}, action: compiledAction{typeName: ActionCommand}}
+	safeRule := diagnosticRule{source: runtimeRedactor.Redact(rule.Source.Path), ordinal: rule.Source.Ordinal, effectiveOrdinal: rule.Source.EffectiveOrdinal, action: rule.action.typeName}
 	for _, code := range codes {
 		if code == "" || seen[code] {
 			t.Fatalf("bad code %q", code)
 		}
 		seen[code] = true
-		item := hookDiagnostic(code, rule, EventToolBefore, "run", 1500*time.Millisecond, "safe category", DefaultLimits())
+		item := hookDiagnostic(code, safeRule, EventToolBefore, "run", 1500*time.Millisecond, runtimeRedactor.Redact("safe category"), DefaultLimits())
 		if item.Code != code || item.Source != "/safe/hooks.yaml" || item.Path != "hooks[1]" || item.Attributes["effective_rule_ordinal"] != "3" || item.Attributes["duration_ms"] != "1500" {
 			t.Fatalf("diagnostic = %#v", item)
 		}
@@ -33,7 +35,8 @@ func TestHookDiagnosticNoLeak(t *testing.T) {
 	runtimeRedactor.RegisterSecret(canary)
 	collector := diagnostics.NewCollector(diagnostics.CollectorOptions{Redactor: runtimeRedactor.Text})
 	rule := Rule{Source: Source{Path: "/tmp/" + canary + "/hooks.yaml", Ordinal: 1, EffectiveOrdinal: 1}, action: compiledAction{typeName: ActionHTTP}}
-	collector.Add(hookDiagnostic(DiagnosticHTTPFailed, rule, EventToolBefore, "response", time.Second, "safe failure", DefaultLimits()))
+	safeRule := diagnosticRule{source: runtimeRedactor.Redact(rule.Source.Path), ordinal: rule.Source.Ordinal, effectiveOrdinal: rule.Source.EffectiveOrdinal, action: rule.action.typeName}
+	collector.Add(hookDiagnostic(DiagnosticHTTPFailed, safeRule, EventToolBefore, "response", time.Second, runtimeRedactor.Redact("safe failure"), DefaultLimits()))
 	for _, item := range collector.List() {
 		if strings.Contains(item.Text(), canary) {
 			t.Fatalf("canary leaked: %s", item.Text())
@@ -76,7 +79,9 @@ func TestDiagnosticSummaryLimit(t *testing.T) {
 		t.Run(item.name, func(t *testing.T) {
 			collector := diagnostics.NewCollector(diagnostics.CollectorOptions{MaxBytes: limits.DiagnosticBytes, Redactor: runtimeRedactor.Text})
 			rule := Rule{Source: Source{Path: "limits.yaml", Ordinal: 1, EffectiveOrdinal: 1}, action: compiledAction{typeName: ActionCommand}}
-			diagnostic := hookDiagnostic(DiagnosticCommandFailed, rule, EventToolBefore, "command", 0, item.summary, limits)
+			safeRule := diagnosticRule{source: runtimeRedactor.Redact(rule.Source.Path), ordinal: rule.Source.Ordinal, effectiveOrdinal: rule.Source.EffectiveOrdinal, action: rule.action.typeName}
+			summary := runtimeRedactor.Redact(item.summary)
+			diagnostic := hookDiagnostic(DiagnosticCommandFailed, safeRule, EventToolBefore, "command", 0, summary, limits)
 			collector.Add(diagnostic)
 			items := collector.List()
 			if len(items) != 1 {
@@ -93,7 +98,7 @@ func TestDiagnosticSummaryLimit(t *testing.T) {
 			if err != nil || !json.Valid(encoded) || strings.Contains(string(encoded), canary) {
 				t.Fatalf("unsafe JSON: %q, %v", encoded, err)
 			}
-			if first, second := safeSummary(item.summary, limits.DiagnosticBytes), safeSummary(item.summary, limits.DiagnosticBytes); first != second {
+			if first, second := safeSummary(summary, limits.DiagnosticBytes), safeSummary(summary, limits.DiagnosticBytes); first.Text() != second.Text() {
 				t.Fatal("summary truncation is unstable")
 			}
 		})

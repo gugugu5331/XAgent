@@ -40,6 +40,7 @@ type managedProcess struct {
 	pipeState  *pipeBorrowState
 	timeout    time.Duration
 	sink       diagnostics.BoundedSink
+	stdinOnce  sync.Once
 
 	waitDone chan struct{}
 	wait     waitResult
@@ -97,6 +98,20 @@ func (p *managedProcess) Pipes() Pipes {
 	return p.pipes
 }
 
+// CloseStdin atomically prevents new borrowed writes and closes the owner
+// handle exactly once so the child observes EOF. Borrowed pipe Close methods
+// remain unable to close any owner handle.
+func (p *managedProcess) CloseStdin() error {
+	if p == nil || p.controller == nil || p.pipeState == nil {
+		return errors.New("proctree stdin is unavailable")
+	}
+	p.stdinOnce.Do(func() {
+		p.pipeState.stopWrites()
+		p.controller.StopWrites()
+	})
+	return nil
+}
+
 func (p *managedProcess) Wait(ctx context.Context) (Result, error) {
 	if p == nil || ctx == nil {
 		return Result{}, errors.New("proctree wait request is invalid")
@@ -142,8 +157,7 @@ func (p *managedProcess) Close(ctx context.Context) error {
 
 func (p *managedProcess) cleanup() {
 	defer close(p.closeDone)
-	p.pipeState.stopWrites()
-	p.controller.StopWrites()
+	_ = p.CloseStdin()
 	deadline := time.NewTimer(p.timeout)
 	defer deadline.Stop()
 	select {

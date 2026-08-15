@@ -28,13 +28,26 @@ type Activity struct {
 	cleanups    map[string]func() error
 	limits      Limits
 	materialize func(string) (string, func() error, error)
+	redactor    *redact.RuntimeRedactor
 }
 
 type ActivitySnapshot struct {
 	Active       []Activated
+	Prompt       []SafeActivated
 	Model        string
 	AllowedTools []string
 	ReadRoots    []string
+}
+
+// SafeActivated is the only active-skill view consumed by prompt rendering.
+// Every text field has already crossed the RuntimeRedactor boundary.
+type SafeActivated struct {
+	Name         redact.SafeText
+	Mode         redact.SafeText
+	Source       redact.SafeText
+	PackageRoot  redact.SafeText
+	Instructions redact.SafeText
+	AllowedTools []string
 }
 
 func NewActivity() *Activity {
@@ -42,11 +55,19 @@ func NewActivity() *Activity {
 }
 
 func NewActivityWithLimits(limits Limits) *Activity {
+	return NewActivityWithRedactor(limits, redact.NewRuntimeRedactor())
+}
+
+func NewActivityWithRedactor(limits Limits, redactor *redact.RuntimeRedactor) *Activity {
+	if redactor == nil {
+		redactor = redact.NewRuntimeRedactor()
+	}
 	return &Activity{
 		active:      map[string]Activated{},
 		cleanups:    map[string]func() error{},
 		limits:      normalizeLimits(limits),
 		materialize: MaterializeBuiltin,
+		redactor:    redactor,
 	}
 }
 
@@ -85,7 +106,7 @@ func (a *Activity) Activate(def Definition, args string) (Activated, error) {
 	a.mu.Lock()
 	candidate := cloneActivatedMap(a.active)
 	candidate[activated.Name] = cloneActivated(activated)
-	if _, err := aggregateActivity(candidate); err != nil {
+	if _, err := aggregateActivity(candidate, a.redactor); err != nil {
 		a.mu.Unlock()
 		return Activated{}, err
 	}
@@ -127,7 +148,7 @@ func (a *Activity) Snapshot() ActivitySnapshot {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	snapshot, _ := aggregateActivity(a.active)
+	snapshot, _ := aggregateActivity(a.active, a.redactor)
 	return cloneActivitySnapshot(snapshot)
 }
 
@@ -147,7 +168,10 @@ func (a *Activity) Clear() {
 	}
 }
 
-func aggregateActivity(active map[string]Activated) (ActivitySnapshot, error) {
+func aggregateActivity(active map[string]Activated, redactor *redact.RuntimeRedactor) (ActivitySnapshot, error) {
+	if redactor == nil {
+		redactor = redact.NewRuntimeRedactor()
+	}
 	names := make([]string, 0, len(active))
 	for name := range active {
 		names = append(names, name)
@@ -186,6 +210,14 @@ func aggregateActivity(active map[string]Activated) (ActivitySnapshot, error) {
 			rootSet[root] = struct{}{}
 		}
 		snapshot.Active = append(snapshot.Active, item)
+		snapshot.Prompt = append(snapshot.Prompt, SafeActivated{
+			Name:         redactor.Redact(item.Name),
+			Mode:         redactor.Redact(string(item.Mode)),
+			Source:       redactor.Redact(string(item.Source)),
+			PackageRoot:  redactor.Redact(item.PackageRoot),
+			Instructions: redactor.Redact(item.Instructions),
+			AllowedTools: append([]string(nil), item.AllowedTools...),
+		})
 	}
 	if restricted {
 		snapshot.AllowedTools = make([]string, 0, len(allowed))
@@ -220,9 +252,14 @@ func cloneActivitySnapshot(snapshot ActivitySnapshot) ActivitySnapshot {
 		AllowedTools: cloneStringSlicePreservingNil(snapshot.AllowedTools),
 		ReadRoots:    append([]string(nil), snapshot.ReadRoots...),
 		Active:       make([]Activated, len(snapshot.Active)),
+		Prompt:       make([]SafeActivated, len(snapshot.Prompt)),
 	}
 	for index, item := range snapshot.Active {
 		clone.Active[index] = cloneActivated(item)
+	}
+	for index, item := range snapshot.Prompt {
+		item.AllowedTools = append([]string(nil), item.AllowedTools...)
+		clone.Prompt[index] = item
 	}
 	return clone
 }

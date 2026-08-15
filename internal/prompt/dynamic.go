@@ -3,7 +3,44 @@ package prompt
 import (
 	"fmt"
 	"strings"
+
+	"xagent/internal/redact"
 )
+
+const defaultDynamicPromptMaxBytes = 2 * 1024 * 1024
+
+// SafeDynamicRequest is the candidate boundary for runtime prompt content.
+// Callers cannot populate its text fields without crossing RuntimeRedactor.
+type SafeDynamicRequest struct {
+	Mode         RunMode
+	Iteration    int
+	ProjectRoot  redact.SafeText
+	ActiveSkills redact.SafeText
+	MaxBytes     int
+}
+
+// DynamicBlocksFromSafe composes runtime prompt blocks only from SafeText and
+// rejects the complete expansion before any block crosses the prompt boundary.
+func DynamicBlocksFromSafe(req SafeDynamicRequest) ([]Block, error) {
+	blocks := DynamicBlocks(BuildRequest{
+		Mode:         req.Mode,
+		Iteration:    req.Iteration,
+		ProjectRoot:  req.ProjectRoot.Text(),
+		ActiveSkills: req.ActiveSkills.Text(),
+	})
+	limit := req.MaxBytes
+	if limit <= 0 {
+		limit = defaultDynamicPromptMaxBytes
+	}
+	total := 0
+	for _, block := range blocks {
+		if len(block.Content) > limit-total {
+			return nil, fmt.Errorf("dynamic prompt exceeds %d bytes", limit)
+		}
+		total += len(block.Content)
+	}
+	return blocks, nil
+}
 
 func DynamicBlocks(req BuildRequest) []Block {
 	blocks := make([]Block, 0, 2)

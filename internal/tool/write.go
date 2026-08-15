@@ -61,11 +61,20 @@ func atomicWriteText(ctx context.Context, execution writeExecution, relative, co
 }
 
 type WriteTool struct {
-	projectRoot string
+	projectRoot   string
+	resultFactory *ResultFactory
 }
 
+// NewWriteTool is the isolated legacy adapter retained until T4.29a.
 func NewWriteTool(projectRoot string) Tool {
 	return &WriteTool{projectRoot: projectRoot}
+}
+
+func NewWriteToolWithResultFactory(projectRoot string, factory *ResultFactory) (Tool, error) {
+	if factory == nil {
+		return nil, fmt.Errorf("safe Write result factory is unavailable")
+	}
+	return &WriteTool{projectRoot: projectRoot, resultFactory: factory}, nil
 }
 
 func (t *WriteTool) Name() string { return "Write" }
@@ -76,6 +85,10 @@ func (t *WriteTool) Description() string {
 
 func (t *WriteTool) Risk() Risk { return RiskDangerous }
 
+func (t *WriteTool) UsesSafeResultBoundary() bool {
+	return t != nil && t.resultFactory != nil
+}
+
 func (t *WriteTool) Schema() Schema {
 	return ObjectSchema([]string{"path", "content"}, map[string]SchemaProperty{
 		"path":    StringProperty("Path to write, relative to the project root."),
@@ -84,6 +97,35 @@ func (t *WriteTool) Schema() Schema {
 }
 
 func (t *WriteTool) Execute(ctx context.Context, input Input) Result {
+	if t != nil && t.resultFactory != nil {
+		return t.executeSafe(ctx, input)
+	}
+	return t.executeLegacy(ctx, input)
+}
+
+func (t *WriteTool) executeSafe(ctx context.Context, input Input) Result {
+	failure := func(code, message string) Result {
+		return buildSyntheticResult(t.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: Completed, Status: StatusError, Summary: message, Error: &Error{Code: code, Message: message, Recoverable: true}})
+	}
+	path, ok := stringArg(input.Arguments, "path")
+	if !ok {
+		return failure(ErrInvalidArguments, "path 参数不能为空")
+	}
+	content, ok := input.Arguments["content"].(string)
+	if !ok {
+		return failure(ErrInvalidArguments, "content 参数必须是字符串")
+	}
+	execution, relative, err := writeTarget(ctx, path)
+	if err != nil {
+		return failure(errorCode(err), "写入文件失败: 目标不可写")
+	}
+	if err := atomicWriteText(ctx, execution, relative, content); err != nil {
+		return failure(ErrPathOutsideProject, "写入文件失败: 目标不可写")
+	}
+	return buildSyntheticResult(t.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: Completed, Status: StatusSuccess, Summary: "文件写入完成", Preview: fmt.Sprintf("Wrote %d bytes", len(content))})
+}
+
+func (t *WriteTool) executeLegacy(ctx context.Context, input Input) Result {
 	path, ok := stringArg(input.Arguments, "path")
 	if !ok {
 		return Failure(input, ErrInvalidArguments, "path 参数不能为空", true)

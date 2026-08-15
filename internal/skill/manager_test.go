@@ -3,6 +3,7 @@ package skill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -252,6 +253,154 @@ func TestManagerRejectedRefreshPreservesActivitySnapshot(t *testing.T) {
 	if !ok || resolved.Body != definition.Body || resolved.Fingerprint != definition.Fingerprint {
 		t.Fatalf("rejected refresh changed the effective definition: %#v", resolved)
 	}
+}
+
+func TestOverLimitHistorySkillIsSkippedWithoutSourceMutation(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "legacy.md")
+	original := overLimitHistorySkillDocument("legacy", 1001, "legacy body marker")
+	if err := os.WriteFile(entry, original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := NewManager(ManagerOptions{
+		Sources:   []SourceFS{{Source: SourceProject, Root: root}},
+		ToolNames: []string{LoadSkillToolName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := manager.Resolve("legacy"); exists {
+		t.Fatal("over-limit Skill remained enabled")
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.Generation != 1 || len(snapshot.Diagnostics) != 1 {
+		t.Fatalf("unexpected migration snapshot: %#v", snapshot)
+	}
+	diagnostic := snapshot.Diagnostics[0]
+	wantAttributes := map[string]string{
+		"allowed_range":  "0..1000",
+		"field_path":     "history",
+		"migration_hint": "lower to 1000 or less",
+	}
+	if diagnostic.Code != "skill_history_migration_required" || diagnostic.Source != string(SourceProject) || diagnostic.Path == "" || !reflect.DeepEqual(diagnostic.Attributes, wantAttributes) {
+		t.Fatalf("unexpected migration diagnostic: %#v", diagnostic)
+	}
+	if !strings.Contains(diagnostic.Message, "refresh") || !strings.Contains(diagnostic.Message, "1000 or less") {
+		t.Fatalf("migration diagnostic is not actionable: %#v", diagnostic)
+	}
+	for _, forbidden := range []string{"1001", "legacy body marker"} {
+		if strings.Contains(diagnostic.Text(), forbidden) {
+			t.Fatalf("migration diagnostic leaked rejected content %q", forbidden)
+		}
+	}
+
+	after, err := os.ReadFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, original) || afterInfo.Mode() != beforeInfo.Mode() {
+		t.Fatal("refresh mutated the governed Skill source")
+	}
+	if _, err := os.Stat(entry); err != nil {
+		t.Fatalf("refresh moved or deleted the governed Skill source: %v", err)
+	}
+}
+
+func TestHistoryFixReenablesOnlyOnNextAtomicRefresh(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "legacy.md")
+	if err := os.WriteFile(entry, overLimitHistorySkillDocument("legacy", 1001, "legacy body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(ManagerOptions{
+		Sources:   []SourceFS{{Source: SourceProject, Root: root}},
+		ToolNames: []string{LoadSkillToolName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeSkillFile(t, entry, "legacy", ModeIsolated, "fixed body", nil, maxSkillHistoryTurns, "")
+	if _, exists := manager.Resolve("legacy"); exists {
+		t.Fatal("file correction changed the published snapshot before refresh")
+	}
+	beforeRefresh := manager.Snapshot()
+	if beforeRefresh.Generation != 1 || len(beforeRefresh.Diagnostics) != 1 || beforeRefresh.Diagnostics[0].Code != "skill_history_migration_required" {
+		t.Fatalf("published migration snapshot changed before refresh: %#v", beforeRefresh)
+	}
+
+	result, err := manager.RefreshIfChanged(context.Background())
+	if err != nil || !result.Changed || result.Generation != 2 || len(result.Diagnostics) != 0 {
+		t.Fatalf("corrected Skill refresh failed: %#v %v", result, err)
+	}
+	definition, exists := manager.Resolve("legacy")
+	if !exists || definition.History != maxSkillHistoryTurns || definition.Body != "fixed body" {
+		t.Fatalf("corrected Skill was not atomically re-enabled: %#v %v", definition, exists)
+	}
+}
+
+func TestInFlightSkillSnapshotIsNotRewritten(t *testing.T) {
+	root := t.TempDir()
+	entry := filepath.Join(root, "demo.md")
+	writeSkillFile(t, entry, "demo", ModeIsolated, "pinned body {{args}}", []string{"Read"}, 2, "pinned-model")
+	manager, err := NewManager(ManagerOptions{
+		Sources:   []SourceFS{{Source: SourceProject, Root: root}},
+		ToolNames: []string{"Read", LoadSkillToolName},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedSnapshot := manager.Snapshot()
+	pinnedDefinition, exists := manager.Resolve("demo")
+	if !exists {
+		t.Fatal("initial Skill was not resolved")
+	}
+	activity := NewActivity()
+	if _, err := activity.Activate(pinnedDefinition, "pinned args"); err != nil {
+		t.Fatal(err)
+	}
+	pinnedActivity := activity.Snapshot()
+
+	overLimitSource := overLimitHistorySkillDocument("demo", 1001, "replacement body")
+	if err := os.WriteFile(entry, overLimitSource, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.RefreshIfChanged(context.Background())
+	if err != nil || !result.Changed || result.Generation != 2 || len(result.Diagnostics) != 1 || result.Diagnostics[0].Code != "skill_history_migration_required" {
+		t.Fatalf("over-limit refresh failed: %#v %v", result, err)
+	}
+	if _, exists := manager.Resolve("demo"); exists {
+		t.Fatal("over-limit Skill remained in the new snapshot")
+	}
+	if pinnedSnapshot.Generation != 1 || pinnedSnapshot.Definitions["demo"].History != 2 || pinnedSnapshot.Definitions["demo"].Body != "pinned body {{args}}" {
+		t.Fatalf("pinned snapshot was rewritten: %#v", pinnedSnapshot)
+	}
+	if pinnedDefinition.History != 2 || pinnedDefinition.Body != "pinned body {{args}}" {
+		t.Fatalf("pinned definition was rewritten: %#v", pinnedDefinition)
+	}
+	if after := activity.Snapshot(); !reflect.DeepEqual(after, pinnedActivity) {
+		t.Fatalf("in-flight activity changed:\nbefore=%#v\nafter=%#v", pinnedActivity, after)
+	}
+	afterSource, err := os.ReadFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(afterSource, overLimitSource) {
+		t.Fatal("refresh rewrote the over-limit source")
+	}
+}
+
+func overLimitHistorySkillDocument(name string, history int, body string) []byte {
+	return []byte(fmt.Sprintf("---\nname: %s\ndescription: migration fixture\nmode: isolated\nhistory: %d\n---\n%s", name, history, body))
 }
 
 func TestManagerRefreshAcceptsSingleFileParseFailure(t *testing.T) {

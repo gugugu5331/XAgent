@@ -10,6 +10,7 @@ import (
 	"xagent/internal/command"
 	"xagent/internal/memory"
 	"xagent/internal/orchestrator"
+	"xagent/internal/tui"
 )
 
 type commandController struct {
@@ -37,6 +38,17 @@ func (c *commandController) DisplayError(err error) {
 
 func (c *commandController) SendUserMessage(text string) {
 	c.cmd = c.model.submitUserMessage(text)
+}
+
+// OpenArtifact only publishes a validated, capability-free local-user intent.
+// The reader is opened later by Model.Update, outside command dispatch.
+func (c *commandController) OpenArtifact(id string) error {
+	intent, ok := tui.NewArtifactOpenIntent(id, 0)
+	if !ok {
+		return fmt.Errorf("artifact ID 必须是 64 位小写十六进制值")
+	}
+	c.cmd = func() tea.Msg { return intent }
+	return nil
 }
 
 func (c *commandController) ExecuteSkill(name string, args string, raw string) error {

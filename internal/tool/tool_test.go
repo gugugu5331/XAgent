@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"xagent/internal/permission"
 )
@@ -184,19 +183,19 @@ func TestEditToolMatchCounts(t *testing.T) {
 	}
 }
 
-func TestBashToolFailureAndTimeout(t *testing.T) {
+func TestBashToolWithoutProtectedRuntimeFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
 	executor := NewExecutor(registry, root, 100*time.Millisecond, 1024)
 
-	failure := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"exit 7"}`})
-	if failure.Status != StatusError || failure.Error.Code != ErrCommandFailed {
-		t.Fatalf("expected command_failed, got %#v", failure)
-	}
-
-	timeout := executor.Execute(context.Background(), Call{ID: "2", Name: "Bash", ArgumentsJSON: `{"command":"sleep 1"}`})
-	if timeout.Status != StatusTimeout {
-		t.Fatalf("expected timeout, got %#v", timeout)
+	for _, call := range []Call{
+		{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"exit 7"}`},
+		{ID: "2", Name: "Bash", ArgumentsJSON: `{"command":"sleep 1"}`},
+	} {
+		result := executor.Execute(context.Background(), call)
+		if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied || result.Data["started"] != false {
+			t.Fatalf("unprotected Bash did not fail closed: %#v", result)
+		}
 	}
 }
 
@@ -241,99 +240,45 @@ func TestExecutorTruncatesOutput(t *testing.T) {
 	}
 }
 
-func TestExecutorUsesConfiguredLimits(t *testing.T) {
+func TestExecutorUsesConfiguredReadLimit(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
 	executor := newWritableExecutor(t, registry, root, 10*time.Millisecond, 12)
 
-	if got := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"sleep 1"}`}); got.Status != StatusTimeout {
-		t.Fatalf("expected configured timeout, got %#v", got)
-	}
 	if got := executor.Execute(context.Background(), Call{ID: "2", Name: "Write", ArgumentsJSON: `{"path":"long.txt","content":"abcdefghijklmnopqrstuvwxyz"}`}); got.Status != StatusSuccess {
 		t.Fatalf("write failed: %#v", got)
 	}
 	read := executor.Execute(context.Background(), Call{ID: "3", Name: "Read", ArgumentsJSON: `{"path":"long.txt"}`})
-	if !read.Truncated || !strings.Contains(read.Summary, "截断") {
+	if !read.Truncated || len(read.Content) != 12 || read.Data["truncation_reason"] != "tool.inline_output_bytes" {
 		t.Fatalf("expected configured max output truncation, got %#v", read)
 	}
 }
 
-func TestBashToolFailureContentIncludesRedactedStdoutAndStderr(t *testing.T) {
+func TestUnprotectedBashDoesNotEchoSensitiveCommand(t *testing.T) {
 	root := t.TempDir()
 	registry, _ := NewRegistry(root)
 	executor := NewExecutor(registry, root, time.Second, 4096)
 
 	result := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"printf 'api_key=secret-key'; printf 'Authorization: Bearer abc123' >&2; exit 7"}`})
-	if result.Status != StatusError || result.Error.Code != ErrCommandFailed {
-		t.Fatalf("expected command_failed, got %#v", result)
+	if result.Status != StatusDenied || result.Error == nil || result.Error.Code != ErrPermissionDenied {
+		t.Fatalf("expected protected-runtime denial, got %#v", result)
 	}
-	if !strings.Contains(result.Content, "exit_code: 7") || !strings.Contains(result.Content, "stdout:") || !strings.Contains(result.Content, "stderr:") {
-		t.Fatalf("failure content missing stdout/stderr summary: %q", result.Content)
-	}
-	if strings.Contains(result.Content, "secret-key") || strings.Contains(result.Content, "abc123") {
+	if strings.Contains(result.Summary, "secret-key") || strings.Contains(result.Content, "secret-key") || strings.Contains(result.Error.Message, "secret-key") ||
+		strings.Contains(result.Summary, "abc123") || strings.Contains(result.Content, "abc123") || strings.Contains(result.Error.Message, "abc123") {
 		t.Fatalf("failure content leaked secret: %q", result.Content)
 	}
-	if stdout, _ := result.Data["stdout"].(string); strings.Contains(stdout, "secret-key") {
-		t.Fatalf("stdout data leaked secret: %q", stdout)
-	}
-	if stderr, _ := result.Data["stderr"].(string); strings.Contains(stderr, "abc123") {
-		t.Fatalf("stderr data leaked secret: %q", stderr)
-	}
 }
 
-func TestBashToolSuccessRedactsStdout(t *testing.T) {
-	root := t.TempDir()
-	registry, _ := NewRegistry(root)
-	executor := NewExecutor(registry, root, time.Second, 4096)
-
-	result := executor.Execute(context.Background(), Call{ID: "1", Name: "Bash", ArgumentsJSON: `{"command":"printf 'api_key=secret-key'"}`})
-	if result.Status != StatusSuccess {
-		t.Fatalf("expected success, got %#v", result)
+func TestRegistryViewsAreNonExecutable(t *testing.T) {
+	registry, err := NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(result.Content, "secret-key") {
-		t.Fatalf("success content leaked secret: %q", result.Content)
-	}
-}
-
-func TestExecutorTruncatesUTF8Safely(t *testing.T) {
-	value, truncated := truncateString("你好世界", 5)
-	if !truncated {
-		t.Fatal("expected truncation")
-	}
-	if !utf8.ValidString(value) {
-		t.Fatalf("truncated string is invalid utf8: %q", value)
-	}
-}
-
-func TestExecutorBoundsEveryModelVisibleResultField(t *testing.T) {
-	const limit = 64
-	executor := &Executor{MaxOutputBytes: limit}
-	result := executor.truncate(Result{
-		Summary: strings.Repeat("摘", 100),
-		Content: strings.Repeat("内", 100),
-		Data: map[string]any{
-			"stdout":  strings.Repeat("出", 100),
-			"stderr":  strings.Repeat("错", 100),
-			"content": strings.Repeat("数", 100),
-		},
-		Error: &Error{Code: ErrCommandFailed, Message: strings.Repeat("误", 100)},
-	})
-	if !result.Truncated || !strings.Contains(result.Summary, "截断") {
-		t.Fatalf("bounded result did not report truncation: %#v", result)
-	}
-	for name, value := range map[string]string{
-		"summary": result.Summary,
-		"content": result.Content,
-		"error":   result.Error.Message,
-	} {
-		if len(value) > limit || !utf8.ValidString(value) {
-			t.Fatalf("%s is not safely bounded: bytes=%d value=%q", name, len(value), value)
-		}
-	}
-	for _, key := range []string{"stdout", "stderr", "content"} {
-		value, _ := result.Data[key].(string)
-		if len(value) > limit/2 || !utf8.ValidString(value) {
-			t.Fatalf("data.%s is not safely bounded: bytes=%d value=%q", key, len(value), value)
+	for _, definition := range registry.List() {
+		if _, executable := definition.(interface {
+			Execute(context.Context, Input) Result
+		}); executable {
+			t.Fatalf("registry exposed executable tool %q", definition.Name())
 		}
 	}
 }
@@ -367,7 +312,7 @@ func TestExecuteAuthorizedAllowsMatchingTicket(t *testing.T) {
 }
 
 func TestRegistryValidateCall(t *testing.T) {
-	registry := &Registry{tools: map[string]Tool{}}
+	registry := &Registry{tools: map[string]Definition{}}
 	recorder := &recordingTool{name: "Recorder"}
 	if err := registry.Register(recorder); err != nil {
 		t.Fatal(err)
@@ -381,8 +326,13 @@ func TestRegistryValidateCall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("blank arguments failed: %v", err)
 		}
-		if validated.Tool != recorder || len(validated.Arguments) != 0 {
+		if validated.Tool == nil || validated.Tool.Name() != recorder.Name() || len(validated.Arguments) != 0 {
 			t.Fatalf("blank arguments were not normalized to {}: %#v", validated)
+		}
+		if _, executable := validated.Tool.(interface {
+			Execute(context.Context, Input) Result
+		}); executable {
+			t.Fatal("validated call exposed its private execution target")
 		}
 	}
 
@@ -407,7 +357,7 @@ func TestRegistryValidateCall(t *testing.T) {
 }
 
 func TestExecuteValidatedAuthorizedPreservesArgumentsAndTicket(t *testing.T) {
-	registry := &Registry{tools: map[string]Tool{}}
+	registry := &Registry{tools: map[string]Definition{}}
 	recorder := &recordingTool{name: "Recorder", mutate: true}
 	if err := registry.Register(recorder); err != nil {
 		t.Fatal(err)
@@ -534,7 +484,7 @@ func TestSchemaRawJSONIsPreserved(t *testing.T) {
 
 func TestProviderDefinitionsUseRawSchema(t *testing.T) {
 	raw := json.RawMessage(`{"type":"object","properties":{"items":{"type":"array","items":{"type":"integer"}}},"required":["items"],"additionalProperties":false}`)
-	registry := &Registry{tools: map[string]Tool{}}
+	registry := &Registry{tools: map[string]Definition{}}
 	if err := registry.Register(fakeTool{schema: Schema{Raw: raw}}); err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +543,7 @@ func TestToolDescriptionsReinforcePromptRules(t *testing.T) {
 		"Read":  {"dedicated tool", "editing", "project"},
 		"Write": {"Read", "project"},
 		"Edit":  {"Read", "project"},
-		"Bash":  {"Prefer dedicated tools", "not sandboxed", "cautiously"},
+		"Bash":  {"Prefer dedicated tools", "protected process-tree runtime", "project root"},
 		"Glob":  {"dedicated tool", "project"},
 		"Grep":  {"dedicated tool", "editing", "project"},
 	}

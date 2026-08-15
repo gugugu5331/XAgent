@@ -3,19 +3,42 @@ package command
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
 )
+
+type helpPresenter interface {
+	DisplayHelp(HelpCatalog)
+}
 
 func Builtins() []Definition {
 	return []Definition{
 		{Name: "help", Aliases: []string{"h", "?"}, Description: "显示可用命令", Usage: "/help", Type: TypeLocal, Handler: helpHandler},
+		{Name: "new", Description: "创建并切换到新会话", Usage: "/new", Type: TypeUI, Intent: IntentNewConversation, Shortcuts: []Shortcut{{Context: ShortcutSessions, Key: "n", Description: "新建会话"}}, Handler: navigationMetadataHandler},
+		{Name: "sessions", Aliases: []string{"list"}, Description: "打开会话列表", Usage: "/sessions", Type: TypeUI, Intent: IntentShowSessions, Shortcuts: []Shortcut{
+			{Context: ShortcutChatIdle, Key: "esc", Description: "打开会话列表"},
+			{Context: ShortcutChatStreaming, Key: "esc", Intent: IntentCancel, Description: "取消当前请求"},
+			{Context: ShortcutChatConfirmation, Key: "esc", Intent: IntentCancel, Description: "取消当前请求"},
+			{Context: ShortcutSessions, Key: "enter", Intent: IntentOpenConversation, Description: "恢复所选会话"},
+			{Context: ShortcutSessions, Key: "q", Intent: IntentQuit, Description: "退出应用"},
+		}, Handler: navigationMetadataHandler},
 		{Name: "compact", Aliases: []string{"ctx"}, Description: "压缩当前会话上下文", Usage: "/compact", Type: TypeLocal, Handler: compactHandler},
 		{Name: "clear", Aliases: []string{"cls"}, Description: "清空当前消息显示", Usage: "/clear", Type: TypeUI, Handler: clearHandler},
+		{Name: "artifact", Description: "打开本地 Artifact", Usage: "/artifact <opaque-id>", Type: TypeUI, ArgHint: "<opaque-id>", Handler: artifactHandler},
 		{Name: "plan", Aliases: []string{"p"}, Description: "进入当前会话的计划模式", Usage: "/plan", Type: TypeUI, Handler: planHandler},
 		{Name: "do", Aliases: []string{"d"}, Description: "退出计划模式并恢复默认执行", Usage: "/do", Type: TypeUI, Handler: doHandler},
 		{Name: "session", Aliases: []string{"sess"}, Description: "显示当前会话摘要", Usage: "/session", Type: TypeLocal, Handler: sessionHandler},
 		{Name: "memory", Aliases: []string{"mem"}, Description: "显示记忆状态与条目数量", Usage: "/memory", Type: TypeLocal, Handler: memoryHandler},
-		{Name: "permission", Aliases: []string{"perm"}, Description: "显示当前权限状态", Usage: "/permission", Type: TypeLocal, Handler: permissionHandler},
-		{Name: "status", Aliases: []string{"st"}, Description: "显示统一运行状态", Usage: "/status", Type: TypeLocal, Handler: statusHandler},
+		{Name: "permission", Aliases: []string{"perm"}, Description: "显示当前权限状态", Usage: "/permission", Type: TypeLocal, HelpEntries: []HelpEntry{
+			{Kind: HelpEntryPermissionMode, Name: "strict", Description: "写入与命令执行需要确认"},
+			{Kind: HelpEntryPermissionMode, Name: "default", Description: "只读操作自动允许，其他操作需要确认"},
+			{Kind: HelpEntryPermissionMode, Name: "permissive", Description: "除受保护命令外尽量自动允许"},
+		}, Handler: permissionHandler},
+		{Name: "status", Aliases: []string{"st"}, Description: "显示统一运行状态", Usage: "/status", Type: TypeLocal, HelpEntries: []HelpEntry{
+			{Kind: HelpEntryStatus, Name: "status", Description: "显示统一运行状态"},
+			{Kind: HelpEntryDiagnostics, Name: "status", Description: "显示有界、脱敏的诊断摘要"},
+		}, Handler: statusHandler},
 		{Name: "rv", Description: "兼容旧审查命令", Usage: "/rv [args]", Type: TypePrompt, ArgHint: "[args]", Hidden: true, Handler: reviewShimHandler},
 		{Name: "permissions", Description: "兼容旧权限状态命令", Usage: "/permissions status", Type: TypeLocal, Hidden: true, Handler: legacyPermissionsHandler},
 		{Name: "mcp", Description: "兼容旧 MCP 状态命令", Usage: "/mcp status", Type: TypeLocal, Hidden: true, Handler: legacyMCPHandler},
@@ -23,9 +46,30 @@ func Builtins() []Definition {
 	}
 }
 
+// navigationMetadataHandler only emits the metadata-owned value. Subsequent
+// App navigation tasks own generation checks and every service side effect.
+func navigationMetadataHandler(context ExecutionContext, invocation Invocation) error {
+	if err := rejectArgs(invocation, "/"+invocation.CanonicalName); err != nil {
+		return err
+	}
+	intent, ok := context.Registry.IntentForCommand(invocation.CanonicalName)
+	if !ok {
+		return fmt.Errorf("/%s 缺少导航 intent", invocation.CanonicalName)
+	}
+	sink, ok := context.Controller.(IntentSink)
+	if !ok {
+		return fmt.Errorf("/%s 的导航控制器不可用", invocation.CanonicalName)
+	}
+	return sink.HandleIntent(intent)
+}
+
 func helpHandler(context ExecutionContext, invocation Invocation) error {
 	if err := rejectArgs(invocation, "/help"); err != nil {
 		return err
+	}
+	if presenter, ok := context.Controller.(helpPresenter); ok {
+		presenter.DisplayHelp(context.Registry.HelpCatalog())
+		return nil
 	}
 	lines := []string{"可用命令："}
 	for _, definition := range context.Registry.Visible() {
@@ -69,6 +113,14 @@ func clearHandler(context ExecutionContext, invocation Invocation) error {
 	context.Controller.ClearMessages()
 	context.Controller.DisplayNotice("当前消息显示已清空，会话历史和上下文保持不变")
 	return nil
+}
+
+func artifactHandler(context ExecutionContext, invocation Invocation) error {
+	args := strings.Fields(invocation.Args)
+	if len(args) != 1 {
+		return fmt.Errorf("用法: /artifact <opaque-id>")
+	}
+	return context.Controller.OpenArtifact(args[0])
 }
 
 func planHandler(context ExecutionContext, invocation Invocation) error {
@@ -137,16 +189,50 @@ func statusHandler(context ExecutionContext, invocation Invocation) error {
 	}
 	status := context.Controller.RuntimeStatus()
 	usage := context.Controller.TokenUsage()
-	recentError := status.RecentError
-	if strings.TrimSpace(recentError) == "" {
-		recentError = "none"
+	diagnosticSummary := "unavailable"
+	if summary, err := context.Controller.LegacyDiagnostics(); err == nil {
+		diagnosticSummary = summary
 	}
-	mcp := status.MCP
-	if strings.TrimSpace(mcp) == "" {
-		mcp = "none"
-	}
-	context.Controller.DisplayNotice(fmt.Sprintf("运行状态: provider=%s model=%s mode=%s streaming=%t tokens=%d_in/%d_out cache=%d_create/%d_read mcp=%s recent_error=%s", status.Provider, status.Model, modeText(status.Mode), status.Streaming, usage.Input, usage.Output, usage.CacheCreation, usage.CacheRead, mcp, recentError))
+	message := fmt.Sprintf(
+		"运行状态: provider=%s model=%s mode=%s streaming=%t tokens=%d_in/%d_out cache=%d_create/%d_read mcp=%s recent_error=%s diagnostics=%s action=根据 recent_error 与 diagnostics 检查配置或连接后重试",
+		boundedStatusField(status.Provider), boundedStatusField(status.Model), modeText(status.Mode), status.Streaming,
+		usage.Input, usage.Output, usage.CacheCreation, usage.CacheRead,
+		boundedStatusField(status.MCP), boundedStatusField(status.RecentError), boundedStatusField(diagnosticSummary),
+	)
+	context.Controller.DisplayNotice(truncateUTF8Bytes(message, 2048))
 	return nil
+}
+
+func boundedStatusField(value string) string {
+	value = ansi.Strip(value)
+	value = strings.Map(func(current rune) rune {
+		if current < ' ' || current >= '\x7f' && current <= '\x9f' {
+			return ' '
+		}
+		return current
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return "none"
+	}
+	return truncateUTF8Bytes(value, 256)
+}
+
+func truncateUTF8Bytes(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(value) <= maximum {
+		return value
+	}
+	end := maximum - len("…")
+	if end <= 0 {
+		return ""
+	}
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + "…"
 }
 
 func reviewShimHandler(context ExecutionContext, invocation Invocation) error {

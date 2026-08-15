@@ -14,6 +14,7 @@ import (
 
 	"xagent/internal/artifact"
 	"xagent/internal/permission"
+	"xagent/internal/proctree"
 	"xagent/internal/redact"
 	"xagent/internal/safefs"
 )
@@ -77,6 +78,152 @@ func TestExecutionStateAndPolicyAreIndependent(t *testing.T) {
 	}
 }
 
+func TestAllToolResultsRequireInjectedFactory(t *testing.T) {
+	const factoryCanary = "injected-factory-canary"
+	redactor := redact.NewRuntimeRedactor()
+	redactor.RegisterSecret(factoryCanary)
+	factory, err := NewResultFactory(redactor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	const readPayload = "needle injected-factory-canary from the real Read producer exceeds inline capacity"
+	if err := os.WriteFile(filepath.Join(root, "candidate.txt"), []byte(readPayload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	captureCalls := 0
+	var captures []*Capture
+	var captureStores []*captureTestStore
+	capture := func(ctx context.Context, _ artifact.Metadata) (*Capture, error) {
+		captureCalls++
+		store := &captureTestStore{}
+		candidate := newTestCaptureWithContext(t, ctx, store, 32, 128)
+		captures = append(captures, candidate)
+		captureStores = append(captureStores, store)
+		return candidate, nil
+	}
+	readTool, err := NewReadToolWithResultBoundary(root, factory, capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grepTool, err := NewGrepToolWithResultBoundary(root, factory, capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globTool, err := NewGlobToolWithResultBoundary(root, factory, capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTool, err := NewWriteToolWithResultFactory(root, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	editTool, err := NewEditToolWithResultFactory(root, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadSkillTool, err := NewLoadSkillToolWithResultFactory(factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := safefs.Bootstrap(root, safefs.Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Root.Close()
+	bashProcess := newStaticBashProcess("bash candidate output exceeds the configured inline capture capacity", "", proctree.Result{})
+	bashTool, err := NewProtectedBashTool(root, BashRuntime{
+		Runner:           &bashTestRunner{process: bashProcess},
+		Plans:            bashTestPlanFactory{},
+		WorkingDirectory: opened.Root,
+		Capture:          capture,
+		ResultFactory:    factory,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeoutTool := &cancelAfterStartSafeTool{name: "Wait", factory: factory}
+	firstRead := readTool.Execute(context.Background(), Input{Name: "Read", CallID: "read-1", Arguments: map[string]any{"path": "candidate.txt"}})
+	secondRead := readTool.Execute(context.Background(), Input{Name: "Read", CallID: "read-2", Arguments: map[string]any{"path": "candidate.txt"}})
+	results := []Result{
+		firstRead,
+		secondRead,
+		grepTool.Execute(context.Background(), Input{Name: "Grep", CallID: "grep", Arguments: map[string]any{"pattern": "needle", "path": "."}}),
+		globTool.Execute(context.Background(), Input{Name: "Glob", CallID: "glob", Arguments: map[string]any{"pattern": "*.txt"}}),
+		bashTool.Execute(context.Background(), Input{Name: "Bash", CallID: "bash", Arguments: map[string]any{"command": "candidate"}}),
+		writeTool.Execute(context.Background(), Input{Name: "Write", CallID: "write", Arguments: map[string]any{}}),
+		editTool.Execute(context.Background(), Input{Name: "Edit", CallID: "edit", Arguments: map[string]any{}}),
+		loadSkillTool.Execute(context.Background(), Input{Name: LoadSkillToolName, CallID: "skill"}),
+	}
+	registry := NewSafeCandidateRegistry()
+	for _, candidate := range []Tool{readTool, grepTool, globTool, bashTool, writeTool, editTool, loadSkillTool, timeoutTool} {
+		if err := registry.Register(candidate); err != nil {
+			t.Fatalf("register safe candidate %s: %v", candidate.Name(), err)
+		}
+	}
+	if err := registry.Register(NewReadTool(root)); err == nil {
+		t.Fatal("safe candidate registry accepted a legacy result producer")
+	}
+	executor, err := NewExecutorWithResultFactory(registry, root, time.Second, 1024, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.Timeout = time.Millisecond
+	var invalidValue any
+	invalidErr := json.Unmarshal([]byte("{"), &invalidValue)
+	timedOut := executor.Execute(context.Background(), Call{ID: "timeout", Name: timeoutTool.Name(), ArgumentsJSON: `{}`})
+	results = append(results,
+		executor.validationFailure(Call{ID: "unknown", Name: "unknown"}, errToolNotRegistered),
+		executor.validationFailure(Call{ID: "invalid", Name: "Read"}, invalidErr),
+		executor.Denied(Call{ID: "denied", Name: "Write"}),
+		timedOut,
+	)
+	for index, result := range results {
+		if !result.ExecutionState().CanProduceResult() || result.ModelContent().Text() == "" || result.PersistedContent().Text() == "" || !result.UserView().State.CanProduceResult() {
+			t.Fatalf("safe candidate result %d did not come from injected factory", index)
+		}
+	}
+	if captureCalls != 5 || len(captures) != captureCalls || len(captureStores) != captureCalls {
+		t.Fatalf("capture candidate calls = %d captures=%d stores=%d, want 5 fresh instances", captureCalls, len(captures), len(captureStores))
+	}
+	if captures[0] == captures[1] || captureStores[0] == captureStores[1] {
+		t.Fatal("repeated Read calls reused a Capture or staging Store")
+	}
+	for index, result := range []Result{firstRead, secondRead} {
+		meta := result.OutputMeta()
+		if !strings.Contains(result.UserView().Preview.Text(), "needle") || !strings.Contains(result.UserView().Preview.Text(), "[redacted]") ||
+			strings.Contains(result.UserView().Preview.Text(), factoryCanary) || meta.Artifact == nil || !meta.Artifact.Complete ||
+			captureStores[index].last == nil || captureStores[index].last.commits != 1 || captureStores[index].last.aborts != 0 ||
+			!strings.Contains(string(captureStores[index].last.data), "real Read producer") {
+			t.Fatalf("real Read call %d did not stream and commit through its fresh Capture: result=%#v store=%#v", index, result, captureStores[index])
+		}
+	}
+	if meta := results[4].OutputMeta(); meta.Artifact == nil || captureStores[4].last == nil || captureStores[4].last.commits != 1 || !bashProcess.wasClosed() {
+		t.Fatalf("safe Bash did not publish its captured output through the shared factory: meta=%#v store=%#v", meta, captureStores[4])
+	}
+	if timedOut.ExecutionState() != CancelledAfterStart || timedOut.Status != StatusTimeout || timeoutTool.calls.Load() != 1 {
+		t.Fatalf("candidate timeout/cancel-after-start result = %#v calls=%d", timedOut, timeoutTool.calls.Load())
+	}
+	if _, err := NewReadToolWithResultBoundary(t.TempDir(), nil, capture); err == nil {
+		t.Fatal("Read accepted nil factory")
+	}
+	if _, err := NewGrepToolWithResultBoundary(t.TempDir(), factory, nil); err == nil {
+		t.Fatal("Grep accepted nil capture")
+	}
+	if _, err := NewGlobToolWithResultBoundary(t.TempDir(), nil, nil); err == nil {
+		t.Fatal("Glob accepted missing dependencies")
+	}
+	if _, err := NewWriteToolWithResultFactory(t.TempDir(), nil); err == nil {
+		t.Fatal("Write accepted nil factory")
+	}
+	if _, err := NewEditToolWithResultFactory(t.TempDir(), nil); err == nil {
+		t.Fatal("Edit accepted nil factory")
+	}
+	if _, err := NewLoadSkillToolWithResultFactory(nil); err == nil {
+		t.Fatal("load_skill accepted nil factory")
+	}
+}
+
 func TestResultFactoryProducesThreeSafeViews(t *testing.T) {
 	const (
 		canary      = "result-runtime-canary-8f21"
@@ -105,8 +252,9 @@ func TestResultFactoryProducesThreeSafeViews(t *testing.T) {
 		Summary:          "command failed: " + canary,
 		Preview:          "bounded preview " + canary + " staged at " + privatePath,
 		Artifact:         ref,
+		CapturedBytes:    ref.Bytes,
 		Truncated:        true,
-		TruncationReason: "capture limit reached after " + canary,
+		TruncationReason: string(CaptureTruncatedHardLimit),
 		Error:            &Error{Code: ErrCommandFailed, Message: "failure: " + canary, Recoverable: true},
 	})
 	if err != nil {
@@ -142,6 +290,9 @@ func TestResultFactoryProducesThreeSafeViews(t *testing.T) {
 	if meta.Artifact == nil || meta.Artifact.ID != artifactID || !meta.Truncated {
 		t.Fatalf("output metadata did not preserve the opaque artifact ref: %#v", meta)
 	}
+	if meta.CapturedBytes != 8192 {
+		t.Fatalf("output metadata captured bytes = %d, want 8192", meta.CapturedBytes)
+	}
 	if !strings.Contains(model, artifactID) || !strings.Contains(persisted, artifactID) {
 		t.Fatal("safe model and persisted views must expose the opaque artifact ref")
 	}
@@ -152,7 +303,7 @@ func TestResultFactoryProducesThreeSafeViews(t *testing.T) {
 		t.Fatal("legacy compatibility fields retained unredacted data")
 	}
 
-	if _, err := factory.Build(ResultFactoryInput{State: CancelledBeforeStart}); err == nil {
+	if _, err := factory.Build(ResultFactoryInput{State: CancelledBeforeStart, Status: StatusTimeout}); err == nil {
 		t.Fatal("a call cancelled before start must not produce a Result")
 	}
 }
@@ -441,6 +592,62 @@ func TestCancelBeforeStartHasNoResultOrSideEffect(t *testing.T) {
 	}
 }
 
+func TestLegacyExecutionPreservesTimeoutAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		timeout      time.Duration
+		cancelCaller bool
+	}{
+		{name: "executor timeout", timeout: 20 * time.Millisecond},
+		{name: "caller cancellation", timeout: time.Second, cancelCaller: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := newEmptyRegistry()
+			fixture := newLegacyCancellationTool("LegacyWait")
+			if err := registry.Register(fixture); err != nil {
+				t.Fatal(err)
+			}
+			executor := NewExecutor(registry, t.TempDir(), test.timeout, 1024)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			resultCh := make(chan Result, 1)
+			go func() {
+				resultCh <- executor.Execute(ctx, Call{ID: "legacy-wait", Name: fixture.Name(), ArgumentsJSON: `{}`})
+			}()
+
+			waitForExecutorSignal(t, fixture.started, "legacy tool start")
+			if test.cancelCaller {
+				cancel()
+			}
+			waitForExecutorSignal(t, fixture.canceled, "legacy tool cancellation")
+			var result Result
+			select {
+			case result = <-resultCh:
+			case <-time.After(time.Second):
+				t.Fatal("legacy executor did not return after cancellation")
+			}
+			if result.Status != StatusTimeout || result.Error == nil || result.Error.Code != ErrTimeout || result.Data["timed_out"] != true {
+				t.Fatalf("legacy timeout result changed: %#v", result)
+			}
+			if calls := fixture.calls.Load(); calls != 1 {
+				t.Fatalf("legacy tool executed %d times, want 1", calls)
+			}
+
+			close(fixture.release)
+			waitForExecutorSignal(t, fixture.finished, "legacy tool finish")
+		})
+	}
+}
+
+func waitForExecutorSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
 type registryBoundaryTool struct {
 	name        string
 	description string
@@ -461,6 +668,69 @@ func (*registryBoundaryTool) Execute(context.Context, Input) Result { return Res
 type startBoundaryTool struct {
 	name  string
 	calls atomic.Int32
+}
+
+type cancelAfterStartSafeTool struct {
+	name    string
+	factory *ResultFactory
+	calls   atomic.Int32
+}
+
+type legacyCancellationTool struct {
+	name     string
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+	calls    atomic.Int32
+}
+
+func newLegacyCancellationTool(name string) *legacyCancellationTool {
+	return &legacyCancellationTool{
+		name:     name,
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+}
+
+func (t *legacyCancellationTool) Name() string { return t.name }
+
+func (*legacyCancellationTool) Description() string { return "legacy cancellation boundary fixture" }
+
+func (*legacyCancellationTool) Schema() Schema { return ObjectSchema(nil, nil) }
+
+func (*legacyCancellationTool) Risk() Risk { return RiskDangerous }
+
+func (t *legacyCancellationTool) Execute(ctx context.Context, input Input) Result {
+	t.calls.Add(1)
+	close(t.started)
+	<-ctx.Done()
+	close(t.canceled)
+	<-t.release
+	close(t.finished)
+	return Success(input, "finished after cancellation", "", nil)
+}
+
+func (t *cancelAfterStartSafeTool) Name() string { return t.name }
+
+func (*cancelAfterStartSafeTool) Description() string { return "safe cancellation boundary fixture" }
+
+func (*cancelAfterStartSafeTool) Schema() Schema { return ObjectSchema(nil, nil) }
+
+func (*cancelAfterStartSafeTool) Risk() Risk { return RiskSafe }
+
+func (t *cancelAfterStartSafeTool) UsesSafeResultBoundary() bool { return t != nil && t.factory != nil }
+
+func (t *cancelAfterStartSafeTool) Execute(ctx context.Context, input Input) Result {
+	t.calls.Add(1)
+	<-ctx.Done()
+	result, _ := t.factory.Build(ResultFactoryInput{
+		CallID: input.CallID, Name: input.Name, State: CancelledAfterStart, Status: StatusTimeout,
+		Summary: "fixture cancelled after start", Error: &Error{Code: ErrTimeout, Message: "fixture timed out", Recoverable: true},
+	})
+	return result
 }
 
 func (t *startBoundaryTool) Name() string { return t.name }

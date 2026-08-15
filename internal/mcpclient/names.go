@@ -109,3 +109,20 @@ func shortHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:8]
 }
+
+func validRegisteredToolName(value string) bool {
+	if !strings.HasPrefix(value, registeredPrefix) || len(value) > maxToolNameLen {
+		return false
+	}
+	for _, r := range value {
+		if r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return len(value) > len(registeredPrefix)
+}
+
+func validServerConfigDigest(digest [32]byte) bool {
+	return digest != [32]byte{}
+}

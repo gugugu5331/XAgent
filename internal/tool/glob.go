@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"xagent/internal/artifact"
 	"xagent/internal/budget"
 	"xagent/internal/safefs"
 )
@@ -24,8 +26,10 @@ var (
 )
 
 type GlobTool struct {
-	projectRoot string
-	limits      globLimits
+	projectRoot   string
+	limits        globLimits
+	resultFactory *ResultFactory
+	capture       func(context.Context, artifact.Metadata) (*Capture, error)
 }
 
 type globLimits struct {
@@ -44,10 +48,21 @@ type globState struct {
 	scanErrors    []string
 	truncated     bool
 	reason        string
+	resultFactory *ResultFactory
+	capture       *Capture
+	captureErr    error
+	resultCount   int
 }
 
 func NewGlobTool(projectRoot string) Tool {
 	return &GlobTool{projectRoot: projectRoot, limits: defaultGlobLimits()}
+}
+
+func NewGlobToolWithResultBoundary(projectRoot string, factory *ResultFactory, capture func(context.Context, artifact.Metadata) (*Capture, error)) (Tool, error) {
+	if factory == nil || capture == nil {
+		return nil, errors.New("safe Glob result dependencies are unavailable")
+	}
+	return &GlobTool{projectRoot: projectRoot, limits: defaultGlobLimits(), resultFactory: factory, capture: capture}, nil
 }
 
 func (t *GlobTool) Name() string { return "Glob" }
@@ -58,6 +73,10 @@ func (t *GlobTool) Description() string {
 
 func (t *GlobTool) Risk() Risk { return RiskSafe }
 
+func (t *GlobTool) UsesSafeResultBoundary() bool {
+	return t != nil && t.resultFactory != nil && t.capture != nil
+}
+
 func (t *GlobTool) Schema() Schema {
 	return ObjectSchema([]string{"pattern"}, map[string]SchemaProperty{
 		"pattern": StringProperty("Glob pattern. Relative patterns search the project and active Skill package roots; absolute patterns must stay in one allowed root."),
@@ -65,16 +84,34 @@ func (t *GlobTool) Schema() Schema {
 }
 
 func (t *GlobTool) Execute(ctx context.Context, input Input) Result {
+	return t.executeLegacy(ctx, input)
+}
+
+func (t *GlobTool) failure(input Input, code, message string) Result {
+	if t != nil && t.resultFactory != nil && t.capture != nil {
+		status := StatusError
+		if code == ErrTimeout {
+			status = StatusTimeout
+		}
+		return buildSyntheticResult(t.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: Completed, Status: status, Summary: message, Error: &Error{Code: code, Message: message, Recoverable: true}})
+	}
+	return globFailure(input, code, message)
+}
+
+func (t *GlobTool) executeLegacy(ctx context.Context, input Input) Result {
 	if ctx == nil || ctx.Err() != nil {
+		if t != nil && t.resultFactory != nil && t.capture != nil {
+			return Result{}
+		}
 		return globFailure(input, ErrTimeout, "文件匹配已取消")
 	}
 	pattern, ok := stringArg(input.Arguments, "pattern")
 	if !ok {
-		return Failure(input, ErrInvalidArguments, "pattern 参数不能为空", true)
+		return t.failure(input, ErrInvalidArguments, "pattern 参数不能为空")
 	}
 	scope, err := effectiveReadScope(ctx, t.projectRoot)
 	if err != nil {
-		return globFailure(input, errorCode(err), "文件匹配范围无效")
+		return t.failure(input, errorCode(err), "文件匹配范围无效")
 	}
 	patterns, err := scopedGlobPatterns(scope, pattern)
 	if err != nil {
@@ -82,7 +119,7 @@ func (t *GlobTool) Execute(ctx context.Context, input Input) Result {
 		if errors.Is(err, filepath.ErrBadPattern) {
 			code = ErrInvalidArguments
 		}
-		return globFailure(input, code, "glob pattern 无效")
+		return t.failure(input, code, "glob pattern 无效")
 	}
 
 	limits := t.limits
@@ -103,17 +140,27 @@ func (t *GlobTool) Execute(ctx context.Context, input Input) Result {
 		lines:       limits.results,
 	})
 	if err != nil {
-		return globFailure(input, ErrNotFound, "文件匹配预算无效")
+		return t.failure(input, ErrNotFound, "文件匹配预算无效")
 	}
-	outputCounter, err := newReadCounter(budget.ToolInlineOutputBytes, budget.Bytes, limits.outputBytes)
-	if err != nil {
-		return globFailure(input, ErrNotFound, "文件匹配输出预算无效")
+	var outputCounter *budget.Counter
+	if t.resultFactory == nil || t.capture == nil {
+		outputCounter, err = newReadCounter(budget.ToolInlineOutputBytes, budget.Bytes, limits.outputBytes)
+		if err != nil {
+			return t.failure(input, ErrNotFound, "文件匹配输出预算无效")
+		}
 	}
 	state := &globState{
 		counter:       counter,
 		outputCounter: outputCounter,
 		results:       make([]string, 0, 16),
 		seen:          make(map[string]struct{}),
+	}
+	if t.resultFactory != nil && t.capture != nil {
+		state.resultFactory = t.resultFactory
+		state.capture, err = t.capture(ctx, artifact.Metadata{MediaType: "text/plain"})
+		if err != nil || state.capture == nil {
+			return t.failure(input, ErrCommandFailed, "文件匹配输出采集不可用")
+		}
 	}
 
 	for _, candidate := range patterns {
@@ -294,7 +341,7 @@ func (s *globState) visit(scope ReadScope, pattern scopedGlobPattern, entry safe
 	if _, exists := s.seen[absolute]; exists {
 		return nil
 	}
-	if len(s.results) >= maxGlobResults {
+	if s.count() >= maxGlobResults {
 		s.truncated = true
 		s.reason = "glob.max_results"
 		return errGlobResultLimit
@@ -303,6 +350,21 @@ func (s *globState) visit(scope ReadScope, pattern scopedGlobPattern, entry safe
 		return mapFileScanLimit(err, budget.FilesScanMaxLines)
 	}
 	display := displayReadPath(scope, pattern.root, absolute, pattern.project)
+	if s.capture != nil {
+		if s.resultCount > 0 {
+			if _, err := io.WriteString(s.capture, "\n"); err != nil {
+				s.captureErr = err
+				return errGlobOutputLimit
+			}
+		}
+		if _, err := io.WriteString(s.capture, display); err != nil {
+			s.captureErr = err
+			return errGlobOutputLimit
+		}
+		s.seen[absolute] = struct{}{}
+		s.resultCount++
+		return nil
+	}
 	separator := int64(0)
 	if len(s.results) > 0 {
 		separator = 1
@@ -319,6 +381,13 @@ func (s *globState) visit(scope ReadScope, pattern scopedGlobPattern, entry safe
 	s.seen[absolute] = struct{}{}
 	s.results = append(s.results, display)
 	return nil
+}
+
+func (s *globState) count() int {
+	if s.capture != nil {
+		return s.resultCount
+	}
+	return len(s.results)
 }
 
 func consumeGlobBytes(counter *budget.Counter, amount int64) error {
@@ -355,6 +424,30 @@ func (s *globState) addScanError(display, code string) {
 }
 
 func (s *globState) result(input Input, pattern string, status ResultStatus, resultErr *Error) Result {
+	if s.capture != nil && s.resultFactory != nil {
+		if s.captureErr == nil && (s.truncated || resultErr != nil) {
+			reason := CaptureTruncatedWriteFailure
+			marker := errors.New("glob producer stopped before complete output")
+			if resultErr != nil && resultErr.Code == ErrTimeout {
+				reason = CaptureTruncatedCanceled
+				marker = context.Canceled
+			} else if s.reason != "" && s.reason != "files.scan_errors" {
+				reason = CaptureTruncatedHardLimit
+			}
+			_ = s.capture.MarkIncomplete(marker, reason)
+		}
+		captured, finishErr := s.capture.Finish(context.Background())
+		state := Completed
+		if resultErr != nil && resultErr.Code == ErrTimeout {
+			state = CancelledAfterStart
+			status = StatusTimeout
+		}
+		if s.captureErr != nil || finishErr != nil {
+			status = StatusError
+			resultErr = &Error{Code: ErrCommandFailed, Message: "文件匹配输出未完整采集", Recoverable: true}
+		}
+		return buildCapturedResult(s.resultFactory, ResultFactoryInput{CallID: input.CallID, Name: input.Name, State: state, Status: status, Summary: fmt.Sprintf("Found %d files", s.resultCount), Error: resultErr}, captured, finishErr)
+	}
 	sort.Strings(s.results)
 	snapshot := s.counter.Snapshot()
 	files := append([]string(nil), s.results...)

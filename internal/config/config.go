@@ -52,6 +52,7 @@ type ToolConfig struct {
 }
 
 type ArtifactConfig struct {
+	Root          string
 	MaxFileBytes  int64
 	MaxTotalBytes int64
 	RetentionDays int64

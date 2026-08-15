@@ -5,11 +5,20 @@ import (
 	"encoding/json"
 )
 
-type Tool interface {
+// Definition is the detached, non-executable view exposed by Registry.
+// Callers may inspect and advertise registered tools, but only Executor can
+// recover the private execution target after a ticket has been consumed.
+type Definition interface {
 	Name() string
 	Description() string
 	Schema() Schema
 	Risk() Risk
+}
+
+// Tool is a registration-time implementation. Registry never returns this
+// executable interface through Get or List.
+type Tool interface {
+	Definition
 	Execute(ctx context.Context, input Input) Result
 }
 

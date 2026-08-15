@@ -22,26 +22,19 @@ func TestSystemBlockSelection(t *testing.T) {
 		{
 			name: "ordered wins",
 			req: ChatRequest{
-				System:        []SystemBlock{{Name: "ordered-1", Content: "one"}, {Name: "ordered-2", Content: "two"}},
-				StableSystem:  []SystemBlock{{Content: "stable"}},
-				DynamicSystem: []SystemBlock{{Content: "dynamic"}},
-				SystemPrompt:  "legacy",
+				System:        []SystemBlock{{Name: "ordered-1", Content: safeText("one")}, {Name: "ordered-2", Content: safeText("two")}},
+				StableSystem:  []SystemBlock{{Content: safeText("stable")}},
+				DynamicSystem: []SystemBlock{{Content: safeText("dynamic")}},
 			},
 			want: []string{"one", "two"},
 		},
 		{
 			name: "stable dynamic fallback",
 			req: ChatRequest{
-				StableSystem:  []SystemBlock{{Content: "stable"}},
-				DynamicSystem: []SystemBlock{{Content: "dynamic"}},
-				SystemPrompt:  "legacy",
+				StableSystem:  []SystemBlock{{Content: safeText("stable")}},
+				DynamicSystem: []SystemBlock{{Content: safeText("dynamic")}},
 			},
 			want: []string{"stable", "dynamic"},
-		},
-		{
-			name: "legacy fallback",
-			req:  ChatRequest{SystemPrompt: " legacy "},
-			want: []string{"legacy"},
 		},
 	}
 	for _, tt := range tests {
@@ -49,7 +42,7 @@ func TestSystemBlockSelection(t *testing.T) {
 			blocks := systemBlocks(tt.req)
 			got := make([]string, 0, len(blocks))
 			for _, block := range blocks {
-				got = append(got, block.Content)
+				got = append(got, block.Content.Text())
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("system selection = %#v, want %#v", got, tt.want)
@@ -76,22 +69,21 @@ func TestOpenAIOrderedSystemBlocks(t *testing.T) {
 	defer server.Close()
 
 	localCanary := "/Users/private/project/.xagent/hooks.yaml#7"
-	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, server.Client())
+	provider := NewOpenAI(config.LLMConfig{Model: "test", BaseURL: server.URL, APIKey: "test"}, borrowProviderTestClient(server.Client()), providerTestRuntimeRedactor())
 	stream, err := provider.StreamChat(context.Background(), ChatRequest{
 		System: []SystemBlock{
-			{Name: "fixed", Content: "fixed rules", Cacheable: true},
-			{Name: localCanary, Content: "hook rules"},
-			{Name: "runtime", Content: "runtime reminder"},
+			{Name: "fixed", Content: safeText("fixed rules"), Cacheable: true},
+			{Name: localCanary, Content: safeText("hook rules")},
+			{Name: "runtime", Content: safeText("runtime reminder")},
 		},
-		StableSystem: []SystemBlock{{Content: "LEGACY STABLE CANARY"}},
-		SystemPrompt: "LEGACY PROMPT CANARY",
+		StableSystem: []SystemBlock{{Content: safeText("LEGACY STABLE CANARY")}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for event := range stream {
+	for event := range stream.Events() {
 		if event.Type == StreamEventError {
-			t.Fatal(event.Err)
+			t.Fatal(event.Error)
 		}
 	}
 	messages, ok := requestBody["messages"].([]any)
@@ -119,10 +111,10 @@ func TestAnthropicHookCacheBoundary(t *testing.T) {
 	localCanary := "/Users/private/project/.xagent/hooks.yaml#2"
 	req := ChatRequest{
 		System: []SystemBlock{
-			{Name: "fixed-first", Content: "fixed one", Cacheable: true},
-			{Name: "fixed-last", Content: "fixed two", Cacheable: true},
-			{Name: localCanary, Content: "hook", Cacheable: false},
-			{Name: "fixed-last", Content: "optional duplicate name", Cacheable: true},
+			{Name: "fixed-first", Content: safeText("fixed one"), Cacheable: true},
+			{Name: "fixed-last", Content: safeText("fixed two"), Cacheable: true},
+			{Name: localCanary, Content: safeText("hook"), Cacheable: false},
+			{Name: "fixed-last", Content: safeText("optional duplicate name"), Cacheable: true},
 		},
 		Tools: []ToolDefinition{{Name: "Read", Description: "read"}},
 		Cache: CachePolicy{

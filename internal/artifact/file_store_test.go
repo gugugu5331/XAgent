@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +61,83 @@ func TestStoreRejectsWorkspaceRoot(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal("repeated store close changed the result")
+	}
+}
+
+func TestPrepareFileStoreRootUsesPrivateCanonicalBoundary(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(t.TempDir(), "artifacts")
+	prepared, err := PrepareFileStoreRoot(root, workspace)
+	canonicalParent, canonicalErr := filepath.EvalSymlinks(filepath.Dir(root))
+	want := filepath.Join(canonicalParent, filepath.Base(root))
+	if err != nil || canonicalErr != nil || prepared != want {
+		t.Fatal("prepare safe artifact root failed")
+	}
+	info, err := os.Stat(prepared)
+	if err != nil || !info.IsDir() || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o700) {
+		t.Fatal("prepared artifact root is not a private directory")
+	}
+	if repeated, err := PrepareFileStoreRoot(root, workspace); err != nil || repeated != prepared {
+		t.Fatal("repeated artifact root preparation changed the result")
+	}
+
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(root, 0o755); err != nil {
+			t.Fatal("change artifact root permissions failed")
+		}
+		if prepared, err := PrepareFileStoreRoot(root, workspace); err == nil || prepared != "" {
+			t.Fatal("non-private artifact root was accepted")
+		}
+	}
+	if prepared, err := PrepareFileStoreRoot(filepath.Join(workspace, "artifacts"), workspace); err == nil || prepared != "" {
+		t.Fatal("workspace artifact root was prepared")
+	}
+}
+
+func TestFileStoreUsesVerifiedRootHandleAfterAncestorReplacement(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	slot := filepath.Join(outside, "slot")
+	root := filepath.Join(slot, "artifacts")
+	created, err := NewFileStore(FileStoreOptions{
+		Root: root, WorkspaceRoot: workspace, MaxFileBytes: 64, MaxTotalBytes: 128,
+	})
+	if err != nil {
+		t.Fatal("construct ancestor replacement store failed")
+	}
+	store := created.(*fileStore)
+	t.Cleanup(func() { _ = store.Close() })
+	first, err := store.Begin(context.Background(), Metadata{})
+	if err != nil {
+		t.Fatal("open verified artifact root failed")
+	}
+	if err := first.Abort(); err != nil {
+		t.Fatal("abort root bootstrap writer failed")
+	}
+
+	moved := filepath.Join(outside, "moved-slot")
+	if err := os.Rename(slot, moved); err != nil {
+		t.Fatal("move verified artifact ancestor failed")
+	}
+	if err := os.Symlink(workspace, slot); err != nil {
+		return
+	}
+	writer, err := store.Begin(context.Background(), Metadata{})
+	if err != nil {
+		t.Fatal("verified root handle became path-dependent")
+	}
+	if _, err := writer.Write([]byte("handle-relative")); err != nil {
+		t.Fatal("write through verified root handle failed")
+	}
+	ref, err := writer.Commit(context.Background())
+	if err != nil || !ref.Available {
+		t.Fatal("commit through verified root handle failed")
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts")); !os.IsNotExist(err) {
+		t.Fatal("ancestor replacement redirected artifact data into workspace")
+	}
+	if _, err := os.Stat(filepath.Join(moved, "artifacts", ref.ID+".artifact")); err != nil {
+		t.Fatal("artifact did not remain under the verified directory handle")
 	}
 }
 
@@ -228,12 +306,12 @@ func TestCleanupHonorsRetentionCapacityAndActiveWriters(t *testing.T) {
 	if err := reader.Close(); err != nil {
 		t.Fatal("close retained artifact failed")
 	}
-	if _, err := os.Stat(activeWriter.stagingPath); err != nil {
+	activePath := filepath.Join(store.root, activeWriter.stagingName)
+	if _, err := os.Stat(activePath); err != nil {
 		t.Fatal("cleanup removed an active writer")
 	}
 
 	retainedPath := filepath.Join(store.root, newestRetained.ID+".artifact")
-	activePath := activeWriter.stagingPath
 	if err := store.Close(); err != nil {
 		t.Fatal("artifact store close failed")
 	}

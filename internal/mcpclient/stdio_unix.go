@@ -2,18 +2,4 @@
 
 package mcpclient
 
-import (
-	"os/exec"
-	"syscall"
-)
-
-func configureProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-func terminateProcessGroup(cmd *exec.Cmd) {
-	if cmd.Process == nil {
-		return
-	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-}
+// Deprecated M5 deletion candidate retained without platform dependencies.

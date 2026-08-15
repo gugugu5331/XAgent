@@ -1,19 +1,4 @@
 package mcpclient
 
-import "context"
-
-type ClosableHTTPTransport struct {
-	*HTTPTransport
-}
-
-func NewClosableHTTPTransport(config HTTPConfig) (*ClosableHTTPTransport, error) {
-	transport, err := NewHTTPTransport(config)
-	if err != nil {
-		return nil, err
-	}
-	return &ClosableHTTPTransport{HTTPTransport: transport}, nil
-}
-
-func (t *ClosableHTTPTransport) Close(ctx context.Context) error {
-	return nil
-}
+// Deprecated M5 deletion candidate. HTTP cleanup is owned by the guarded
+// transport and has no dependency on this path.
