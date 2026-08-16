@@ -64,6 +64,11 @@ func TestManagerCompletionIsSingleProjectionSource(t *testing.T) {
 		StopReason:       StopMaxIterations,
 		Usage:            Usage{InputTokens: 11, OutputTokens: 7, CacheCreationInputTokens: 3, CacheReadInputTokens: 2},
 		Error:            SafeError(ErrLimitReached, redactor.Redact("iteration limit"), true),
+		Workspace: WorkspaceSummary{
+			WorkspaceID: strings.Repeat("a", 32), Isolation: "worktree", State: "retained",
+			BaseOID: strings.Repeat("b", 40), Branch: "xagent/worktree/" + strings.Repeat("a", 32),
+			Dirty: true, Cleanup: "retained", RetentionCause: "dirty_worktree",
+		},
 	}
 	factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
 		return &managerTestPreparedTask{run: func(context.Context, EventSink) Completion {
@@ -96,6 +101,9 @@ func TestManagerCompletionIsSingleProjectionSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	notification := inbox.waitPublished(t)
+	if notification.Workspace != want.Workspace {
+		t.Fatalf("notification workspace diverged from settled completion: got %#v want %#v", notification.Workspace, want.Workspace)
+	}
 
 	assertManagerCompletionProjection(t, completion, detail.Task, *terminal.Completion, notification)
 	if terminal.Snapshot == nil || terminal.Snapshot.Revision != terminal.Revision || notification.CompletionRevision != terminal.Revision || notification.CompletionSequence != terminal.Sequence {

@@ -144,7 +144,10 @@ func TestT35ParallelRoleModelsAndHookSessionsStayTaskLocal(t *testing.T) {
 	completions := make(chan subagent.Completion, 2)
 	for _, task := range []subagent.PreparedTask{fast, quality} {
 		task := task
-		go func() { completions <- task.Run(context.Background(), func(subagent.AgentEvent) error { return nil }) }()
+		go func() {
+			result := task.Run(context.Background(), func(subagent.AgentEvent) error { return nil })
+			completions <- task.Settle(context.Background(), result)
+		}()
 	}
 	for range 2 {
 		completion := <-completions

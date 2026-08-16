@@ -1,6 +1,7 @@
 package subagent
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,7 @@ func TestTransitionMatrixMatchesTaskLifecycle(t *testing.T) {
 		StatusQueued,
 		StatusRunning,
 		StatusWaitingConfirmation,
+		StatusSettling,
 		StatusCompleted,
 		StatusFailed,
 		StatusCancelled,
@@ -76,17 +78,25 @@ func TestTransitionMatrixMatchesTaskLifecycle(t *testing.T) {
 	allowed := map[[2]Status]bool{
 		{StatusQueued, StatusRunning}:                   true,
 		{StatusQueued, StatusCancelled}:                 true,
+		{StatusQueued, StatusSettling}:                  true,
 		{StatusRunning, StatusWaitingConfirmation}:      true,
+		{StatusRunning, StatusSettling}:                 true,
 		{StatusRunning, StatusCompleted}:                true,
 		{StatusRunning, StatusFailed}:                   true,
 		{StatusRunning, StatusCancelled}:                true,
 		{StatusRunning, StatusTimedOut}:                 true,
 		{StatusRunning, StatusLimitReached}:             true,
 		{StatusWaitingConfirmation, StatusRunning}:      true,
+		{StatusWaitingConfirmation, StatusSettling}:     true,
 		{StatusWaitingConfirmation, StatusFailed}:       true,
 		{StatusWaitingConfirmation, StatusCancelled}:    true,
 		{StatusWaitingConfirmation, StatusTimedOut}:     true,
 		{StatusWaitingConfirmation, StatusLimitReached}: true,
+		{StatusSettling, StatusCompleted}:               true,
+		{StatusSettling, StatusFailed}:                  true,
+		{StatusSettling, StatusCancelled}:               true,
+		{StatusSettling, StatusTimedOut}:                true,
+		{StatusSettling, StatusLimitReached}:            true,
 	}
 	for _, from := range statuses {
 		for _, to := range statuses {
@@ -108,6 +118,94 @@ func TestTransitionMatrixMatchesTaskLifecycle(t *testing.T) {
 		if got := IsTerminal(status); got != wantTerminal {
 			t.Errorf("IsTerminal(%q)=%t, want %t", status, got, wantTerminal)
 		}
+	}
+}
+
+func TestWorkspaceSummaryValidatesIsolationBoundary(t *testing.T) {
+	workspaceID := strings.Repeat("a", 32)
+	baseOID := strings.Repeat("b", 40)
+	branch := "xagent/worktree/" + workspaceID
+	valid := []WorkspaceSummary{
+		{},
+		{
+			Isolation:   "worktree",
+			WorkspaceID: workspaceID,
+			BaseOID:     baseOID,
+			Branch:      branch,
+			State:       "deleted",
+			Cleanup:     "deleted",
+		},
+		{
+			Isolation:      "worktree",
+			WorkspaceID:    workspaceID,
+			BaseOID:        strings.Repeat("c", 64),
+			Branch:         branch,
+			State:          "retained",
+			Cleanup:        "retained",
+			RetentionCause: "dirty_worktree",
+			Dirty:          true,
+		},
+	}
+	for _, summary := range valid {
+		if err := summary.Validate(); err != nil {
+			t.Errorf("valid workspace summary rejected: %v", err)
+		}
+	}
+
+	invalid := []WorkspaceSummary{
+		{Isolation: "shared"},
+		{Isolation: "worktree", BaseOID: baseOID, Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, State: "deleted"},
+		{Isolation: "worktree", WorkspaceID: "/Users/private/repo", BaseOID: baseOID, Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: strings.Repeat("A", 32), BaseOID: baseOID, Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: "/Users/private/repo", Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: strings.Repeat("g", 40), Branch: branch, State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: "/Users/private/repo", State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: "xagent/worktree/" + strings.Repeat("c", 32), State: "deleted", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, State: "active", Cleanup: "deleted"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, State: "deleted", Cleanup: "future"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, State: "retained", Cleanup: "retained", RetentionCause: "/Users/private/repo"},
+		{Isolation: "worktree", WorkspaceID: workspaceID, BaseOID: baseOID, Branch: branch, State: "retained", Cleanup: "retained", RetentionCause: strings.Repeat("a", 65)},
+	}
+	for _, summary := range invalid {
+		if err := summary.Validate(); err == nil {
+			t.Fatalf("invalid workspace summary accepted: %#v", summary)
+		}
+	}
+}
+
+func TestRunResultAndWorkspaceSummaryCloneDetachErrors(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	run := RunResult{Status: StatusFailed, Error: SafeError(ErrInternal, redactor.Redact("run failed"), false)}
+	runClone := run.Clone()
+	run.Error.Code = "mutated"
+	if runClone.Error == run.Error || runClone.Error.Code != string(ErrInternal) {
+		t.Fatalf("run result clone aliased error: %#v", runClone)
+	}
+
+	workspace := WorkspaceSummary{
+		Isolation: "worktree", WorkspaceID: "workspace-1", BaseOID: "oid", Branch: "branch",
+		State: "partial", Cleanup: "partial", Error: SafeError(ErrInternal, redactor.Redact("settle failed"), false),
+	}
+	workspaceClone := workspace.Clone()
+	workspace.Error.Code = "mutated"
+	if workspaceClone.Error == workspace.Error || workspaceClone.Error.Code != string(ErrInternal) {
+		t.Fatalf("workspace summary clone aliased error: %#v", workspaceClone)
+	}
+}
+
+func TestResultNotificationCloneDetachesWorkspaceSummary(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	notification := ResultNotification{Workspace: WorkspaceSummary{
+		Error: SafeError(ErrInternal, redactor.Redact("settlement failed"), false),
+	}}
+	cloned := notification.Clone()
+	notification.Workspace.Error.Code = "mutated"
+	if cloned.Workspace.Error == notification.Workspace.Error || cloned.Workspace.Error.Code != string(ErrInternal) {
+		t.Fatalf("result notification clone aliased workspace: %#v", cloned)
 	}
 }
 
@@ -256,6 +354,7 @@ func TestTypeEventValidateOneOfUsesStrictKindPayloadMapping(t *testing.T) {
 		{Kind: EventQueued, Snapshot: snapshot},
 		{Kind: EventRunning, Snapshot: snapshot},
 		{Kind: EventWaitingConfirmation, Snapshot: snapshot},
+		{Kind: EventSettling, Snapshot: snapshot},
 		{Kind: EventIterationStarted, Snapshot: snapshot},
 		{Kind: EventProgress, Snapshot: snapshot},
 		{Kind: EventTextDelta, Agent: agent},

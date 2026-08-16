@@ -13,6 +13,7 @@ import (
 	"xagent/internal/events"
 	"xagent/internal/memory"
 	"xagent/internal/redact"
+	"xagent/internal/subagent"
 	"xagent/internal/tui"
 )
 
@@ -344,6 +345,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskSubscribedMsg:
 		return m, m.handleTaskSubscribed(message)
 	case taskEventMsg:
+		if diagnostic, reject := m.rejectTaskEventProjection(message); reject {
+			m.publishTaskStreamError(subagent.SafeError(
+				subagent.ErrInvalidTransition,
+				redact.NewRuntimeRedactor().Redact(diagnostic),
+				false,
+			))
+			m.taskEventCursor = message.event.Revision
+			return m, waitTaskEvent(message.state, message.epoch, message.events)
+		}
 		return m, m.handleTaskEvent(message)
 	case taskEventStreamClosedMsg:
 		return m, m.handleTaskEventStreamClosed(message)
@@ -569,6 +579,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input.Text, cmd = m.input.Text.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) rejectTaskEventProjection(message taskEventMsg) (string, bool) {
+	if m == nil || message.state == nil || !message.state.accepts(message.epoch) {
+		return "", false
+	}
+	event := message.event
+	if event.Kind == subagent.EventGap || event.Revision == 0 || event.Revision <= m.taskEventCursor ||
+		event.Sequence == 0 || event.TaskID == "" || event.ValidateOneOf() != nil || !validTaskEventPayload(event) {
+		return "", false
+	}
+	if workspace, present := taskEventWorkspace(event); present {
+		if _, valid := projectTaskWorkspace(workspace); !valid {
+			return "任务工作区状态无效", true
+		}
+	}
+	next, changesStatus := taskEventProjectedStatus(event)
+	if !changesStatus {
+		return "", false
+	}
+	current, found := m.currentProjectedTaskStatus(event.TaskID)
+	if !found || current == next || subagent.CanTransition(current, next) {
+		return "", false
+	}
+	return "任务状态事件顺序无效", true
+}
+
+func taskEventProjectedStatus(event subagent.Event) (subagent.Status, bool) {
+	if event.Result != nil {
+		return event.Result.Status, true
+	}
+	if event.Snapshot != nil {
+		return event.Snapshot.Status, true
+	}
+	return "", false
+}
+
+func (m *Model) currentProjectedTaskStatus(taskID subagent.ID) (subagent.Status, bool) {
+	var (
+		status   subagent.Status
+		revision uint64
+		found    bool
+	)
+	for _, task := range m.taskListView.Tasks() {
+		candidate := subagent.Status(task.Status())
+		if task.ID() == string(taskID) && candidate.Valid() && (!found || task.Revision() >= revision) {
+			status, revision, found = candidate, task.Revision(), true
+		}
+	}
+	detail := m.taskDetailView.Task()
+	candidate := subagent.Status(detail.Status())
+	if detail.ID() == string(taskID) && candidate.Valid() && (!found || detail.Revision() >= revision) {
+		status, found = candidate, true
+	}
+	return status, found
 }
 
 func (m *Model) trackTransientID(independentID string) {

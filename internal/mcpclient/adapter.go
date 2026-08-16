@@ -37,6 +37,7 @@ type RemoteToolAdapterOptions struct {
 	Schema             tool.Schema
 	ServerConfigDigest [32]byte
 	RemoteAnnotations  json.RawMessage
+	Workspace          tool.WorkspacePolicy
 	Caller             ToolCaller
 	ResultFactory      *tool.ResultFactory
 	Capture            func(context.Context, artifact.Metadata) (*tool.Capture, error)
@@ -54,6 +55,7 @@ type ToolAdapter struct {
 
 	serverConfigDigest [32]byte
 	remoteAnnotations  json.RawMessage
+	workspace          tool.WorkspacePolicy
 	boundToServer      bool
 	legacy             bool
 }
@@ -103,6 +105,7 @@ func newRemoteToolAdapter(options RemoteToolAdapterOptions, legacy bool) (ToolAd
 		capture:            options.Capture,
 		serverConfigDigest: options.ServerConfigDigest,
 		remoteAnnotations:  append(json.RawMessage(nil), options.RemoteAnnotations...),
+		workspace:          options.Workspace,
 		boundToServer:      true,
 		legacy:             legacy,
 	}, nil
@@ -114,6 +117,7 @@ func newRemoteToolAdapter(options RemoteToolAdapterOptions, legacy bool) (ToolAd
 func (a ToolAdapter) RegistrationOptions() tool.RegistrationOptions {
 	options := tool.RegistrationOptions{
 		Policy:            tool.ExecutionPolicy{},
+		Workspace:         a.workspace,
 		RemoteAnnotations: append(json.RawMessage(nil), a.remoteAnnotations...),
 	}
 	if a.boundToServer {

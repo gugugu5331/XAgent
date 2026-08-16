@@ -364,7 +364,7 @@ func TestExecuteValidatedAuthorizedPreservesArgumentsAndTicket(t *testing.T) {
 	}
 	executor := NewExecutor(registry, t.TempDir(), time.Second, 1024)
 	call := Call{ID: "call-1", Name: "Recorder", ArgumentsJSON: `{"large":9007199254740993,"decimal":1.25}`}
-	validated, err := registry.ValidateCall(call)
+	validated, err := executor.PrepareCall(context.Background(), call)
 	if err != nil {
 		t.Fatal(err)
 	}

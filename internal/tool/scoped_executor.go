@@ -79,6 +79,9 @@ func (e *ScopedExecutor) ExecuteValidatedAuthorized(
 		return Result{}
 	}
 	call := validated.Call
+	if !e.base.ownsValidatedCall(validated) {
+		return e.filtered(call, FilterUnknown)
+	}
 	current, err := e.currentCapabilities()
 	if err != nil {
 		return e.filtered(call, FilterUnknown)

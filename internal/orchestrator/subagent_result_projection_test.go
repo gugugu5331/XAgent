@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,6 +65,46 @@ func TestResultProjectorAcksOnlyAfterProviderAcceptsRequest(t *testing.T) {
 	}
 	if len(base.Messages) != 1 {
 		t.Fatal("projection mutated the caller request")
+	}
+}
+
+func TestWorkspaceSummaryProviderResultProjectionIsStableAndPathFree(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	owner := subagent.ParentRef{ConversationID: "conversation-workspace", ExecutionID: "execution-workspace", RequestGeneration: 7}
+	notification := completedResultNotification(redactor, owner, "task-workspace", 11, "settled")
+	workspaceID := strings.Repeat("e", 32)
+	notification.Workspace = subagent.WorkspaceSummary{
+		WorkspaceID: workspaceID, Isolation: "worktree", State: "retained",
+		BaseOID: strings.Repeat("f", 40), Branch: "xagent/worktree/" + workspaceID,
+		Dirty: true, Cleanup: "retained", RetentionCause: "dirty_worktree",
+		Error: subagent.SafeError(subagent.ErrInternal, redactor.Redact("/private/worktree/root"), false),
+	}
+	payload, err := subagent.MarshalResultMessage(notification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &recordingResultClaimService{claim: subagent.ResultClaim{
+		ClaimID: "claim-workspace", Owner: owner, SerializedBytes: int64(len(payload)),
+		Notifications: []subagent.ResultNotification{notification},
+	}}
+	projector := mustResultProjector(t, service, redactor, 100_000)
+	var projected provider.ChatRequest
+	stream := &projectionTestStream{events: make(chan provider.StreamEvent)}
+	base := provider.ChatRequest{Model: "model", Messages: []provider.ModelMessage{{
+		Role: provider.ModelMessageRoleUser, Content: redactor.Redact("continue"),
+	}}}
+	_, err = projector.StreamChat(context.Background(), owner, base, func(_ context.Context, request provider.ChatRequest) (provider.ChatStream, error) {
+		projected = request
+		return stream, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Messages) != 2 || projected.Messages[1].Content.Text() != string(payload) {
+		t.Fatalf("provider workspace projection diverged: %#v", projected.Messages)
+	}
+	if !strings.Contains(string(payload), workspaceID) || strings.Contains(string(payload), "/private/worktree/root") {
+		t.Fatalf("provider workspace projection is not stable and path-free: %s", payload)
 	}
 }
 

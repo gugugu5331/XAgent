@@ -64,6 +64,9 @@ type Manager struct {
 	running    int
 	tombstones map[ID]taskTombstone
 	usedIDs    map[string]struct{}
+	// admissionCleanup retains the sole PreparedTask ownership reference when
+	// admission settlement cannot prove cleanup completed.
+	admissionCleanup map[ID]*admissionCleanupRecord
 
 	runWG        sync.WaitGroup
 	shutdownOnce sync.Once
@@ -95,11 +98,21 @@ type managedTask struct {
 	runningSlot          bool
 	durationTimer        *time.Timer
 	firstRequestObserved bool
+	settlementStarted    bool
+	forcedRunResult      *RunResult
 }
 
 type taskTombstone struct {
 	id        ID
 	evictedAt time.Time
+}
+
+type admissionCleanupRecord struct {
+	id       ID
+	parent   ParentRef
+	prepared PreparedTask
+	result   RunResult
+	settled  bool
 }
 
 // NewManager constructs an isolated task lifecycle. Task contexts derive from
@@ -126,21 +139,22 @@ func NewManager(options ManagerOptions) (Service, error) {
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancelCause(context.Background())
 	return &Manager{
-		runner:          options.Runner,
-		limits:          options.Limits,
-		inbox:           options.Inbox,
-		redactor:        options.Redactor,
-		clock:           options.Clock,
-		idGenerator:     options.IDGenerator,
-		shutdownTimeout: options.ShutdownTimeout,
-		hub:             hub,
-		lifecycleCtx:    lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		accepting:       true,
-		tasks:           make(map[ID]*managedTask),
-		tombstones:      make(map[ID]taskTombstone),
-		usedIDs:         make(map[string]struct{}),
-		shutdownDone:    make(chan struct{}),
+		runner:           options.Runner,
+		limits:           options.Limits,
+		inbox:            options.Inbox,
+		redactor:         options.Redactor,
+		clock:            options.Clock,
+		idGenerator:      options.IDGenerator,
+		shutdownTimeout:  options.ShutdownTimeout,
+		hub:              hub,
+		lifecycleCtx:     lifecycleCtx,
+		lifecycleCancel:  lifecycleCancel,
+		accepting:        true,
+		tasks:            make(map[ID]*managedTask),
+		tombstones:       make(map[ID]taskTombstone),
+		usedIDs:          make(map[string]struct{}),
+		admissionCleanup: make(map[ID]*admissionCleanupRecord),
+		shutdownDone:     make(chan struct{}),
 	}, nil
 }
 
@@ -182,7 +196,13 @@ func (manager *Manager) Submit(ctx context.Context, input SubmitInput) (Submissi
 
 	prepared, prepareErr := manager.prepareTask(ctx, id, normalized)
 	if prepareErr != nil || prepared == nil {
-		_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		if prepared != nil {
+			if cleanupErr := manager.settleAdmissionFailure(ctx, id, normalized.Parent, prepared, manager.admissionFailedRunResult()); cleanupErr != nil {
+				return Submission{}, cleanupErr
+			}
+		} else {
+			_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		}
 		if prepareErr == nil {
 			prepareErr = manager.error(ErrInternal, "subagent preparation returned no task", false)
 		}
@@ -190,7 +210,9 @@ func (manager *Manager) Submit(ctx context.Context, input SubmitInput) (Submissi
 	}
 	metadata, metadataErr := manager.preparedMetadata(prepared, normalized)
 	if metadataErr != nil {
-		_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		if cleanupErr := manager.settleAdmissionFailure(ctx, id, normalized.Parent, prepared, manager.admissionFailedRunResult()); cleanupErr != nil {
+			return Submission{}, cleanupErr
+		}
 		return Submission{}, metadataErr
 	}
 
@@ -227,7 +249,9 @@ func (manager *Manager) Submit(ctx context.Context, input SubmitInput) (Submissi
 	}
 	if err := manager.installFirstRequestObserver(prepared, id); err != nil {
 		taskCancel(err)
-		_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		if cleanupErr := manager.settleAdmissionFailure(ctx, id, normalized.Parent, prepared, manager.admissionFailedRunResult()); cleanupErr != nil {
+			return Submission{}, cleanupErr
+		}
 		return Submission{}, err
 	}
 
@@ -235,14 +259,18 @@ func (manager *Manager) Submit(ctx context.Context, input SubmitInput) (Submissi
 	if !manager.accepting {
 		manager.mu.Unlock()
 		taskCancel(manager.error(ErrShutdown, "subagent admission is closed", false))
-		_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		if cleanupErr := manager.settleAdmissionFailure(ctx, id, normalized.Parent, prepared, manager.admissionCanceledRunResult()); cleanupErr != nil {
+			return Submission{}, cleanupErr
+		}
 		return Submission{}, manager.error(ErrShutdown, "subagent admission is closed", false)
 	}
 	queued, publishErr := manager.publishSnapshotLocked(record, EventQueued)
 	if publishErr != nil {
 		manager.mu.Unlock()
 		taskCancel(publishErr)
-		_ = manager.inbox.ReleaseReservation(context.Background(), id, normalized.Parent)
+		if cleanupErr := manager.settleAdmissionFailure(ctx, id, normalized.Parent, prepared, manager.admissionFailedRunResult()); cleanupErr != nil {
+			return Submission{}, cleanupErr
+		}
 		return Submission{}, manager.externalError(publishErr, ErrInternal, "subagent registration failed", false)
 	}
 	manager.tasks[id] = record
@@ -706,6 +734,7 @@ func (manager *Manager) publishResultLocked(record *managedTask) {
 			StopReason:         completion.StopReason,
 			Usage:              completion.Usage,
 			Error:              cloneSafeError(completion.Error),
+			Workspace:          completion.Workspace.Clone(),
 		}
 	}
 	notification := record.pendingNotification.Clone()
@@ -889,6 +918,85 @@ func (manager *Manager) prepareTask(ctx context.Context, id ID, input SubmitInpu
 		}
 	}()
 	return manager.runner.Prepare(ctx, id, input)
+}
+
+func (manager *Manager) settleAdmissionFailure(
+	_ context.Context,
+	id ID,
+	parent ParentRef,
+	prepared PreparedTask,
+	result RunResult,
+) error {
+	cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), manager.shutdownTimeout)
+	defer cancelCleanup()
+	record := &admissionCleanupRecord{
+		id: id, parent: parent, prepared: prepared, result: result.Clone(),
+	}
+	if manager.tryAdmissionCleanup(cleanupContext, record) {
+		return nil
+	}
+
+	manager.mu.Lock()
+	manager.admissionCleanup[id] = record
+	manager.runWG.Add(1)
+	manager.mu.Unlock()
+	go manager.recoverAdmissionCleanup(record)
+	return manager.error(ErrInternal, "subagent admission cleanup failed", false)
+}
+
+func (manager *Manager) recoverAdmissionCleanup(record *admissionCleanupRecord) {
+	if manager == nil || record == nil {
+		return
+	}
+	cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), manager.shutdownTimeout)
+	defer cancelCleanup()
+	if !manager.tryAdmissionCleanup(cleanupContext, record) {
+		// Leave the quarantine entry and runWG ownership outstanding. Shutdown
+		// then fails closed through its existing bounded wait instead of reporting
+		// success while this PreparedTask may still own a workspace.
+		return
+	}
+	manager.mu.Lock()
+	if manager.admissionCleanup[record.id] == record {
+		delete(manager.admissionCleanup, record.id)
+	}
+	manager.mu.Unlock()
+	manager.runWG.Done()
+}
+
+func (manager *Manager) tryAdmissionCleanup(ctx context.Context, record *admissionCleanupRecord) bool {
+	if manager == nil || record == nil || record.prepared == nil {
+		return false
+	}
+	if !record.settled {
+		completion, panicked := settlePreparedTask(record.prepared, ctx, record.result)
+		if panicked || !validAdmissionCleanupCompletion(record.id, record.result, completion) {
+			return false
+		}
+		record.settled = true
+	}
+	return manager.inbox.ReleaseReservation(context.Background(), record.id, record.parent) == nil
+}
+
+func validAdmissionCleanupCompletion(id ID, result RunResult, completion Completion) bool {
+	return completion.ID == id && completion.Status == result.Status && completion.StopReason == result.StopReason &&
+		completion.Validate() == nil
+}
+
+func (manager *Manager) admissionFailedRunResult() RunResult {
+	message := manager.redactor.Redact("subagent admission failed")
+	return RunResult{
+		Status: StatusFailed, StopReason: StopInternalError, Summary: message,
+		Error: SafeError(ErrInternal, message, false),
+	}
+}
+
+func (manager *Manager) admissionCanceledRunResult() RunResult {
+	message := manager.redactor.Redact("subagent admission stopped because the application closed")
+	return RunResult{
+		Status: StatusCancelled, StopReason: StopApplicationClosed, Summary: message,
+		Error: SafeError(ErrCancelled, message, true),
+	}
 }
 
 func (manager *Manager) installFirstRequestObserver(prepared PreparedTask, id ID) (err error) {

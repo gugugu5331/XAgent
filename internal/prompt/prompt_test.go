@@ -6,6 +6,47 @@ import (
 	"testing"
 )
 
+func TestPromptBlocksCarryExplicitScopes(t *testing.T) {
+	bundle := Build(BuildRequest{
+		Mode:         RunModeDo,
+		Iteration:    1,
+		ProjectRoot:  "/repo",
+		SkillCatalog: "catalog",
+		ActiveSkills: "active",
+		OptionalStableSections: []Section{
+			{Name: "user", Priority: 100, Content: "user rules", Stable: true, Scope: ScopeUser},
+			{Name: "project", Priority: 110, Content: "project rules", Stable: true, Scope: ScopeProject},
+		},
+	})
+	for _, block := range bundle.StableBlocks[:7] {
+		if block.Scope != ScopeGlobal {
+			t.Fatalf("fixed block %q scope = %q, want %q", block.Name, block.Scope, ScopeGlobal)
+		}
+	}
+	if got := bundle.StableBlocks[7].Scope; got != ScopeUser {
+		t.Fatalf("user section scope = %q", got)
+	}
+	if got := bundle.StableBlocks[8].Scope; got != ScopeProject {
+		t.Fatalf("project section scope = %q", got)
+	}
+	if got := bundle.StableBlocks[9].Scope; got != ScopeProject {
+		t.Fatalf("skill catalog scope = %q", got)
+	}
+	for _, block := range bundle.DynamicBlocks {
+		if block.Scope != ScopeRuntime {
+			t.Fatalf("dynamic block %q scope = %q, want %q", block.Name, block.Scope, ScopeRuntime)
+		}
+	}
+	for _, scope := range []Scope{ScopeGlobal, ScopeUser, ScopeProject, ScopeRuntime} {
+		if !scope.Valid() {
+			t.Fatalf("declared scope %q is invalid", scope)
+		}
+	}
+	if Scope("").Valid() || Scope("future").Valid() {
+		t.Fatal("missing or unknown prompt scope validated")
+	}
+}
+
 func TestStableSectionsOrderAndCoreContent(t *testing.T) {
 	bundle := Build(BuildRequest{})
 	names := make([]string, 0, len(bundle.StableBlocks))
@@ -29,11 +70,11 @@ func TestStableSectionsOrderAndCoreContent(t *testing.T) {
 
 func TestOptionalStableSectionsAreDeterministic(t *testing.T) {
 	optional := []Section{
-		{Name: "beta", Priority: 100, Content: "B", Stable: true},
-		{Name: "alpha", Priority: 100, Content: "A", Stable: true},
-		{Name: "ignored-dynamic", Priority: 90, Content: "D", Stable: false},
-		{Name: "empty", Priority: 80, Content: "   ", Stable: true},
-		{Name: "alpha", Priority: 10, Content: "duplicate", Stable: true},
+		{Name: "beta", Priority: 100, Content: "B", Stable: true, Scope: ScopeProject},
+		{Name: "alpha", Priority: 100, Content: "A", Stable: true, Scope: ScopeProject},
+		{Name: "ignored-dynamic", Priority: 90, Content: "D", Stable: false, Scope: ScopeRuntime},
+		{Name: "empty", Priority: 80, Content: "   ", Stable: true, Scope: ScopeProject},
+		{Name: "alpha", Priority: 10, Content: "duplicate", Stable: true, Scope: ScopeProject},
 	}
 	first := Build(BuildRequest{OptionalStableSections: optional})
 	second := Build(BuildRequest{OptionalStableSections: optional})
@@ -131,7 +172,7 @@ func TestSkillBlockOrdering(t *testing.T) {
 			SkillCatalog: catalog,
 			ActiveSkills: active,
 			OptionalStableSections: []Section{{
-				Name: "project-instructions", Priority: 100, Content: "project rules", Stable: true,
+				Name: "project-instructions", Priority: 100, Content: "project rules", Stable: true, Scope: ScopeProject,
 			}},
 		})
 		catalogBlock, catalogIndex := findBlock(bundle.StableBlocks, SkillCatalogBlockName)
@@ -179,11 +220,11 @@ func TestHookBlockOrder(t *testing.T) {
 		Mode:         RunModePlan,
 		Iteration:    1,
 		ProjectRoot:  "/repo",
-		HookBlocks:   []Block{{Name: "/repo/.xagent/hooks.yaml#1", Content: "HOOK ONE", Stable: true}, {Name: "user-hook#2", Content: "HOOK TWO"}},
+		HookBlocks:   []Block{{Name: "/repo/.xagent/hooks.yaml#1", Content: "HOOK ONE", Stable: true, Scope: ScopeProject}, {Name: "user-hook#2", Content: "HOOK TWO", Scope: ScopeUser}},
 		SkillCatalog: "SKILL CATALOG",
 		ActiveSkills: "ACTIVE SOP",
 		OptionalStableSections: []Section{{
-			Name: "project-instructions", Priority: 100, Content: "PROJECT RULES", Stable: true,
+			Name: "project-instructions", Priority: 100, Content: "PROJECT RULES", Stable: true, Scope: ScopeProject,
 		}},
 	})
 	if !bundle.UsesOrderedBlocks() {
@@ -228,7 +269,7 @@ func TestLegacyPromptUnchanged(t *testing.T) {
 		SkillCatalog: "catalog",
 		ActiveSkills: "active",
 		OptionalStableSections: []Section{{
-			Name: "project", Priority: 100, Content: "project rules", Stable: true,
+			Name: "project", Priority: 100, Content: "project rules", Stable: true, Scope: ScopeProject,
 		}},
 	}
 	baseline := Build(req)
@@ -236,7 +277,7 @@ func TestLegacyPromptUnchanged(t *testing.T) {
 		Mode:                   req.Mode,
 		Iteration:              req.Iteration,
 		ProjectRoot:            req.ProjectRoot,
-		HookBlocks:             []Block{{Name: "ignored", Content: "  ", Stable: true}},
+		HookBlocks:             []Block{{Name: "ignored", Content: "  ", Stable: true, Scope: ScopeProject}},
 		SkillCatalog:           req.SkillCatalog,
 		ActiveSkills:           req.ActiveSkills,
 		OptionalStableSections: req.OptionalStableSections,

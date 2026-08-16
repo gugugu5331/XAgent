@@ -32,6 +32,12 @@ type CommandRunner interface {
 	Run(context.Context, CommandRequest) (CommandResult, error)
 }
 
+type disabledWorkspaceCommandRunner struct{}
+
+func (disabledWorkspaceCommandRunner) Run(context.Context, CommandRequest) (CommandResult, error) {
+	return CommandResult{}, fmt.Errorf("workspace command runtime is unavailable")
+}
+
 // ShellCommandRunner owns only the narrow capabilities required to start one
 // protected Hook command. Plans are created by the assembly-owned factory and
 // are handed directly to the shared proctree Runner; Hook rules cannot create,
@@ -43,6 +49,7 @@ type ShellCommandRunner struct {
 	Plans            proctree.ProtectionPlanFactory
 	WorkingDirectory *safefs.Root
 	ProjectRoot      string
+	WorkspaceBound   bool
 	JoinGrace        time.Duration
 }
 
@@ -156,7 +163,10 @@ func (r *ShellCommandRunner) validRuntime(requestRoot string) bool {
 	}
 	expected := stringsCleanAbsolutePath(r.ProjectRoot)
 	actual := stringsCleanAbsolutePath(requestRoot)
-	return expected != "" && actual == expected
+	if expected == "" || actual != expected {
+		return false
+	}
+	return !r.WorkspaceBound || liveWorkspaceIdentity(expected, r.WorkingDirectory.Identity())
 }
 
 func stringsCleanAbsolutePath(value string) string {

@@ -4,13 +4,379 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"xagent/internal/events"
 	"xagent/internal/redact"
 )
+
+func TestSchedulerSettlingIsObservableBeforeCompletion(t *testing.T) {
+	runContinue := make(chan struct{})
+	settleEntered := make(chan struct{})
+	settleContinue := make(chan struct{})
+	defer func() {
+		select {
+		case <-settleContinue:
+		default:
+			close(settleContinue)
+		}
+	}()
+	var settleCalls atomic.Int32
+	factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
+		return &managerTestPreparedTask{
+			run: func(context.Context, EventSink) Completion {
+				<-runContinue
+				return Completion{ID: id, Status: StatusCompleted, Summary: managerTestSafe("done"), StopReason: StopCompleted, EndedAt: time.Now().UTC()}
+			},
+			settle: func(_ context.Context, result RunResult) Completion {
+				settleCalls.Add(1)
+				close(settleEntered)
+				<-settleContinue
+				return Completion{
+					ID: id, Status: result.Status, Summary: result.Summary, StopReason: result.StopReason,
+					Usage: result.Usage, Error: cloneSafeError(result.Error), EndedAt: time.Now().UTC(),
+				}
+			},
+		}, nil
+	}}
+	inbox := newManagerTestInbox()
+	manager := newManagerUnderTest(t, managerTestOptions(
+		factory, inbox, managerIDSequence("task-settling", "notification-settling"),
+	))
+	submission := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementBackground))
+	close(runContinue)
+	waitManagerSignal(t, settleEntered, "settlement start")
+
+	detail, err := manager.Get(context.Background(), submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Task.Status != StatusSettling {
+		t.Fatalf("status while Settle blocked = %q, want settling", detail.Task.Status)
+	}
+	settlingEvents := 0
+	for _, event := range detail.RecentEvents {
+		if event.Kind == EventKind("settling") {
+			settlingEvents++
+			if event.Snapshot == nil || event.Snapshot.Status != StatusSettling {
+				t.Fatalf("settling event snapshot = %#v", event.Snapshot)
+			}
+		}
+		if terminalEventKind(event.Kind) || event.Kind == EventResultPublished {
+			t.Fatalf("completion escaped before Settle returned: %#v", event)
+		}
+	}
+	if settlingEvents != 1 {
+		t.Fatalf("settling events = %d, want 1", settlingEvents)
+	}
+	awaitDone := make(chan error, 1)
+	go func() {
+		_, awaitErr := manager.Await(context.Background(), submission.ID)
+		awaitDone <- awaitErr
+	}()
+	select {
+	case awaitErr := <-awaitDone:
+		t.Fatalf("Await returned before Settle: %v", awaitErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	reserved, released, published := inbox.counts()
+	if reserved != 1 || released != 0 || published != 0 {
+		t.Fatalf("inbox changed before settlement: reserved=%d released=%d published=%d", reserved, released, published)
+	}
+
+	close(settleContinue)
+	select {
+	case awaitErr := <-awaitDone:
+		if awaitErr != nil {
+			t.Fatal(awaitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Await did not return after settlement")
+	}
+	if settleCalls.Load() != 1 {
+		t.Fatalf("Settle calls = %d, want 1", settleCalls.Load())
+	}
+	detail, err = manager.Get(context.Background(), submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settlingIndex, terminalIndex, resultIndex := -1, -1, -1
+	for index, event := range detail.RecentEvents {
+		switch {
+		case event.Kind == EventKind("settling"):
+			settlingIndex = index
+		case terminalEventKind(event.Kind):
+			terminalIndex = index
+		case event.Kind == EventResultPublished:
+			resultIndex = index
+		}
+	}
+	if settlingIndex < 0 || terminalIndex <= settlingIndex || resultIndex <= terminalIndex {
+		t.Fatalf("lifecycle event order settling/terminal/result = %d/%d/%d: %#v", settlingIndex, terminalIndex, resultIndex, detail.RecentEvents)
+	}
+}
+
+func TestSchedulerSettlingMapsSettlePanicAndInvalidCompletionToInternal(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		settle func(ID, RunResult) Completion
+	}{
+		{
+			name: "panic",
+			settle: func(ID, RunResult) Completion {
+				panic("settlement secret must not escape")
+			},
+		},
+		{
+			name: "invalid",
+			settle: func(id ID, _ RunResult) Completion {
+				return Completion{ID: id, Status: StatusCompleted, StopReason: StopProviderError, EndedAt: time.Now().UTC()}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var settleCalls atomic.Int32
+			factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
+				return &managerTestPreparedTask{
+					run: func(context.Context, EventSink) Completion {
+						return Completion{ID: id, Status: StatusCompleted, Summary: managerTestSafe("run done"), StopReason: StopCompleted, EndedAt: time.Now().UTC()}
+					},
+					settle: func(_ context.Context, result RunResult) Completion {
+						settleCalls.Add(1)
+						return test.settle(id, result)
+					},
+				}, nil
+			}}
+			manager := newManagerUnderTest(t, managerTestOptions(
+				factory, newManagerTestInbox(), managerIDSequence(ID("task-settle-"+test.name), ID("notification-settle-"+test.name)),
+			))
+			submission := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementBackground))
+
+			completion, err := manager.Await(context.Background(), submission.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completion.Status != StatusFailed || completion.StopReason != StopInternalError || completion.Error == nil ||
+				completion.Error.Code != string(ErrInternal) || completion.Error.Source != "subagent" ||
+				strings.Contains(completion.Error.Error(), "secret") {
+				t.Fatalf("unsafe Settle outcome = %#v", completion)
+			}
+			if settleCalls.Load() != 1 {
+				t.Fatalf("Settle calls = %d, want 1", settleCalls.Load())
+			}
+			detail, err := manager.Get(context.Background(), submission.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			settlingIndex, terminalIndex := -1, -1
+			for index, event := range detail.RecentEvents {
+				if event.Kind == EventSettling {
+					if settlingIndex >= 0 {
+						t.Fatalf("duplicate settling event: %#v", detail.RecentEvents)
+					}
+					settlingIndex = index
+				}
+				if terminalEventKind(event.Kind) {
+					terminalIndex = index
+				}
+			}
+			if settlingIndex < 0 || terminalIndex <= settlingIndex {
+				t.Fatalf("settling/terminal event order = %d/%d: %#v", settlingIndex, terminalIndex, detail.RecentEvents)
+			}
+		})
+	}
+}
+
+func TestCancelQueuedTaskSettlesBeforeTerminal(t *testing.T) {
+	limits := managerTestLimits()
+	limits.MaxConcurrent = 1
+	firstStarted := make(chan struct{})
+	firstContinue := make(chan struct{})
+	settleEntered := make(chan struct{})
+	settleContinue := make(chan struct{})
+	defer func() {
+		select {
+		case <-firstContinue:
+		default:
+			close(firstContinue)
+		}
+		select {
+		case <-settleContinue:
+		default:
+			close(settleContinue)
+		}
+	}()
+	var settleCalls atomic.Int32
+	factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
+		if id == "task-cancel-running" {
+			return &managerTestPreparedTask{run: func(context.Context, EventSink) Completion {
+				close(firstStarted)
+				<-firstContinue
+				return Completion{ID: id, Status: StatusCompleted, Summary: managerTestSafe("done"), StopReason: StopCompleted, EndedAt: time.Now().UTC()}
+			}}, nil
+		}
+		return &managerTestPreparedTask{
+			run: func(context.Context, EventSink) Completion {
+				t.Fatal("queued canceled task reached Run")
+				return Completion{}
+			},
+			settle: func(ctx context.Context, result RunResult) Completion {
+				settleCalls.Add(1)
+				if _, ok := ctx.Deadline(); !ok || context.Cause(ctx) != nil {
+					t.Errorf("queued cleanup context is not independent and bounded: deadline=%v cause=%v", ok, context.Cause(ctx))
+				}
+				close(settleEntered)
+				<-settleContinue
+				return Completion{
+					ID: id, Status: result.Status, Summary: result.Summary, StopReason: result.StopReason,
+					Error: cloneSafeError(result.Error), EndedAt: time.Now().UTC(),
+				}
+			},
+		}, nil
+	}}
+	inbox := newManagerTestInbox()
+	options := managerTestOptions(factory, inbox, managerIDSequence("task-cancel-running", "task-cancel-queued", "notification-cancel"))
+	options.Limits = limits
+	manager := newManagerUnderTest(t, options)
+	first := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementBackground))
+	waitManagerSignal(t, firstStarted, "first running task")
+	queued := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementBackground))
+
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- manager.Cancel(context.Background(), queued.ID) }()
+	waitManagerSignal(t, settleEntered, "queued task settlement")
+	waitManagerStatus(t, manager, queued.ID, StatusSettling)
+	select {
+	case err := <-cancelDone:
+		t.Fatalf("Cancel returned before queued settlement completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, _, published := inbox.counts(); published != 0 {
+		t.Fatalf("queued cancellation published result before settlement: %d", published)
+	}
+
+	close(settleContinue)
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not return after queued settlement")
+	}
+	completion, err := manager.Await(context.Background(), queued.ID)
+	if err != nil || completion.Status != StatusCancelled || completion.StopReason != StopCancelled {
+		t.Fatalf("queued cancellation completion=%#v error=%v", completion, err)
+	}
+	if settleCalls.Load() != 1 {
+		t.Fatalf("queued cancellation Settle calls = %d", settleCalls.Load())
+	}
+	close(firstContinue)
+	if _, err := manager.Await(context.Background(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelRunningTaskFreezesWinnerBeforeSettling(t *testing.T) {
+	runStarted := make(chan struct{})
+	settleEntered := make(chan struct{})
+	settleContinue := make(chan struct{})
+	defer func() {
+		select {
+		case <-settleContinue:
+		default:
+			close(settleContinue)
+		}
+	}()
+	var settleCalls atomic.Int32
+	factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
+		return &managerTestPreparedTask{
+			run: func(ctx context.Context, _ EventSink) Completion {
+				close(runStarted)
+				<-ctx.Done()
+				return managerCancelledCandidate(id, StopCancelled)
+			},
+			settle: func(_ context.Context, result RunResult) Completion {
+				settleCalls.Add(1)
+				close(settleEntered)
+				<-settleContinue
+				return Completion{
+					ID: id, Status: result.Status, Summary: result.Summary, StopReason: result.StopReason,
+					Error: cloneSafeError(result.Error), EndedAt: time.Now().UTC(),
+				}
+			},
+		}, nil
+	}}
+	manager := newManagerUnderTest(t, managerTestOptions(factory, newManagerTestInbox(), managerIDSequence("task-running-cancel")))
+	submission := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementForeground))
+	waitManagerSignal(t, runStarted, "running cancellation task")
+	if err := manager.Cancel(context.Background(), submission.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitManagerSignal(t, settleEntered, "running cancellation settlement")
+	waitManagerStatus(t, manager, submission.ID, StatusSettling)
+	if err := manager.Cancel(context.Background(), submission.ID); managerErrorCode(err) != ErrTaskTerminal {
+		t.Fatalf("late settling cancellation error = %v", err)
+	}
+	close(settleContinue)
+	completion, err := manager.Await(context.Background(), submission.ID)
+	if err != nil || completion.Status != StatusCancelled || completion.StopReason != StopCancelled {
+		t.Fatalf("running cancellation completion=%#v error=%v", completion, err)
+	}
+	if settleCalls.Load() != 1 {
+		t.Fatalf("running cancellation Settle calls = %d", settleCalls.Load())
+	}
+}
+
+func TestCancelSettlementTimeoutRetainsWorkspace(t *testing.T) {
+	runStarted := make(chan struct{})
+	cleanupTimedOut := make(chan struct{})
+	workspaceID := strings.Repeat("a", 32)
+	baseOID := strings.Repeat("b", 40)
+	factory := &managerTestRunnerFactory{prepare: func(_ context.Context, id ID, _ SubmitInput) (PreparedTask, error) {
+		return &managerTestPreparedTask{
+			run: func(ctx context.Context, _ EventSink) Completion {
+				close(runStarted)
+				<-ctx.Done()
+				return managerCancelledCandidate(id, StopCancelled)
+			},
+			settle: func(ctx context.Context, result RunResult) Completion {
+				<-ctx.Done()
+				close(cleanupTimedOut)
+				return Completion{
+					ID: id, Status: result.Status, Summary: result.Summary, StopReason: result.StopReason,
+					Error: cloneSafeError(result.Error), EndedAt: time.Now().UTC(),
+					Workspace: WorkspaceSummary{
+						WorkspaceID: workspaceID, Isolation: "worktree", State: "retained", BaseOID: baseOID,
+						Branch: "xagent/worktree/" + workspaceID, Cleanup: "retained", RetentionCause: "runtime_active",
+						Error: SafeError(ErrInternal, managerTestSafe("workspace runtime did not stop"), false),
+					},
+				}
+			},
+		}, nil
+	}}
+	options := managerTestOptions(factory, newManagerTestInbox(), managerIDSequence("task-cleanup-timeout"))
+	options.ShutdownTimeout = 20 * time.Millisecond
+	manager := newManagerUnderTest(t, options)
+	submission := mustManagerSubmit(t, manager, managerModelInput(TypeDefined, PlacementForeground))
+	waitManagerSignal(t, runStarted, "cleanup-timeout task")
+	if err := manager.Cancel(context.Background(), submission.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitManagerSignal(t, cleanupTimedOut, "bounded cleanup timeout")
+	completion, err := manager.Await(context.Background(), submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completion.Workspace.State != "retained" || completion.Workspace.Cleanup != "retained" ||
+		completion.Workspace.RetentionCause != "runtime_active" {
+		t.Fatalf("cleanup timeout did not retain workspace: %#v", completion.Workspace)
+	}
+}
 
 func TestSchedulerUsesFIFOQueueAndWaitingConfirmationKeepsConcurrencySlot(t *testing.T) {
 	limits := managerTestLimits()
@@ -519,8 +885,8 @@ func TestSchedulerShutdownIsIdempotentBoundedAndNeverFabricatesSuccess(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Task.Status != StatusCancelled || detail.Task.StopReason != StopApplicationClosed {
-		t.Fatalf("shutdown task state=%#v", detail.Task)
+	if IsTerminal(detail.Task.Status) || detail.Task.StopReason != "" {
+		t.Fatalf("shutdown published terminal before owner cleanup: %#v", detail.Task)
 	}
 	close(release)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -532,7 +898,7 @@ func TestSchedulerShutdownIsIdempotentBoundedAndNeverFabricatesSuccess(t *testin
 		t.Fatalf("idempotent shutdown: %v", err)
 	}
 	detail, err = manager.Get(context.Background(), submission.ID)
-	if err != nil || detail.Task.Status != StatusCancelled {
+	if err != nil || detail.Task.Status != StatusCancelled || detail.Task.StopReason != StopApplicationClosed {
 		t.Fatalf("late runner success replaced shutdown completion: detail=%#v error=%v", detail, err)
 	}
 }

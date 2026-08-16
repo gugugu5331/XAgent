@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -254,7 +255,9 @@ func newTaskRuntimeFactoryFixture(t *testing.T, maxIterations int) (*SubagentRun
 		Roles: roles, Models: catalog,
 		Authorizer: &permission.Authorizer{Session: permission.NewSession(), Redact: redactor.Text},
 		Limits:     limits, RunOptions: RunOptions{MaxIterations: 6, MaxUnknownToolCalls: 2},
-		SessionContext:  taskRuntimeStableContext{sections: []prompt.Section{{Name: "project-rules", Priority: 10, Content: "PROJECT-INSTRUCTIONS-ONLY", Stable: true}}},
+		SessionContext: taskRuntimeStableContext{sections: []prompt.Section{{
+			Name: "project-rules", Priority: 10, Content: "PROJECT-INSTRUCTIONS-ONLY", Stable: true, Scope: prompt.ScopeProject,
+		}}},
 		RequestBudgeter: contextmgr.NewRequestBudgeter(), ContextPolicy: contextPolicy,
 		Thinking: config.ThinkingConfig{}, RuntimeRedactor: redactor,
 		ParentRuntime: func(context.Context, subagent.ParentRef) (ParentRuntimeSnapshot, error) {
@@ -438,6 +441,20 @@ func TestDefinedPromptContainsNoParentHistoryOrSkillActivity(t *testing.T) {
 			t.Fatalf("request system leaked %q: %s", forbidden, joined)
 		}
 	}
+	for _, block := range request.StableSystem {
+		want := prompt.ScopeGlobal
+		if block.Content.Text() == "PROJECT-INSTRUCTIONS-ONLY" {
+			want = prompt.ScopeProject
+		}
+		if block.Scope != want {
+			t.Fatalf("stable block %q scope = %q, want %q", block.Name, block.Scope, want)
+		}
+	}
+	for _, block := range request.DynamicSystem {
+		if block.Scope != prompt.ScopeRuntime {
+			t.Fatalf("dynamic block %q scope = %q, want runtime", block.Name, block.Scope)
+		}
+	}
 	if len(request.Messages) != 1 || request.Messages[0].Role != provider.ModelMessageRoleUser || request.Messages[0].Content.Text() != "TASK-MESSAGE-ONLY" {
 		t.Fatalf("defined messages = %#v", request.Messages)
 	}
@@ -456,10 +473,18 @@ func TestDefinedZeroIterationReturnsLimitWithoutProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completion := prepared.Run(context.Background(), func(subagent.AgentEvent) error { return nil })
-	if completion.Status != subagent.StatusLimitReached || completion.StopReason != subagent.StopMaxIterations ||
-		completion.Error == nil || completion.Error.Code != string(subagent.ErrLimitReached) {
-		t.Fatalf("zero-iteration completion = %#v", completion)
+	result := prepared.Run(context.Background(), func(subagent.AgentEvent) error { return nil })
+	if result.Status != subagent.StatusLimitReached || result.StopReason != subagent.StopMaxIterations ||
+		result.Error == nil || result.Error.Code != string(subagent.ErrLimitReached) {
+		t.Fatalf("zero-iteration run result = %#v", result)
+	}
+	completion := prepared.Settle(context.Background(), result)
+	if completion.ID != "task-zero" || completion.EndedAt.IsZero() || completion.Workspace != (subagent.WorkspaceSummary{}) {
+		t.Fatalf("zero-iteration settlement = %#v", completion)
+	}
+	again := prepared.Settle(context.Background(), subagent.RunResult{})
+	if !reflect.DeepEqual(again, completion) {
+		t.Fatalf("shared settlement is not idempotent: first=%#v again=%#v", completion, again)
 	}
 }
 
@@ -810,12 +835,16 @@ func TestForkPreparationUsesFrozenParentSnapshotsAndForcesBackground(t *testing.
 		t.Fatal(err)
 	}
 	promptSnapshot, err := provider.CapturePromptPrefix(provider.ChatRequest{
-		Model:         "model-parent",
-		StableSystem:  []provider.SystemBlock{{Name: "parent-stable", Content: testSafeText("PARENT-STABLE"), Cacheable: true}},
-		DynamicSystem: []provider.SystemBlock{{Name: "parent-dynamic", Content: testSafeText("PARENT-DYNAMIC"), Cacheable: false}},
-		Messages:      []provider.ModelMessage{{Role: provider.ModelMessageRoleUser, Content: testSafeText("PARENT-PROVIDER-MESSAGE")}},
-		Tools:         []provider.ToolDefinition{{Name: "ParentOnly", Description: "captured parent tool", Schema: tool.Schema{Type: "object"}}},
-		Cache:         provider.CachePolicy{EnablePromptCache: true, SystemBreakpointName: "parent-stable", CacheTools: true},
+		Model: "model-parent",
+		StableSystem: []provider.SystemBlock{{
+			Name: "parent-stable", Content: testSafeText("PARENT-STABLE"), Cacheable: true, Scope: prompt.ScopeProject,
+		}},
+		DynamicSystem: []provider.SystemBlock{{
+			Name: "parent-dynamic", Content: testSafeText("PARENT-DYNAMIC"), Cacheable: false, Scope: prompt.ScopeRuntime,
+		}},
+		Messages: []provider.ModelMessage{{Role: provider.ModelMessageRoleUser, Content: testSafeText("PARENT-PROVIDER-MESSAGE")}},
+		Tools:    []provider.ToolDefinition{{Name: "ParentOnly", Description: "captured parent tool", Schema: tool.Schema{Type: "object"}}},
+		Cache:    provider.CachePolicy{EnablePromptCache: true, SystemBreakpointName: "parent-stable", CacheTools: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1123,7 +1152,7 @@ func TestSubagentLoopUsesTaskConfirmationBrokerAndResumes(t *testing.T) {
 	resolved := make(chan error, 1)
 	completed := make(chan subagent.Completion, 1)
 	go func() {
-		completed <- task.Run(context.Background(), func(event subagent.AgentEvent) error {
+		result := task.Run(context.Background(), func(event subagent.AgentEvent) error {
 			if event.Kind == events.ToolWaitingConfirmation && event.Payload.Confirmation != nil {
 				request := *event.Payload.Confirmation
 				waiting <- request
@@ -1136,6 +1165,7 @@ func TestSubagentLoopUsesTaskConfirmationBrokerAndResumes(t *testing.T) {
 			}
 			return nil
 		})
+		completed <- task.Settle(context.Background(), result)
 	}()
 	var request events.ToolConfirmationRequest
 	select {

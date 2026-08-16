@@ -5,17 +5,40 @@ import (
 	"testing"
 
 	"xagent/internal/config"
+	"xagent/internal/prompt"
 	"xagent/internal/tool"
 )
+
+func TestPromptPrefixSnapshotRequiresAndFingerprintsScope(t *testing.T) {
+	request := ChatRequest{
+		StableSystem: []SystemBlock{{Name: "project", Content: safeText("project rules"), Cacheable: true, Scope: prompt.ScopeProject}},
+	}
+	snapshot, err := CapturePromptPrefix(request)
+	if err != nil {
+		t.Fatalf("capture scoped prefix: %v", err)
+	}
+	tampered := snapshot
+	tampered.StableSystem = cloneSystemBlocks(snapshot.StableSystem)
+	tampered.StableSystem[0].Scope = prompt.ScopeUser
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("snapshot validated after scope changed without updating fingerprint")
+	}
+	for _, scope := range []prompt.Scope{"", "future"} {
+		request.StableSystem[0].Scope = scope
+		if _, err := CapturePromptPrefix(request); err == nil {
+			t.Fatalf("captured invalid scope %q", scope)
+		}
+	}
+}
 
 func TestPromptPrefixSnapshotCaptureDeepCopiesAndValidatesSplitLayout(t *testing.T) {
 	request := ChatRequest{
 		Model: "parent-model",
 		StableSystem: []SystemBlock{
-			{Name: "stable", Content: safeText("stable rules"), Cacheable: true},
+			{Name: "stable", Content: safeText("stable rules"), Cacheable: true, Scope: prompt.ScopeGlobal},
 		},
 		DynamicSystem: []SystemBlock{
-			{Name: "dynamic", Content: safeText("dynamic reminder")},
+			{Name: "dynamic", Content: safeText("dynamic reminder"), Scope: prompt.ScopeRuntime},
 		},
 		Messages: []ModelMessage{{Role: ModelMessageRoleUser, Content: safeText("parent message")}},
 		Thinking: config.ThinkingConfig{Enabled: true, Show: true, BudgetTokens: 4096},
@@ -44,7 +67,7 @@ func TestPromptPrefixSnapshotCaptureDeepCopiesAndValidatesSplitLayout(t *testing
 	request.Messages[0].Content = safeText("mutated parent")
 	request.Tools[0].Schema.Properties["path"] = tool.EnumProperty("mutated", "secret")
 	child := snapshot.BuildChild(
-		[]SystemBlock{{Name: "role", Content: safeText("role instructions"), Cacheable: true}},
+		[]SystemBlock{{Name: "role", Content: safeText("role instructions"), Cacheable: true, Scope: prompt.ScopeRuntime}},
 		[]ModelMessage{{Role: ModelMessageRoleUser, Content: safeText("child task")}},
 		snapshot.Tools,
 	)
@@ -80,7 +103,7 @@ func TestPromptPrefixSnapshotChangedToolsDropsOnlyToolCache(t *testing.T) {
 	snapshot, err := CapturePromptPrefix(ChatRequest{
 		Model: "parent-model",
 		StableSystem: []SystemBlock{
-			{Name: "stable", Content: safeText("stable rules"), Cacheable: true},
+			{Name: "stable", Content: safeText("stable rules"), Cacheable: true, Scope: prompt.ScopeGlobal},
 		},
 		Messages: []ModelMessage{{Role: ModelMessageRoleUser, Content: safeText("parent")}},
 		Tools: []ToolDefinition{
@@ -93,7 +116,7 @@ func TestPromptPrefixSnapshotChangedToolsDropsOnlyToolCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := snapshot.BuildChild(
-		[]SystemBlock{{Name: "role", Content: safeText("restricted role")}},
+		[]SystemBlock{{Name: "role", Content: safeText("restricted role"), Scope: prompt.ScopeRuntime}},
 		[]ModelMessage{{Role: ModelMessageRoleUser, Content: safeText("task")}},
 		[]ToolDefinition{{Name: "Read", Description: "read", Schema: tool.Schema{Type: "object"}}},
 	)
@@ -117,7 +140,7 @@ func TestPromptPrefixSnapshotPreservesOrderedLayoutAndMaterializesRegistry(t *te
 	}
 	request := ChatRequest{
 		Model:    "ordered-model",
-		System:   []SystemBlock{{Name: "fixed", Content: safeText("fixed")}},
+		System:   []SystemBlock{{Name: "fixed", Content: safeText("fixed"), Scope: prompt.ScopeGlobal}},
 		ToolDefs: registry,
 		Cache:    CachePolicy{EnablePromptCache: true, SystemBreakpointName: "fixed", CacheTools: true},
 	}
@@ -128,9 +151,24 @@ func TestPromptPrefixSnapshotPreservesOrderedLayoutAndMaterializesRegistry(t *te
 	if !snapshot.OrderedSystem || snapshot.System == nil || snapshot.StableSystem != nil || snapshot.DynamicSystem != nil || len(snapshot.Tools) != 3 {
 		t.Fatalf("ordered/registry capture = %#v", snapshot)
 	}
-	child := snapshot.BuildChild([]SystemBlock{{Name: "role", Content: safeText("role")}}, nil, snapshot.Tools[:1])
+	child := snapshot.BuildChild([]SystemBlock{{Name: "role", Content: safeText("role"), Scope: prompt.ScopeRuntime}}, nil, snapshot.Tools[:1])
 	if child.System == nil || child.StableSystem != nil || child.DynamicSystem != nil || len(child.System) != 2 || child.ToolDefs != nil {
 		t.Fatalf("ordered child changed representation or retained registry: %#v", child)
+	}
+}
+
+func TestPromptPrefixSnapshotPreservesEmptyOrderedLayout(t *testing.T) {
+	request := ChatRequest{System: []SystemBlock{}}
+	snapshot, err := CapturePromptPrefix(request)
+	if err != nil {
+		t.Fatalf("capture empty ordered system: %v", err)
+	}
+	if !snapshot.OrderedSystem || snapshot.System == nil || len(snapshot.System) != 0 {
+		t.Fatalf("empty ordered layout was collapsed: %#v", snapshot)
+	}
+	child := snapshot.BuildChild(nil, nil, nil)
+	if child.System == nil || child.StableSystem != nil || child.DynamicSystem != nil {
+		t.Fatalf("empty ordered child changed representation: %#v", child)
 	}
 }
 

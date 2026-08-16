@@ -79,6 +79,33 @@ func TestAnthropicSubagentResultMapsToSingleMarkedUserTextBlock(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSummarySubagentResultSchemaIsStrictAndPathFree(t *testing.T) {
+	workspaceID := strings.Repeat("a", 32)
+	workspace := `,"workspace":{"workspace_id":"` + workspaceID + `","isolation":"worktree","state":"retained","base_oid":"` + strings.Repeat("b", 40) + `","branch":"xagent/worktree/` + workspaceID + `","dirty":true,"unpushed":true,"cleanup":"retained","retention_cause":"dirty_worktree"}`
+	valid := strings.TrimSuffix(providerSubagentResultFixture, "}") + workspace + `}`
+	if !validSubagentResultJSON(valid) {
+		t.Fatalf("valid workspace summary was rejected: %s", valid)
+	}
+
+	invalid := []string{
+		strings.Replace(valid, `"state":"retained"`, `"state":"active"`, 1),
+		strings.Replace(valid, `"cleanup":"retained"`, `"cleanup":"future"`, 1),
+		strings.Replace(valid, `"workspace_id":"`+workspaceID+`"`, `"workspace_id":"/private/worktree/root"`, 1),
+		strings.Replace(valid, `"retention_cause":"dirty_worktree"`, `"retention_cause":"/private/worktree/root"`, 1),
+		strings.Replace(valid, `"retention_cause":"dirty_worktree"`, `"retention_cause":"dirty_worktree","root":"/private/worktree/root"`, 1),
+		strings.Replace(valid, `"retention_cause":"dirty_worktree"`, `"retention_cause":"dirty_worktree","error":{"message":"free text"}`, 1),
+		strings.TrimSuffix(providerSubagentResultFixture, "}") + `,"workspace":{}}`,
+	}
+	for _, payload := range invalid {
+		if validSubagentResultJSON(payload) {
+			t.Fatalf("invalid workspace summary was accepted: %s", payload)
+		}
+	}
+	if !validSubagentResultJSON(providerSubagentResultFixture) {
+		t.Fatal("shared compatibility fixture was rejected")
+	}
+}
+
 func TestProviderAdaptersRejectUnknownMessageRoleInsteadOfDroppingIt(t *testing.T) {
 	request := ChatRequest{Messages: []ModelMessage{{Role: ModelMessageRole("future"), Content: safeText("must not disappear")}}}
 	if _, err := newOpenAIRequest(request, "model"); err == nil {

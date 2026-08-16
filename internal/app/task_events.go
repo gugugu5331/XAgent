@@ -21,6 +21,9 @@ func (m *Model) ApplyTaskEvent(ctx context.Context, source subagent.Event) error
 		return m.failTaskNotification(subagent.ErrInvalidTransition, "任务通知无效", false)
 	}
 	notification := event.Result
+	if _, valid := projectTaskWorkspace(notification.Workspace); !valid {
+		return m.failTaskNotification(subagent.ErrInvalidTransition, "任务工作区状态无效", false)
+	}
 	if m.conversation == nil || m.conversation.ID == "" || notification.Parent.ConversationID != m.conversation.ID {
 		// A result for another main conversation is neither displayed nor marked
 		// seen. Replaying it after that conversation becomes active remains safe.
@@ -90,8 +93,19 @@ func hasTaskNotification(value *conversation.Conversation, notificationID string
 }
 
 func taskNotificationNotice(notification *subagent.ResultNotification) string {
-	return tui.NewTaskNotification(tui.TaskNotificationViewSpec{
+	if notification == nil {
+		return "任务通知无效"
+	}
+	workspace, valid := projectTaskWorkspace(notification.Workspace)
+	if !valid {
+		return "任务工作区状态无效"
+	}
+	notice := tui.NewTaskNotification(tui.TaskNotificationViewSpec{
 		NotificationID: notification.NotificationID, TaskID: string(notification.TaskID), Status: string(notification.Status),
 		Summary: notification.Summary, StopReason: string(notification.StopReason), Error: projectTaskSafeError(notification.Error),
 	}).View()
+	if workspace != "" {
+		notice += " | " + workspace
+	}
+	return notice
 }

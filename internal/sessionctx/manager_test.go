@@ -23,7 +23,7 @@ func TestSessionContextAndPromptAcceptOnlySafeText(t *testing.T) {
 		Redactor:        redactor,
 		MaxSectionBytes: 96,
 		Instructions: fakeInstructionLoader{sections: []prompt.Section{{
-			Name: "runtime instruction", Content: strings.Repeat("a", 160) + canary, Stable: true,
+			Name: "runtime instruction", Content: strings.Repeat("a", 160) + canary, Stable: true, Scope: prompt.ScopeProject,
 		}}},
 		Memory: fakeMemoryProvider{index: memory.Index{Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{
 			ID: "safe", Title: "memory " + canary, Body: strings.Repeat("b", 160) + canary,
@@ -69,8 +69,10 @@ func TestSessionContextAndPromptAcceptOnlySafeText(t *testing.T) {
 
 func TestSessionContextPreparesInstructionsMemoryAndBoundary(t *testing.T) {
 	manager := &Manager{
-		Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "项目指令", Priority: 1000, Content: "项目规则", Stable: true}}},
-		Memory:       fakeMemoryProvider{index: memory.Index{Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "n1", Title: "偏好", Body: "用户喜欢简洁中文"}}}},
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+			Name: "项目指令", Priority: 1000, Content: "项目规则", Stable: true, Scope: prompt.ScopeProject,
+		}}},
+		Memory: fakeMemoryProvider{index: memory.Index{Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "n1", Title: "偏好", Body: "用户喜欢简洁中文"}}}},
 	}
 	prepared, err := manager.Prepare(context.Background(), conversation.NewConversation("c", zeroTime()), PrepareAuto)
 	if err != nil {
@@ -81,6 +83,34 @@ func TestSessionContextPreparesInstructionsMemoryAndBoundary(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("prepared sections missing %q: %s", want, joined)
 		}
+	}
+}
+
+func TestSessionContextAssignsMemoryScopes(t *testing.T) {
+	manager := &Manager{Memory: fakeMemoryProvider{indices: map[memory.Scope]memory.Index{
+		memory.ScopeProject: {Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "project", Title: "project", Body: "project memory"}}},
+		memory.ScopeUser:    {Scope: memory.ScopeUser, Entries: []memory.IndexEntry{{ID: "user", Title: "user", Body: "user memory"}}},
+	}}}
+	prepared := manager.PrepareStable(context.Background())
+	want := map[string]prompt.Scope{
+		"长期记忆边界":         prompt.ScopeGlobal,
+		"长期记忆索引-project": prompt.ScopeProject,
+		"长期记忆索引-user":    prompt.ScopeUser,
+		"会话恢复边界":         prompt.ScopeGlobal,
+	}
+	for _, section := range prepared.StableSections {
+		if scope, ok := want[section.Name]; ok {
+			if section.Scope != scope {
+				t.Fatalf("section %q scope = %q, want %q", section.Name, section.Scope, scope)
+			}
+			delete(want, section.Name)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing scoped sections: %#v", want)
+	}
+	if got := memoryPromptScope(memory.Scope("future")); got.Valid() {
+		t.Fatalf("unknown memory scope mapped to valid prompt scope %q", got)
 	}
 }
 
@@ -114,8 +144,10 @@ func TestSessionContextMergesDiagnostics(t *testing.T) {
 func TestPrepareStableDoesNotMutateConversationContext(t *testing.T) {
 	contextPreparer := &fakeContextPreparer{changed: true}
 	manager := &Manager{
-		Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Content: "stable project rules", Stable: true}}},
-		Context:      contextPreparer,
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+			Name: "project", Content: "stable project rules", Stable: true, Scope: prompt.ScopeProject,
+		}}},
+		Context: contextPreparer,
 	}
 	prepared := manager.PrepareStable(context.Background())
 	if contextPreparer.calls != 0 || prepared.MessagesChanged || prepared.ContextResult.Changed {
@@ -129,8 +161,8 @@ func TestPrepareStableDoesNotMutateConversationContext(t *testing.T) {
 func TestSessionContextPriority(t *testing.T) {
 	manager := &Manager{
 		Instructions: fakeInstructionLoader{sections: []prompt.Section{
-			{Name: "项目根指令", Priority: 1000, Content: "项目根约束优先", Stable: true},
-			{Name: "用户指令", Priority: 1020, Content: "用户通用偏好", Stable: true},
+			{Name: "项目根指令", Priority: 1000, Content: "项目根约束优先", Stable: true, Scope: prompt.ScopeProject},
+			{Name: "用户指令", Priority: 1020, Content: "用户通用偏好", Stable: true, Scope: prompt.ScopeUser},
 		}},
 		Memory: fakeMemoryProvider{indices: map[memory.Scope]memory.Index{
 			memory.ScopeProject: {Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "project-note", Title: "项目记忆", Body: "项目长期记忆"}}},
@@ -154,8 +186,10 @@ func TestSessionContextPriority(t *testing.T) {
 func TestPrepareWithOptions(t *testing.T) {
 	preparer := &fakeContextPreparer{changed: true}
 	manager := &Manager{
-		Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Content: "stable project rules", Stable: true}}},
-		Context:      preparer,
+		Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+			Name: "project", Content: "stable project rules", Stable: true, Scope: prompt.ScopeProject,
+		}}},
+		Context: preparer,
 	}
 	conv := conversation.NewConversation("c", zeroTime())
 
@@ -207,7 +241,9 @@ func TestPrepareWithOptions(t *testing.T) {
 func TestNoHookContextCompatibility(t *testing.T) {
 	newManager := func(preparer *fakeContextPreparer) *Manager {
 		return &Manager{
-			Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "project", Priority: 1000, Content: "stable project rules", Stable: true}}},
+			Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+				Name: "project", Priority: 1000, Content: "stable project rules", Stable: true, Scope: prompt.ScopeProject,
+			}}},
 			Memory: fakeMemoryProvider{indices: map[memory.Scope]memory.Index{
 				memory.ScopeProject: {Scope: memory.ScopeProject, Entries: []memory.IndexEntry{{ID: "project", Title: "knowledge", Body: "stable memory"}}},
 				memory.ScopeUser:    {Scope: memory.ScopeUser},
@@ -275,8 +311,10 @@ func TestNoHookSessionCompatibility(t *testing.T) {
 	for _, item := range observers {
 		preparer := &fakeContextPreparer{}
 		manager := &Manager{
-			Instructions: fakeInstructionLoader{sections: []prompt.Section{{Name: "session-policy", Content: "same session policy", Stable: true}}},
-			Context:      preparer,
+			Instructions: fakeInstructionLoader{sections: []prompt.Section{{
+				Name: "session-policy", Content: "same session policy", Stable: true, Scope: prompt.ScopeProject,
+			}}},
+			Context: preparer,
 		}
 		newConversation := conversation.NewConversation("new", zeroTime())
 		resumedConversation := conversation.NewConversation("resumed", zeroTime())

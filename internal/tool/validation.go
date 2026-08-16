@@ -33,6 +33,7 @@ type ValidatedCall struct {
 	executionRootPath  string
 	targetDigest       *[32]byte
 	policy             ExecutionPolicy
+	provenance         *executorProvenance
 }
 
 type ValidationContext struct {

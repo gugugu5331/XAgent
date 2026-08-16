@@ -109,6 +109,24 @@ var approvedAppConfigNumericKeys = []string{
 	"subagent.role_limits.max_tool_name_bytes",
 	"subagent.role_limits.max_tool_names",
 	"subagent.role_limits.max_total_bytes",
+	"subagent.worktree.lifecycle.git_timeout_ms",
+	"subagent.worktree.lifecycle.init_timeout_ms",
+	"subagent.worktree.lifecycle.janitor_interval_ms",
+	"subagent.worktree.lifecycle.janitor_timeout_ms",
+	"subagent.worktree.lifecycle.lock_timeout_ms",
+	"subagent.worktree.lifecycle.recovery_timeout_ms",
+	"subagent.worktree.lifecycle.retention_ttl_ms",
+	"subagent.worktree.lifecycle.settle_timeout_ms",
+	"subagent.worktree.limits.max_active",
+	"subagent.worktree.limits.max_depth",
+	"subagent.worktree.limits.max_init_bytes",
+	"subagent.worktree.limits.max_init_depth",
+	"subagent.worktree.limits.max_init_files",
+	"subagent.worktree.limits.max_janitor_candidates",
+	"subagent.worktree.limits.max_janitor_concurrency",
+	"subagent.worktree.limits.max_name_bytes",
+	"subagent.worktree.limits.max_retained",
+	"subagent.worktree.limits.max_segment_bytes",
 }
 
 func TestAppConfigNumericManifestIsExact(t *testing.T) {
@@ -852,6 +870,7 @@ func allAppConfigNumericSpecs() []numericSpec {
 	result = append(result, memoryDiagnosticsLifecycleNumericSpecs[:]...)
 	result = append(result, roleLimitNumericSpecs[:]...)
 	result = append(result, subagentRuntimeNumericSpecs[:]...)
+	result = append(result, worktreeNumericSpecs[:]...)
 	return result
 }
 
@@ -917,6 +936,18 @@ func prepareCompleteNumericBoundary(partial *PartialAppConfig, path string) {
 		partial.Subagent.ReadCacheMaxValueBytes = set(1)
 	case "subagent.read_cache_max_value_bytes":
 		partial.Subagent.ReadCacheMaxBytes = set(512 * mebibyte)
+	case "subagent.worktree.limits.max_active":
+		partial.Subagent.Worktree.Limits.MaxRetained = set(4_096)
+	case "subagent.worktree.limits.max_retained":
+		partial.Subagent.Worktree.Limits.MaxActive = set(1)
+	case "subagent.worktree.limits.max_name_bytes":
+		partial.Subagent.Worktree.Limits.MaxSegmentBytes = set(1)
+	case "subagent.worktree.limits.max_segment_bytes":
+		partial.Subagent.Worktree.Limits.MaxNameBytes = set(1_024)
+	case "subagent.worktree.limits.max_janitor_candidates":
+		partial.Subagent.Worktree.Limits.MaxJanitorConcurrency = set(1)
+	case "subagent.worktree.limits.max_janitor_concurrency":
+		partial.Subagent.Worktree.Limits.MaxJanitorCandidates = set(10_000)
 	}
 }
 
@@ -1186,6 +1217,42 @@ func resolvedNumericValue(t *testing.T, config AppConfig, path string) int64 {
 		return int64(config.Subagent.RoleLimits.MaxCandidates)
 	case "subagent.role_limits.max_diagnostics":
 		return int64(config.Subagent.RoleLimits.MaxDiagnostics)
+	case "subagent.worktree.lifecycle.retention_ttl_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.RetentionTTL / time.Millisecond)
+	case "subagent.worktree.lifecycle.janitor_interval_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.JanitorInterval / time.Millisecond)
+	case "subagent.worktree.lifecycle.git_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.GitTimeout / time.Millisecond)
+	case "subagent.worktree.lifecycle.lock_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.LockTimeout / time.Millisecond)
+	case "subagent.worktree.lifecycle.init_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.InitTimeout / time.Millisecond)
+	case "subagent.worktree.lifecycle.recovery_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.RecoveryTimeout / time.Millisecond)
+	case "subagent.worktree.lifecycle.settle_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.SettleTimeout / time.Millisecond)
+	case "subagent.worktree.lifecycle.janitor_timeout_ms":
+		return int64(config.Subagent.Worktree.Lifecycle.JanitorTimeout / time.Millisecond)
+	case "subagent.worktree.limits.max_active":
+		return int64(config.Subagent.Worktree.Limits.MaxActive)
+	case "subagent.worktree.limits.max_retained":
+		return int64(config.Subagent.Worktree.Limits.MaxRetained)
+	case "subagent.worktree.limits.max_name_bytes":
+		return int64(config.Subagent.Worktree.Limits.MaxNameBytes)
+	case "subagent.worktree.limits.max_segment_bytes":
+		return int64(config.Subagent.Worktree.Limits.MaxSegmentBytes)
+	case "subagent.worktree.limits.max_depth":
+		return int64(config.Subagent.Worktree.Limits.MaxDepth)
+	case "subagent.worktree.limits.max_init_files":
+		return int64(config.Subagent.Worktree.Limits.MaxInitFiles)
+	case "subagent.worktree.limits.max_init_bytes":
+		return config.Subagent.Worktree.Limits.MaxInitBytes
+	case "subagent.worktree.limits.max_init_depth":
+		return int64(config.Subagent.Worktree.Limits.MaxInitDepth)
+	case "subagent.worktree.limits.max_janitor_candidates":
+		return int64(config.Subagent.Worktree.Limits.MaxJanitorCandidates)
+	case "subagent.worktree.limits.max_janitor_concurrency":
+		return int64(config.Subagent.Worktree.Limits.MaxJanitorConcurrency)
 	default:
 		t.Fatal("resolved numeric test path is unknown")
 		return 0

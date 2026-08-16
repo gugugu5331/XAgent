@@ -3,8 +3,10 @@ package orchestrator
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +23,12 @@ import (
 	"xagent/internal/prompt"
 	"xagent/internal/provider"
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 	"xagent/internal/sessionctx"
 	"xagent/internal/subagent"
 	"xagent/internal/tool"
+	"xagent/internal/workspace"
+	"xagent/internal/worktree"
 )
 
 // ParentRuntimeSnapshot is the small immutable boundary required to prepare a
@@ -45,13 +50,31 @@ type ParentRuntimeSnapshot struct {
 	ParentContext context.Context
 }
 
-// StableContextPreparer captures standard project instructions without
-// compacting or otherwise reading a parent Conversation.
-type StableContextPreparer interface {
-	PrepareStable(context.Context) sessionctx.PreparedContext
+type ParentRuntimeSnapshotter func(context.Context, subagent.ParentRef) (ParentRuntimeSnapshot, error)
+
+// WorktreeLifecycleManager is the only Worktree lifecycle surface needed
+// while preparing an isolated task. Settlement after Run is wired in T54;
+// here Settle and Release are used only to roll back a failed Prepare.
+type WorktreeLifecycleManager interface {
+	Acquire(context.Context, worktree.AcquireRequest) (worktree.Lease, error)
+	Settle(context.Context, worktree.Lease, worktree.SettleRequest) (worktree.Settlement, error)
+	Release(context.Context, worktree.Lease) error
 }
 
-type ParentRuntimeSnapshotter func(context.Context, subagent.ParentRef) (ParentRuntimeSnapshot, error)
+// WorktreeWorkspaceBindRequest deliberately omits raw scratch, artifact and
+// readonly paths. The assembly adapter added in T60 owns those per-task roots;
+// the orchestrator passes only immutable task authority.
+type WorktreeWorkspaceBindRequest struct {
+	TaskID   string
+	Lease    worktree.Lease
+	Role     agentrole.ResolvedRole
+	PlanMode bool
+	Verifier permission.TicketVerifier
+}
+
+type WorktreeWorkspaceBinder interface {
+	Bind(context.Context, WorktreeWorkspaceBindRequest) (workspace.Runtime, error)
+}
 
 // SubagentRunnerOptions contains shared immutable infrastructure and explicit
 // snapshot seams. Per-task mutable objects are always allocated by Prepare.
@@ -69,7 +92,7 @@ type SubagentRunnerOptions struct {
 	GlobalDenied      map[string]struct{}
 	Limits            subagent.Limits
 	RunOptions        RunOptions
-	SessionContext    StableContextPreparer
+	SessionContext    sessionctx.StablePreparer
 	ContextManager    *contextmgr.Manager
 	RequestBudgeter   contextmgr.RequestBudgeter
 	ContextPolicy     SkillHistoryPolicy
@@ -79,6 +102,11 @@ type SubagentRunnerOptions struct {
 	ParentRuntime     ParentRuntimeSnapshotter
 	Clock             func() time.Time
 	ChatStreamOptions provider.ChatStreamOptions
+	WorktreeManager   WorktreeLifecycleManager
+	WorkspaceBinder   WorktreeWorkspaceBinder
+	// WorktreeAcquireTemplate is repository-scoped and immutable. Prepare
+	// always generates WorkspaceID/OwnerID and derives the final logical name.
+	WorktreeAcquireTemplate worktree.AcquireRequest
 }
 
 type SubagentRunnerFactory struct {
@@ -130,9 +158,128 @@ func NewSubagentRunnerFactory(options SubagentRunnerOptions) (*SubagentRunnerFac
 	if err := options.BackgroundPolicy.Validate(options.Registry); err != nil {
 		return nil, fmt.Errorf("subagent runner background policy is invalid: %w", err)
 	}
+	configuredIsolation := options.WorktreeManager != nil || options.WorkspaceBinder != nil ||
+		options.WorktreeAcquireTemplate != (worktree.AcquireRequest{})
+	if configuredIsolation {
+		if options.WorktreeManager == nil || options.WorkspaceBinder == nil ||
+			!validWorktreeAcquireTemplate(options.WorktreeAcquireTemplate) {
+			return nil, errors.New("subagent runner worktree boundary is invalid")
+		}
+	}
 	options.BackgroundPolicy.AllowedNames = append([]string(nil), options.BackgroundPolicy.AllowedNames...)
 	options.GlobalDenied = cloneDeniedNames(options.GlobalDenied)
 	return &SubagentRunnerFactory{options: options}, nil
+}
+
+func validWorktreeAcquireTemplate(request worktree.AcquireRequest) bool {
+	if request.WorkspaceID != "" || request.OwnerID != "" ||
+		!filepath.IsAbs(request.RepositoryRoot) || filepath.Clean(request.RepositoryRoot) != request.RepositoryRoot ||
+		request.RepositoryIdentity.Root != request.RepositoryRoot ||
+		!filepath.IsAbs(request.RepositoryIdentity.CommonDir) || filepath.Clean(request.RepositoryIdentity.CommonDir) != request.RepositoryIdentity.CommonDir ||
+		worktree.ValidateLogicalName(request.LogicalName, worktree.Limits{}) != nil {
+		return false
+	}
+	current, err := worktree.NewRepositoryIdentity(request.RepositoryRoot, request.RepositoryIdentity.CommonDir)
+	return err == nil && current == request.RepositoryIdentity
+}
+
+type preparedWorkspaceOwnership struct {
+	manager WorktreeLifecycleManager
+	lease   worktree.Lease
+	runtime workspace.Runtime
+}
+
+func (factory *SubagentRunnerFactory) prepareIsolatedWorkspace(
+	ctx context.Context,
+	id subagent.ID,
+	role *agentrole.ResolvedRole,
+	planMode bool,
+	verifier permission.TicketVerifier,
+) (*preparedWorkspaceOwnership, error) {
+	if role == nil || role.Definition.Isolation == agentrole.IsolationNone {
+		return nil, nil
+	}
+	if role.Definition.Isolation != agentrole.IsolationWorktree || factory.options.WorktreeManager == nil ||
+		factory.options.WorkspaceBinder == nil || verifier == nil {
+		return nil, errors.New("worktree isolation boundary is unavailable")
+	}
+	workspaceID, err := worktree.GenerateWorkspaceID(nil)
+	if err != nil {
+		return nil, err
+	}
+	ownerID, err := worktree.GenerateOwnerID(nil)
+	if err != nil {
+		return nil, err
+	}
+	for ownerID == workspaceID {
+		ownerID, err = worktree.GenerateOwnerID(nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	roleName := strings.ToLower(strings.TrimSpace(role.Definition.Name))
+	logicalName := factory.options.WorktreeAcquireTemplate.LogicalName + "/" + roleName + "/" + workspaceID
+	if worktree.ValidateLogicalName(roleName, worktree.Limits{}) != nil ||
+		worktree.ValidateLogicalName(logicalName, worktree.Limits{}) != nil {
+		return nil, errors.New("worktree logical name is invalid")
+	}
+	request := factory.options.WorktreeAcquireTemplate
+	request.WorkspaceID = workspaceID
+	request.OwnerID = ownerID
+	request.LogicalName = logicalName
+	lease, err := factory.options.WorktreeManager.Acquire(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	ownership := &preparedWorkspaceOwnership{manager: factory.options.WorktreeManager, lease: lease}
+	bound, bindErr := factory.options.WorkspaceBinder.Bind(ctx, WorktreeWorkspaceBindRequest{
+		TaskID: string(id), Lease: lease,
+		Role:     agentrole.ResolvedRole{Generation: role.Generation, Definition: role.Definition.Clone()},
+		PlanMode: planMode, Verifier: verifier,
+	})
+	ownership.runtime = bound
+	if bindErr != nil || bound == nil {
+		rollbackErr := ownership.rollback(ctx)
+		if bindErr == nil {
+			bindErr = errors.New("workspace binder returned no runtime")
+		}
+		return nil, errors.Join(bindErr, rollbackErr)
+	}
+	return ownership, nil
+}
+
+func (ownership *preparedWorkspaceOwnership) rollback(ctx context.Context) error {
+	if ownership == nil || ownership.manager == nil {
+		return nil
+	}
+	cleanupContext := context.Background()
+	if ctx != nil {
+		cleanupContext = context.WithoutCancel(ctx)
+	}
+	// T57 must supply the authoritative workspace-cleanup deadline. Reusing a
+	// Provider/tool timeout here could stop rollback early and leak ownership;
+	// until then cleanup is deliberately independent of the failed caller.
+	var failures []error
+	runtimeStopped := ownership.runtime == nil
+	if ownership.runtime != nil {
+		if err := ownership.runtime.Close(cleanupContext); err != nil {
+			failures = append(failures, err)
+		} else {
+			runtimeStopped = true
+		}
+	}
+	if _, err := ownership.manager.Settle(cleanupContext, ownership.lease, worktree.SettleRequest{RuntimeStopped: runtimeStopped}); err != nil {
+		failures = append(failures, err)
+	}
+	// A failed Runtime.Close means code may still be using the Worktree. Keep
+	// the active OS lease owned by Manager until Shutdown/process exit so no
+	// other process can recover the same directory concurrently.
+	if runtimeStopped {
+		if err := ownership.manager.Release(cleanupContext, ownership.lease); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (factory *SubagentRunnerFactory) Prepare(ctx context.Context, id subagent.ID, input subagent.SubmitInput) (subagent.PreparedTask, error) {
@@ -258,13 +405,41 @@ func (factory *SubagentRunnerFactory) prepareDefined(ctx context.Context, id sub
 	}
 	runtime := &TaskRuntimeState{
 		TaskID: id, Parent: input.Parent, Role: role, Conversation: childConversation, Profile: profile,
-		ActiveTools: activeTools, Authorizer: taskScope.Authorizer, Executor: scopedExecutor,
+		ActiveTools: activeTools, Registry: parent.Registry, ToolExecutor: factory.options.Executor,
+		Authorizer: taskScope.Authorizer, Executor: scopedExecutor, Hooks: factory.options.Hooks,
 		Confirm: confirmation, ReadCache: readCache, HookSessionID: hookSessionID,
 		Context: runtimeCtx, Cancel: cancel, RequestBudgeter: factory.options.RequestBudgeter,
 	}
 	backgroundTask := placement == subagent.PlacementBackground
 	if !backgroundTask && parent.ParentContext != nil {
 		runtime.ParentBridge = newParentCancelBridge(parent.ParentContext, cancel)
+	}
+	isolated, err := factory.prepareIsolatedWorkspace(ctx, id, role, parent.PlanMode, taskScope.Verifier)
+	if err != nil {
+		runtime.close(err)
+		return nil, factory.safeError(subagent.ErrInternal, "worktree isolation is unavailable", true)
+	}
+	keepIsolated := false
+	if isolated != nil {
+		defer func() {
+			if !keepIsolated {
+				_ = isolated.rollback(ctx)
+			}
+		}()
+	}
+	promptContext := ctx
+	releaseWorkspaceCall := func() {}
+	if isolated != nil {
+		promptContext, releaseWorkspaceCall, err = isolated.runtime.BeginCall(ctx)
+		if err != nil {
+			runtime.close(err)
+			return nil, factory.safeError(subagent.ErrInternal, "defined workspace admission is unavailable", false)
+		}
+		defer releaseWorkspaceCall()
+		if err := factory.bindDefinedWorktreeRuntime(promptContext, runtime, isolated.runtime, isolated.lease, role); err != nil {
+			runtime.close(err)
+			return nil, factory.safeError(subagent.ErrInternal, "defined workspace runtime is invalid", false)
+		}
 	}
 	if backgroundTask {
 		changed, _ := runtime.ActiveTools.MoveToBackground()
@@ -273,7 +448,12 @@ func (factory *SubagentRunnerFactory) prepareDefined(ctx context.Context, id sub
 			return nil, factory.safeError(subagent.ErrInternal, "defined background capability switch is unavailable", false)
 		}
 	}
-	prefix, err := factory.definedPromptPrefix(ctx, runtime)
+	var prefix provider.PromptPrefixSnapshot
+	if isolated == nil {
+		prefix, err = factory.definedPromptPrefix(promptContext, runtime)
+	} else {
+		prefix, err = factory.definedWorktreePromptPrefix(promptContext, runtime, isolated.runtime.SessionContext(), isolated.lease)
+	}
 	if err != nil {
 		runtime.close(err)
 		return nil, factory.safeError(subagent.ErrContextBudgetExceeded, "defined prompt prefix is invalid", true)
@@ -284,6 +464,13 @@ func (factory *SubagentRunnerFactory) prepareDefined(ctx context.Context, id sub
 		factory: factory, runtime: runtime, projectRoot: factory.options.Executor.ProjectRoot,
 		metadata: preparedMetadata(input.Type, roleName, role, profile), background: backgroundTask,
 	}
+	if isolated != nil {
+		task.projectRoot = isolated.lease.Root
+		task.workspaceRuntime = isolated.runtime
+		task.workspaceLease = isolated.lease
+		task.worktreeManager = isolated.manager
+	}
+	task.metadata = preparedMetadata(input.Type, roleName, role, runtime.Profile)
 	if err := task.validatePreparedBudget(ctx); err != nil {
 		runtime.close(err)
 		if errors.Is(err, errSubagentContextBudgetExceeded) {
@@ -291,6 +478,7 @@ func (factory *SubagentRunnerFactory) prepareDefined(ctx context.Context, id sub
 		}
 		return nil, factory.safeError(subagent.ErrInternal, "defined child request budget could not be measured", false)
 	}
+	keepIsolated = true
 	return task, nil
 }
 
@@ -364,9 +552,12 @@ func (factory *SubagentRunnerFactory) prepareFork(ctx context.Context, id subage
 	if err != nil {
 		return nil, factory.safeError(subagent.ErrInternal, "fork capability switch is unavailable", false)
 	}
-	changed, _ := activeTools.MoveToBackground()
-	if !changed {
-		return nil, factory.safeError(subagent.ErrInternal, "fork background capability switch is unavailable", false)
+	isWorktree := role != nil && role.Definition.Isolation == agentrole.IsolationWorktree
+	if !isWorktree {
+		changed, _ := activeTools.MoveToBackground()
+		if !changed {
+			return nil, factory.safeError(subagent.ErrInternal, "fork background capability switch is unavailable", false)
+		}
 	}
 	taskScope, err := factory.options.Authorizer.NewTaskScope(permission.TaskScopeOptions{
 		ScopeID: string(id), Mode: effectivePermission, AllowPermanent: false,
@@ -409,11 +600,14 @@ func (factory *SubagentRunnerFactory) prepareFork(ctx context.Context, id subage
 	})
 	childConversation.UpdatedAt = now
 
-	prefix, err := cloneForkPromptPrefix(parent.Prompt, model)
-	if err != nil {
-		readCache.Close()
-		confirmation.Close(err)
-		return nil, factory.safeError(subagent.ErrParentSnapshotUnavailable, "fork prompt snapshot is invalid", true)
+	var prefix provider.PromptPrefixSnapshot
+	if !isWorktree {
+		prefix, err = cloneForkPromptPrefix(parent.Prompt, model)
+		if err != nil {
+			readCache.Close()
+			confirmation.Close(err)
+			return nil, factory.safeError(subagent.ErrParentSnapshotUnavailable, "fork prompt snapshot is invalid", true)
+		}
 	}
 	runtimeCtx, cancel := context.WithCancelCause(context.Background())
 	profile := RuntimeProfile{
@@ -426,15 +620,60 @@ func (factory *SubagentRunnerFactory) prepareFork(ctx context.Context, id subage
 	}
 	runtime := &TaskRuntimeState{
 		TaskID: id, Parent: input.Parent, Role: role, Conversation: childConversation, Profile: profile,
-		ActiveTools: activeTools, Authorizer: taskScope.Authorizer, Executor: scopedExecutor,
+		ActiveTools: activeTools, Registry: parent.Registry, ToolExecutor: factory.options.Executor,
+		Authorizer: taskScope.Authorizer, Executor: scopedExecutor, Hooks: factory.options.Hooks,
 		Confirm: confirmation, ReadCache: readCache, HookSessionID: hookSessionID,
 		Context: runtimeCtx, Cancel: cancel, Prompt: prefix, RequestBudgeter: factory.options.RequestBudgeter,
+	}
+	isolated, err := factory.prepareIsolatedWorkspace(ctx, id, role, parent.PlanMode, taskScope.Verifier)
+	if err != nil {
+		runtime.close(err)
+		return nil, factory.safeError(subagent.ErrInternal, "worktree isolation is unavailable", true)
+	}
+	keepIsolated := false
+	if isolated != nil {
+		defer func() {
+			if !keepIsolated {
+				_ = isolated.rollback(ctx)
+			}
+		}()
+		workspaceContext, releaseWorkspace, admissionErr := isolated.runtime.BeginCall(ctx)
+		if admissionErr != nil {
+			runtime.close(admissionErr)
+			return nil, factory.safeError(subagent.ErrInternal, "fork workspace admission is unavailable", false)
+		}
+		defer releaseWorkspace()
+		if bindErr := factory.bindDefinedWorktreeRuntime(workspaceContext, runtime, isolated.runtime, isolated.lease, role); bindErr != nil {
+			runtime.close(bindErr)
+			return nil, factory.safeError(subagent.ErrInternal, "fork workspace runtime is invalid", false)
+		}
+		changed, _ := runtime.ActiveTools.MoveToBackground()
+		if !changed {
+			runtime.close(errors.New("background capability switch failed"))
+			return nil, factory.safeError(subagent.ErrInternal, "fork background capability switch is unavailable", false)
+		}
+		prefix, err = factory.forkWorktreePromptPrefix(
+			workspaceContext, parent.Prompt, runtime, isolated.runtime.SessionContext(), isolated.lease, model,
+		)
+		if err != nil {
+			runtime.close(err)
+			return nil, factory.safeError(subagent.ErrParentSnapshotUnavailable, "fork workspace prompt snapshot is invalid", true)
+		}
+		runtime.Prompt = prefix
 	}
 	task := &preparedSubagentTask{
 		factory: factory, runtime: runtime, projectRoot: factory.options.Executor.ProjectRoot,
 		metadata: preparedMetadata(input.Type, roleName, role, profile), background: true,
 		conversationMessageOffset: messageOffset, appendRoleToPrompt: role != nil,
 	}
+	if isolated != nil {
+		task.projectRoot = isolated.lease.Root
+		task.workspaceRuntime = isolated.runtime
+		task.workspaceLease = isolated.lease
+		task.worktreeManager = isolated.manager
+		task.appendRoleToPrompt = false
+	}
+	task.metadata = preparedMetadata(input.Type, roleName, role, runtime.Profile)
 	if err := task.validatePreparedBudget(ctx); err != nil {
 		runtime.close(err)
 		if errors.Is(err, errSubagentContextBudgetExceeded) {
@@ -442,6 +681,7 @@ func (factory *SubagentRunnerFactory) prepareFork(ctx context.Context, id subage
 		}
 		return nil, factory.safeError(subagent.ErrInternal, "fork child request budget could not be measured", false)
 	}
+	keepIsolated = true
 	return task, nil
 }
 
@@ -496,11 +736,11 @@ func (factory *SubagentRunnerFactory) definedPromptPrefix(ctx context.Context, r
 	stable := make([]provider.SystemBlock, 0, len(sections))
 	for _, section := range sections {
 		stable = append(stable, provider.SystemBlock{
-			Name: section.Name, Content: factory.options.RuntimeRedactor.Redact(section.Content), Cacheable: true,
+			Name: section.Name, Content: factory.options.RuntimeRedactor.Redact(section.Content), Cacheable: true, Scope: section.Scope,
 		})
 	}
 	dynamic := []provider.SystemBlock{{
-		Name: "subagent-role", Content: runtime.Role.Definition.Instructions, Cacheable: false,
+		Name: "subagent-role", Content: runtime.Role.Definition.Instructions, Cacheable: false, Scope: prompt.ScopeRuntime,
 	}}
 	current := runtime.ActiveTools.Current()
 	request := provider.ChatRequest{
@@ -511,11 +751,171 @@ func (factory *SubagentRunnerFactory) definedPromptPrefix(ctx context.Context, r
 	return provider.CapturePromptPrefix(request)
 }
 
+func (factory *SubagentRunnerFactory) bindDefinedWorktreeRuntime(
+	ctx context.Context,
+	runtime *TaskRuntimeState,
+	bound workspace.Runtime,
+	lease worktree.Lease,
+	role *agentrole.ResolvedRole,
+) error {
+	if ctx == nil || ctx.Err() != nil || runtime == nil || bound == nil || role == nil {
+		return errors.New("defined workspace runtime binding is unavailable")
+	}
+	root := bound.Root()
+	rootHandle := bound.RootHandle()
+	boundLease := bound.Lease()
+	registry := bound.Registry()
+	toolExecutor := bound.ToolExecutor()
+	scopedExecutor := bound.Executor()
+	capabilities := bound.Capabilities()
+	hooks := bound.Hooks()
+	if root != lease.Root || boundLease != lease || !filepath.IsAbs(root) || filepath.Clean(root) != root ||
+		rootHandle == nil || rootHandle.Identity() == (safefs.Identity{}) || registry == nil || !registry.IsSealed() ||
+		toolExecutor == nil || toolExecutor.Registry != registry || toolExecutor.ProjectRoot != root ||
+		scopedExecutor == nil || capabilities == nil || hooks == nil {
+		return errors.New("defined workspace runtime binding is invalid")
+	}
+	foreground, background, err := tool.BuildCapabilityViews(
+		registry, &role.Definition, factory.options.BackgroundPolicy,
+		factory.options.GlobalDenied, runtime.Profile.PlanMode,
+	)
+	if err != nil || capabilities.Current().Fingerprint != foreground.Fingerprint {
+		return errors.New("defined workspace capabilities are invalid")
+	}
+	if runtime.ReadCache != nil {
+		runtime.ReadCache.Close()
+		runtime.ReadCache = nil
+	}
+	runtime.ActiveTools = capabilities
+	runtime.Registry = registry
+	runtime.ToolExecutor = toolExecutor
+	runtime.Executor = scopedExecutor
+	runtime.Hooks = hooks
+	runtime.Profile.ReadRoots = []string{root}
+	runtime.Profile.ForegroundTools = foreground.Clone()
+	runtime.Profile.BackgroundTools = background.Clone()
+	return nil
+}
+
+func (factory *SubagentRunnerFactory) definedWorktreePromptPrefix(
+	ctx context.Context,
+	runtime *TaskRuntimeState,
+	preparer sessionctx.StablePreparer,
+	lease worktree.Lease,
+) (provider.PromptPrefixSnapshot, error) {
+	if ctx == nil || ctx.Err() != nil || runtime == nil || preparer == nil || runtime.Role == nil {
+		return provider.PromptPrefixSnapshot{}, errors.New("defined workspace prompt context is unavailable")
+	}
+	prepared := preparer.PrepareStable(ctx)
+	optional := make([]prompt.Section, 0, len(prepared.StableSections))
+	for _, section := range prepared.StableSections {
+		switch section.Scope {
+		case prompt.ScopeGlobal, prompt.ScopeUser, prompt.ScopeProject:
+			optional = append(optional, section)
+		}
+	}
+	sections := prompt.StableSections(redactStableSections(factory.options.RuntimeRedactor, optional))
+	stable := make([]provider.SystemBlock, 0, len(sections))
+	for _, section := range sections {
+		stable = append(stable, provider.SystemBlock{
+			Name: section.Name, Content: factory.options.RuntimeRedactor.Redact(section.Content), Cacheable: true, Scope: section.Scope,
+		})
+	}
+	workspaceBlock, err := factory.definedWorktreeRuntimeBlock(lease)
+	if err != nil {
+		return provider.PromptPrefixSnapshot{}, err
+	}
+	dynamic := []provider.SystemBlock{
+		{Name: "subagent-role", Content: runtime.Role.Definition.Instructions, Cacheable: false, Scope: prompt.ScopeRuntime},
+		workspaceBlock,
+	}
+	current := runtime.ActiveTools.Current()
+	request := provider.ChatRequest{
+		Model: runtime.Profile.Model, StableSystem: stable, DynamicSystem: dynamic,
+		Thinking: factory.options.Thinking, Tools: toolDefinitionsFromRegistry(current.Registry),
+		Cache: provider.CachePolicy{EnablePromptCache: true, CacheTools: true},
+	}
+	return provider.CapturePromptPrefix(request)
+}
+
+func (factory *SubagentRunnerFactory) forkWorktreePromptPrefix(
+	ctx context.Context,
+	parent provider.PromptPrefixSnapshot,
+	runtime *TaskRuntimeState,
+	preparer sessionctx.StablePreparer,
+	lease worktree.Lease,
+	model string,
+) (provider.PromptPrefixSnapshot, error) {
+	if ctx == nil || ctx.Err() != nil || runtime == nil || runtime.Role == nil || preparer == nil {
+		return provider.PromptPrefixSnapshot{}, errors.New("fork workspace prompt context is unavailable")
+	}
+	prepared := preparer.PrepareStable(ctx)
+	projectSections := make([]prompt.Section, 0, len(prepared.StableSections))
+	for _, section := range prepared.StableSections {
+		if !section.Scope.Valid() {
+			return provider.PromptPrefixSnapshot{}, errors.New("fork workspace prompt scope is invalid")
+		}
+		if section.Scope == prompt.ScopeProject {
+			projectSections = append(projectSections, section)
+		}
+	}
+	sections := prompt.StableSections(redactStableSections(factory.options.RuntimeRedactor, projectSections))
+	projectBlocks := make([]provider.SystemBlock, 0, len(sections))
+	for _, section := range sections {
+		projectBlocks = append(projectBlocks, provider.SystemBlock{
+			Name: section.Name, Content: factory.options.RuntimeRedactor.Redact(section.Content), Cacheable: true, Scope: prompt.ScopeProject,
+		})
+	}
+	workspaceBlock, err := factory.definedWorktreeRuntimeBlock(lease)
+	if err != nil {
+		return provider.PromptPrefixSnapshot{}, err
+	}
+	runtimeBlocks := []provider.SystemBlock{
+		{Name: "subagent-role", Content: runtime.Role.Definition.Instructions, Cacheable: false, Scope: prompt.ScopeRuntime},
+		workspaceBlock,
+	}
+	current := runtime.ActiveTools.Current()
+	request, err := parent.BuildWorkspaceChild(
+		projectBlocks, runtimeBlocks, toolDefinitionsFromRegistry(current.Registry),
+	)
+	if err != nil {
+		return provider.PromptPrefixSnapshot{}, err
+	}
+	request.Model = model
+	return provider.CapturePromptPrefix(request)
+}
+
+func (factory *SubagentRunnerFactory) definedWorktreeRuntimeBlock(lease worktree.Lease) (provider.SystemBlock, error) {
+	metadata, err := json.Marshal(struct {
+		WorkspaceID string `json:"workspace_id"`
+		Root        string `json:"root"`
+		BaseOID     string `json:"base_oid"`
+		Branch      string `json:"branch"`
+	}{WorkspaceID: lease.WorkspaceID, Root: lease.Root, BaseOID: lease.BaseOID, Branch: lease.Branch})
+	if err != nil {
+		return provider.SystemBlock{}, err
+	}
+	content := strings.Join([]string{
+		"这是任务私有的 Worktree 运行时边界：" + string(metadata),
+		"所有文件和命令工具都必须使用显式 cwd，并将项目根指向上述 Worktree；不得依赖进程当前目录。",
+		"主目录、其他 Worktree 和共享依赖均为只读；只允许在任务 Worktree、任务 scratch 和明确 artifact 根内写入。",
+	}, "\n")
+	return provider.SystemBlock{
+		Name: "worktree-runtime", Content: factory.options.RuntimeRedactor.Redact(content),
+		Cacheable: false, Scope: prompt.ScopeRuntime,
+	}, nil
+}
+
 type preparedSubagentTask struct {
 	factory     *SubagentRunnerFactory
 	runtime     *TaskRuntimeState
 	projectRoot string
 	metadata    subagent.PreparedMetadata
+	// These fields retain ownership for T54. T51 uses them only to ensure no
+	// acquired resource is lost before PreparedTask is published.
+	workspaceRuntime workspace.Runtime
+	workspaceLease   worktree.Lease
+	worktreeManager  WorktreeLifecycleManager
 	// Fork requests start from Prompt.Messages, not from the separately
 	// materialized audit Conversation. Only the child-owned suffix at and after
 	// this offset is appended on every round.
@@ -524,9 +924,12 @@ type preparedSubagentTask struct {
 
 	mu                   sync.Mutex
 	run                  bool
+	runTemplate          subagent.Completion
 	firstRequestObserver func(context.Context)
 	firstObserved        bool
 	confirmationSequence uint64
+	settleOnce           sync.Once
+	settled              subagent.Completion
 
 	placementMu sync.Mutex
 	background  bool
@@ -676,6 +1079,14 @@ func (task *preparedSubagentTask) MoveToBackground() bool {
 	}
 	task.placementMu.Lock()
 	defer task.placementMu.Unlock()
+	workspaceContext, releaseWorkspace, err := task.beginWorkspaceCall(task.runtime.Context)
+	if err != nil {
+		return false
+	}
+	defer releaseWorkspace()
+	if workspaceContext.Err() != nil {
+		return false
+	}
 	if task.background {
 		return false
 	}
@@ -789,12 +1200,12 @@ func (task *preparedSubagentTask) requestForIteration(iteration int) (provider.C
 	dynamic := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
 		dynamic = append(dynamic, provider.SystemBlock{
-			Name: block.Name, Content: task.factory.options.RuntimeRedactor.Redact(block.Content), Cacheable: false,
+			Name: block.Name, Content: task.factory.options.RuntimeRedactor.Redact(block.Content), Cacheable: false, Scope: block.Scope,
 		})
 	}
 	if task.appendRoleToPrompt && task.runtime.Role != nil {
 		dynamic = append([]provider.SystemBlock{{
-			Name: "subagent-role", Content: task.runtime.Role.Definition.Instructions, Cacheable: false,
+			Name: "subagent-role", Content: task.runtime.Role.Definition.Instructions, Cacheable: false, Scope: prompt.ScopeRuntime,
 		}}, dynamic...)
 	}
 	messages, err := taskModelMessagesFrom(task.runtime.Conversation, task.conversationMessageOffset)
@@ -826,7 +1237,7 @@ func (task *preparedSubagentTask) requestForTurn(ctx context.Context, iteration 
 	if ref.ExecutionID == "" {
 		return task.finalizeTurnRequest(ctx, request, nil)
 	}
-	lease, err := task.factory.options.Hooks.AcquirePrompts(ctx, ref)
+	lease, err := task.runtime.Hooks.AcquirePrompts(ctx, ref)
 	if err != nil {
 		return provider.ChatRequest{}, err
 	}
@@ -845,7 +1256,7 @@ func (task *preparedSubagentTask) requestForTurn(ctx context.Context, iteration 
 		if name == "" || strings.TrimSpace(content.Text()) == "" {
 			continue
 		}
-		appended = append(appended, provider.SystemBlock{Name: name, Content: content, Cacheable: false})
+		appended = append(appended, provider.SystemBlock{Name: name, Content: content, Cacheable: false, Scope: prompt.ScopeRuntime})
 	}
 	if len(appended) == 0 {
 		lease.Release()
@@ -898,14 +1309,14 @@ func (task *preparedSubagentTask) streamChat(ctx context.Context, request provid
 	return task.factory.options.Provider.StreamChat(ctx, request)
 }
 
-func (task *preparedSubagentTask) Run(ctx context.Context, sink subagent.EventSink) subagent.Completion {
+func (task *preparedSubagentTask) Run(ctx context.Context, sink subagent.EventSink) subagent.RunResult {
 	if task == nil || task.runtime == nil || task.factory == nil {
-		return subagent.Completion{}
+		return subagent.RunResult{}
 	}
 	task.mu.Lock()
 	if task.run {
 		task.mu.Unlock()
-		return task.failureCompletion(subagent.StopInternalError, subagent.ErrInternal, "task was already run", false)
+		return runResultFromCompletion(task.failureCompletion(subagent.StopInternalError, subagent.ErrInternal, "task was already run", false))
 	}
 	task.run = true
 	task.mu.Unlock()
@@ -918,11 +1329,24 @@ func (task *preparedSubagentTask) Run(ctx context.Context, sink subagent.EventSi
 		task.runtime.Cancel(cause)
 	}
 	defer task.runtime.close(context.Cause(task.runtime.Context))
+	workspaceContext, releaseWorkspace, err := task.beginWorkspaceCall(task.runtime.Context)
+	if err != nil {
+		completion := task.failureCompletion(subagent.StopInternalError, subagent.ErrInternal, "workspace runtime is not accepting calls", false)
+		task.mu.Lock()
+		task.runTemplate = completion.Clone()
+		task.mu.Unlock()
+		return runResultFromCompletion(completion)
+	}
+	defer releaseWorkspace()
+	stopWorkspaceBridge := context.AfterFunc(workspaceContext, func() {
+		task.runtime.Cancel(context.Cause(workspaceContext))
+	})
+	defer stopWorkspaceBridge()
 	bridge := newTaskEventBridge(
 		task.runtime.Context, task.runtime.Cancel, sink,
 		task.factory.options.Limits.MaxEventBytes, task.factory.options.Limits.MaxSubscriberBuffer,
 	)
-	hooks := task.factory.options.Hooks
+	hooks := task.runtime.Hooks
 	hooks.SessionStart(task.runtime.Context, task.runtime.HookSessionID, hook.SessionNew)
 
 	var completion subagent.Completion
@@ -940,7 +1364,162 @@ func (task *preparedSubagentTask) Run(ctx context.Context, sink subagent.EventSi
 		completion = task.failureCompletion(subagent.StopInternalError, subagent.ErrInternal, "subagent event consumer failed", false)
 	}
 	hooks.SessionEnd(context.WithoutCancel(task.runtime.Context), task.runtime.HookSessionID, hook.SessionEndExit)
-	return completion
+	task.mu.Lock()
+	task.runTemplate = completion.Clone()
+	task.mu.Unlock()
+	return runResultFromCompletion(completion)
+}
+
+// Settle closes task-owned workspace access before Git inspection and publishes
+// exactly one terminal projection. Cleanup is owner work: caller cancellation
+// must not skip it. T57 adds the authoritative cleanup deadline.
+func (task *preparedSubagentTask) Settle(ctx context.Context, result subagent.RunResult) subagent.Completion {
+	if task == nil || task.runtime == nil || task.factory == nil {
+		return subagent.Completion{}
+	}
+	task.settleOnce.Do(func() {
+		task.mu.Lock()
+		template := task.runTemplate.Clone()
+		task.mu.Unlock()
+		completion := completionFromRunResult(task.runtime.TaskID, result)
+		if template.ID == task.runtime.TaskID {
+			completion.SummaryTruncated = template.SummaryTruncated
+			completion.TruncationReason = template.TruncationReason
+		}
+		completion.Workspace = task.settleWorkspace(ctx)
+		completion.EndedAt = task.factory.options.Clock()
+		task.settled = completion.Clone()
+	})
+	return task.settled.Clone()
+}
+
+func (task *preparedSubagentTask) settleWorkspace(ctx context.Context) subagent.WorkspaceSummary {
+	if task.workspaceRuntime == nil {
+		return subagent.WorkspaceSummary{}
+	}
+	summary := subagent.WorkspaceSummary{
+		WorkspaceID: task.workspaceLease.WorkspaceID,
+		Isolation:   "worktree",
+		BaseOID:     task.workspaceLease.BaseOID,
+		Branch:      task.workspaceLease.Branch,
+	}
+	cleanupContext := context.Background()
+	if ctx != nil {
+		cleanupContext = context.WithoutCancel(ctx)
+	}
+
+	task.workspaceRuntime.StopAccepting()
+	closeErr := task.workspaceRuntime.Close(cleanupContext)
+	runtimeStopped := closeErr == nil
+	if task.worktreeManager == nil {
+		return task.failedWorkspaceSummary(summary, "settlement_unavailable", "workspace settlement requires attention")
+	}
+	settlement, settleErr := task.worktreeManager.Settle(
+		cleanupContext, task.workspaceLease, worktree.SettleRequest{RuntimeStopped: runtimeStopped},
+	)
+	var releaseErr error
+	if runtimeStopped {
+		releaseErr = task.worktreeManager.Release(cleanupContext, task.workspaceLease)
+	}
+	if !runtimeStopped {
+		return task.failedWorkspaceSummary(summary, "runtime_active", "workspace runtime did not stop")
+	}
+	if settleErr != nil || !validWorkspaceSettlement(settlement) {
+		return task.failedWorkspaceSummary(summary, "settlement_failed", "workspace settlement requires attention")
+	}
+	if releaseErr != nil {
+		return task.failedWorkspaceSummary(summary, "lease_release_failed", "workspace lease release requires attention")
+	}
+	summary.State = string(settlement.State)
+	summary.Cleanup = string(settlement.State)
+	summary.Dirty = settlement.Dirty
+	summary.Unpushed = settlement.Unpushed
+	if settlement.State != worktree.SettlementDeleted {
+		summary.RetentionCause = settlement.ReasonCode
+	}
+	return summary
+}
+
+func (task *preparedSubagentTask) failedWorkspaceSummary(
+	summary subagent.WorkspaceSummary,
+	reason string,
+	message string,
+) subagent.WorkspaceSummary {
+	state := worktree.SettlementManualAttention
+	if reason == "runtime_active" {
+		state = worktree.SettlementRetained
+	}
+	summary.State = string(state)
+	summary.Cleanup = string(state)
+	summary.RetentionCause = reason
+	safe, _, _ := task.boundedSummary(message)
+	summary.Error = subagent.SafeError(subagent.ErrInternal, safe, false)
+	return summary
+}
+
+func validWorkspaceSettlement(settlement worktree.Settlement) bool {
+	switch settlement.State {
+	case worktree.SettlementDeleted:
+		return settlement.ReasonCode == "clean" && !settlement.Dirty && !settlement.Unpushed
+	case worktree.SettlementRetained, worktree.SettlementPartial, worktree.SettlementManualAttention:
+		return validWorkspaceSettlementReason(settlement.ReasonCode)
+	default:
+		return false
+	}
+}
+
+func validWorkspaceSettlementReason(reason string) bool {
+	switch reason {
+	case "runtime_active",
+		"lease_release_failed",
+		"identity_unknown",
+		"manifest_unknown",
+		"initialization_changed",
+		"inspection_unknown",
+		"protected_changes",
+		"unpushed_commits",
+		"delete_unavailable",
+		"delete_lock_failed",
+		"delete_lease_failed",
+		"worktree_in_use",
+		"identity_mismatch",
+		"directory_identity_mismatch",
+		"record_changed",
+		"git_management_mismatch",
+		"branch_moved",
+		"manifest_mismatch",
+		"worktree_remove_failed",
+		"worktree_remove_interrupted",
+		"branch_cas_failed",
+		"branch_cas_interrupted",
+		"tombstone_failed",
+		"tombstone_interrupted",
+		"lease_identity_mismatch",
+		"partial_directory_unknown",
+		"partial_registration_unknown",
+		"partial_registration_present",
+		"partial_branch_unknown",
+		"partial_branch_moved",
+		"partial_branch_present":
+		return true
+	default:
+		return false
+	}
+}
+
+func runResultFromCompletion(completion subagent.Completion) subagent.RunResult {
+	return subagent.RunResult{
+		Status: completion.Status, StopReason: completion.StopReason, Summary: completion.Summary,
+		Usage: completion.Usage, Error: completion.Error,
+	}.Clone()
+}
+
+func completionFromRunResult(id subagent.ID, result subagent.RunResult) subagent.Completion {
+	result = result.Clone()
+	return subagent.Completion{
+		ID: id, Status: result.Status, StopReason: result.StopReason, Summary: result.Summary,
+		Usage: result.Usage, Error: result.Error,
+	}
 }
 
 func (task *preparedSubagentTask) runNonInteractiveLoop(bridge *taskEventBridge) subagent.Completion {
@@ -957,7 +1536,7 @@ func (task *preparedSubagentTask) runNonInteractiveLoop(bridge *taskEventBridge)
 		}}) {
 			return task.failureCompletion(subagent.StopCancelled, subagent.ErrCancelled, "subagent event stream was cancelled", true)
 		}
-		ref := task.factory.options.Hooks.BeginTurn(
+		ref := task.runtime.Hooks.BeginTurn(
 			task.runtime.Context, task.runtime.HookSessionID, hook.ExecutionIsolatedSkill,
 			hookMode(runModeFromPlan(task.runtime.Profile.PlanMode)),
 		)
@@ -1022,9 +1601,9 @@ func (task *preparedSubagentTask) runNonInteractiveLoop(bridge *taskEventBridge)
 		}
 		assistantText := collector.AssistantText.String()
 		if assistantText != "" {
-			message := task.factory.options.Hooks.BeginMessage(task.runtime.Context, ref, hook.MessageAssistant, assistantText)
+			message := task.runtime.Hooks.BeginMessage(task.runtime.Context, ref, hook.MessageAssistant, assistantText)
 			task.appendConversationMessage(conversation.RoleAssistant, assistantText, nil)
-			task.factory.options.Hooks.EndMessage(task.runtime.Context, message)
+			task.runtime.Hooks.EndMessage(task.runtime.Context, message)
 		}
 		if len(collector.ToolCalls) == 0 {
 			task.endTurn(ref, hook.TurnCompleted, "completed")
@@ -1120,7 +1699,7 @@ func (task *preparedSubagentTask) executeTaskToolBatch(
 			return unknown, err
 		}
 		if outcome.afterHook {
-			task.factory.options.Hooks.AfterTool(
+			task.runtime.Hooks.AfterTool(
 				context.WithoutCancel(ctx), ref, outcome.hookInput,
 				hook.ToolOutputFromUserView(outcome.projection.UserView), outcome.duration,
 			)
@@ -1163,7 +1742,7 @@ func (task *preparedSubagentTask) executeTaskTool(
 		return outcome, errors.New("task capability registry is unavailable")
 	}
 	if !current.Allows(call.Name) {
-		_, known := task.factory.options.Registry.Get(call.Name)
+		_, known := task.runtime.Registry.Get(call.Name)
 		outcome.unknown = !known
 		code := tool.ErrToolFiltered
 		message := "Tool is unavailable in the current task capability view: " + string(current.FilterReason(call.Name))
@@ -1193,7 +1772,7 @@ func (task *preparedSubagentTask) executeTaskTool(
 	if err != nil {
 		return outcome, err
 	}
-	validated, err := task.factory.options.Executor.PrepareCall(execCtx, call)
+	validated, err := task.runtime.ToolExecutor.PrepareCall(execCtx, call)
 	if err != nil {
 		result, buildErr := task.syntheticToolResult(call, tool.StatusError,
 			"Tool arguments are invalid.", tool.ErrInvalidArguments)
@@ -1216,7 +1795,7 @@ func (task *preparedSubagentTask) executeTaskTool(
 		}
 		return task.projectTaskToolResult(call, result)
 	}
-	identity, err := task.factory.options.Executor.CallIdentity(validated)
+	identity, err := task.runtime.ToolExecutor.CallIdentity(validated)
 	if err != nil {
 		return outcome, err
 	}
@@ -1229,7 +1808,7 @@ func (task *preparedSubagentTask) executeTaskTool(
 		return task.projectTaskToolResult(call, result)
 	}
 	hookInput := hook.NewToolInput(call.ID, call.Name, validated.Arguments)
-	if hookDecision := task.factory.options.Hooks.BeforeTool(ctx, ref, hookInput); hookDecision.IsDeny() {
+	if hookDecision := task.runtime.Hooks.BeforeTool(ctx, ref, hookInput); hookDecision.IsDeny() {
 		result, buildErr := task.syntheticToolResult(call, tool.StatusDenied,
 			"Tool execution was denied by a task hook.", tool.ErrHookDenied)
 		if buildErr != nil {
@@ -1397,7 +1976,17 @@ func (task *preparedSubagentTask) nextConfirmationID() string {
 }
 
 func (task *preparedSubagentTask) endTurn(ref hook.ExecutionRef, status hook.TurnStatus, detail string) {
-	task.factory.options.Hooks.EndTurn(context.WithoutCancel(task.runtime.Context), ref, status, detail)
+	task.runtime.Hooks.EndTurn(context.WithoutCancel(task.runtime.Context), ref, status, detail)
+}
+
+func (task *preparedSubagentTask) beginWorkspaceCall(ctx context.Context) (context.Context, func(), error) {
+	if ctx == nil {
+		return nil, nil, errors.New("workspace call context is unavailable")
+	}
+	if task == nil || task.workspaceRuntime == nil {
+		return ctx, func() {}, nil
+	}
+	return task.workspaceRuntime.BeginCall(ctx)
 }
 
 func runModeFromPlan(plan bool) RunMode {
@@ -1425,7 +2014,6 @@ func (task *preparedSubagentTask) completedCompletion(summary string) subagent.C
 			InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
 			CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheReadInputTokens: usage.CacheReadInputTokens,
 		},
-		EndedAt: task.factory.options.Clock(),
 	}
 }
 
@@ -1456,7 +2044,7 @@ func (task *preparedSubagentTask) failureCompletion(reason subagent.StopReason, 
 			InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
 			CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheReadInputTokens: usage.CacheReadInputTokens,
 		},
-		Error: subagent.SafeError(code, safe, recoverable), EndedAt: task.factory.options.Clock(),
+		Error: subagent.SafeError(code, safe, recoverable),
 	}
 }
 

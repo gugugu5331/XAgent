@@ -97,6 +97,7 @@ const (
 	StatusQueued              Status = "queued"
 	StatusRunning             Status = "running"
 	StatusWaitingConfirmation Status = "waiting_confirmation"
+	StatusSettling            Status = "settling"
 	StatusCompleted           Status = "completed"
 	StatusFailed              Status = "failed"
 	StatusCancelled           Status = "cancelled"
@@ -109,6 +110,7 @@ func (status Status) Valid() bool {
 	case StatusQueued,
 		StatusRunning,
 		StatusWaitingConfirmation,
+		StatusSettling,
 		StatusCompleted,
 		StatusFailed,
 		StatusCancelled,
@@ -135,11 +137,13 @@ func CanTransition(from, to Status) bool {
 	}
 	switch from {
 	case StatusQueued:
-		return to == StatusRunning || to == StatusCancelled
+		return to == StatusRunning || to == StatusSettling || to == StatusCancelled
 	case StatusRunning:
-		return to == StatusWaitingConfirmation || IsTerminal(to)
+		return to == StatusWaitingConfirmation || to == StatusSettling || IsTerminal(to)
 	case StatusWaitingConfirmation:
-		return to == StatusRunning || to == StatusFailed || to == StatusCancelled || to == StatusTimedOut || to == StatusLimitReached
+		return to == StatusRunning || to == StatusSettling || to == StatusFailed || to == StatusCancelled || to == StatusTimedOut || to == StatusLimitReached
+	case StatusSettling:
+		return IsTerminal(to)
 	default:
 		return false
 	}
@@ -190,11 +194,110 @@ type Usage struct {
 	CacheReadInputTokens     int64
 }
 
+// RunResult captures the execution phase before task-owned resources settle.
+// It deliberately has no EndedAt because the public task is not terminal yet.
+type RunResult struct {
+	Status     Status
+	StopReason StopReason
+	Summary    redact.SafeText
+	Usage      Usage
+	Error      *diagnostics.SafeError
+}
+
+func (result RunResult) Clone() RunResult {
+	cloned := result
+	cloned.Error = cloneSafeError(result.Error)
+	return cloned
+}
+
 func (usage Usage) Validate() error {
 	if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CacheCreationInputTokens < 0 || usage.CacheReadInputTokens < 0 {
 		return errors.New("subagent usage is invalid")
 	}
 	return nil
+}
+
+// WorkspaceSummary is the path-free lifecycle projection attached to a final
+// completion. Empty Isolation represents the existing shared workspace mode.
+type WorkspaceSummary struct {
+	WorkspaceID    string
+	Isolation      string
+	State          string
+	BaseOID        string
+	Branch         string
+	Dirty          bool
+	Unpushed       bool
+	Cleanup        string
+	RetentionCause string
+	Error          *diagnostics.SafeError
+}
+
+func (summary WorkspaceSummary) Clone() WorkspaceSummary {
+	cloned := summary
+	cloned.Error = cloneSafeError(summary.Error)
+	return cloned
+}
+
+func (summary WorkspaceSummary) Validate() error {
+	if summary.Isolation == "" {
+		if summary != (WorkspaceSummary{}) {
+			return errors.New("shared subagent workspace summary contains isolated state")
+		}
+		return nil
+	}
+	if summary.Isolation != "worktree" ||
+		!validLowerHex(summary.WorkspaceID, 32) ||
+		!validWorkspaceTerminal(summary.State) ||
+		!validGitOID(summary.BaseOID) ||
+		summary.Branch != "xagent/worktree/"+summary.WorkspaceID ||
+		!validWorkspaceTerminal(summary.Cleanup) {
+		return errors.New("subagent workspace summary is invalid")
+	}
+	if summary.RetentionCause != "" && !validWorkspaceReason(summary.RetentionCause) {
+		return errors.New("subagent workspace retention cause is invalid")
+	}
+	return nil
+}
+
+func validGitOID(value string) bool {
+	return validLowerHex(value, 40) || validLowerHex(value, 64)
+}
+
+func validLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validWorkspaceTerminal(value string) bool {
+	switch value {
+	case "deleted", "retained", "partial", "manual_attention":
+		return true
+	default:
+		return false
+	}
+}
+
+func validWorkspaceReason(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			continue
+		}
+		if index > 0 && (character == '_' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type Completion struct {
@@ -206,12 +309,14 @@ type Completion struct {
 	StopReason       StopReason
 	Usage            Usage
 	Error            *diagnostics.SafeError
+	Workspace        WorkspaceSummary
 	EndedAt          time.Time
 }
 
 func (completion Completion) Clone() Completion {
 	cloned := completion
 	cloned.Error = cloneSafeError(completion.Error)
+	cloned.Workspace = completion.Workspace.Clone()
 	return cloned
 }
 
@@ -223,6 +328,9 @@ func (completion Completion) Validate() error {
 		return errors.New("subagent completion terminal state is invalid")
 	}
 	if err := completion.Usage.Validate(); err != nil {
+		return err
+	}
+	if err := completion.Workspace.Validate(); err != nil {
 		return err
 	}
 	if completion.SummaryTruncated != (completion.TruncationReason.Text() != "") {
@@ -419,7 +527,8 @@ type PreparedMetadata struct {
 }
 
 type PreparedTask interface {
-	Run(context.Context, EventSink) Completion
+	Run(context.Context, EventSink) RunResult
+	Settle(context.Context, RunResult) Completion
 	Metadata() PreparedMetadata
 }
 
@@ -456,6 +565,7 @@ const (
 	EventQueued                EventKind = "queued"
 	EventRunning               EventKind = "running"
 	EventWaitingConfirmation   EventKind = "waiting_confirmation"
+	EventSettling              EventKind = "settling"
 	EventIterationStarted      EventKind = "iteration_started"
 	EventTextDelta             EventKind = "text_delta"
 	EventThinkingDelta         EventKind = "thinking_delta"
@@ -480,6 +590,7 @@ func (kind EventKind) Valid() bool {
 	case EventQueued,
 		EventRunning,
 		EventWaitingConfirmation,
+		EventSettling,
 		EventIterationStarted,
 		EventTextDelta,
 		EventThinkingDelta,
@@ -557,7 +668,7 @@ func (event Event) ValidateOneOf() error {
 	}
 	var valid bool
 	switch event.Kind {
-	case EventQueued, EventRunning, EventWaitingConfirmation, EventIterationStarted, EventProgress:
+	case EventQueued, EventRunning, EventWaitingConfirmation, EventSettling, EventIterationStarted, EventProgress:
 		valid = event.Snapshot != nil && event.onlyPayloads(payloadSnapshot)
 	case EventTextDelta, EventThinkingDelta, EventTool, EventConfirmationRequested, EventUsage, EventDiagnostic:
 		valid = event.Agent != nil && event.onlyPayloads(payloadAgent)
@@ -647,11 +758,13 @@ type ResultNotification struct {
 	StopReason         StopReason
 	Usage              Usage
 	Error              *diagnostics.SafeError
+	Workspace          WorkspaceSummary
 }
 
 func (notification ResultNotification) Clone() ResultNotification {
 	cloned := notification
 	cloned.Error = cloneSafeError(notification.Error)
+	cloned.Workspace = notification.Workspace.Clone()
 	return cloned
 }
 

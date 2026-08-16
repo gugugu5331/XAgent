@@ -1,10 +1,31 @@
 package prompt
 
+// Scope 标识 Prompt 块与父会话或工作区的绑定范围。
+// 该元数据必须显式提供，调用方不得根据块名称猜测。
+type Scope string
+
+const (
+	ScopeGlobal  Scope = "global"
+	ScopeUser    Scope = "user"
+	ScopeProject Scope = "project"
+	ScopeRuntime Scope = "runtime"
+)
+
+func (scope Scope) Valid() bool {
+	switch scope {
+	case ScopeGlobal, ScopeUser, ScopeProject, ScopeRuntime:
+		return true
+	default:
+		return false
+	}
+}
+
 type Section struct {
 	Name     string
 	Priority int
 	Content  string
 	Stable   bool
+	Scope    Scope
 }
 
 type RunMode string
@@ -34,6 +55,7 @@ type Block struct {
 	Name    string
 	Content string
 	Stable  bool
+	Scope   Scope
 }
 
 type Bundle struct {

@@ -28,8 +28,8 @@ func TestReadCacheLRUAndDependencyInvalidation(t *testing.T) {
 	keyB := ReadCacheKey{Tool: "Glob", ArgumentsFingerprint: strings.Repeat("b", 64)}
 	keyC := ReadCacheKey{Tool: "Grep", ArgumentsFingerprint: strings.Repeat("c", 64)}
 	deps := []FileVersion{
-		{Path: "/root/z.txt", Size: 2, ModTime: 20, Digest: "z-digest"},
-		{Path: "/root/a.txt", Size: 1, ModTime: 10, Digest: "a-digest"},
+		{Path: "/root/z.txt", Size: 2, ModTime: 20, Digest: "z-digest", IdentityDigest: strings.Repeat("1", 64)},
+		{Path: "/root/a.txt", Size: 1, ModTime: 10, Digest: "a-digest", IdentityDigest: strings.Repeat("2", 64)},
 	}
 	for _, key := range []ReadCacheKey{keyA, keyB} {
 		if err := cache.Put(key, deps, value); err != nil {
@@ -80,7 +80,7 @@ func TestReadCacheRejectsLimitsAndCloneIsTaskLocal(t *testing.T) {
 	}
 	key := ReadCacheKey{Tool: "Read", ArgumentsFingerprint: "fingerprint"}
 	value := readCacheTestValue(t, factory, "old-call", "summary", "preview")
-	tooManyDependencies := []FileVersion{{Path: "/a", Digest: "a"}, {Path: "/b", Digest: "b"}}
+	tooManyDependencies := []FileVersion{readCacheTestDependency("/a", "a"), readCacheTestDependency("/b", "b")}
 	if err := cache.Put(key, tooManyDependencies, value); err == nil {
 		t.Fatal("dependency limit was not enforced")
 	}
@@ -88,21 +88,21 @@ func TestReadCacheRejectsLimitsAndCloneIsTaskLocal(t *testing.T) {
 		t.Fatal("over-limit dependency lookup hit")
 	}
 
-	if err := cache.Put(key, []FileVersion{{Path: "/a", Digest: "a"}}, value); err != nil {
+	if err := cache.Put(key, []FileVersion{readCacheTestDependency("/a", "a")}, value); err != nil {
 		t.Fatal(err)
 	}
 	clone := cache.CloneEmpty()
 	if clone == nil {
 		t.Fatal("CloneEmpty returned nil")
 	}
-	if _, ok := clone.Get(key, []FileVersion{{Path: "/a", Digest: "a"}}); ok {
+	if _, ok := clone.Get(key, []FileVersion{readCacheTestDependency("/a", "a")}); ok {
 		t.Fatal("CloneEmpty shared entries with its source task")
 	}
 	cache.Close()
-	if _, ok := cache.Get(key, []FileVersion{{Path: "/a", Digest: "a"}}); ok {
+	if _, ok := cache.Get(key, []FileVersion{readCacheTestDependency("/a", "a")}); ok {
 		t.Fatal("closed cache retained readable entries")
 	}
-	if err := cache.Put(key, []FileVersion{{Path: "/a", Digest: "a"}}, value); err == nil {
+	if err := cache.Put(key, []FileVersion{readCacheTestDependency("/a", "a")}, value); err == nil {
 		t.Fatal("closed cache accepted a new value")
 	}
 }
@@ -121,7 +121,7 @@ func TestReadCacheRejectsOversizedSafeTemplateWithoutEvictingExisting(t *testing
 		t.Fatal(err)
 	}
 	key := ReadCacheKey{Tool: "Read", ArgumentsFingerprint: "small"}
-	deps := []FileVersion{{Path: "/a", Digest: "a"}}
+	deps := []FileVersion{readCacheTestDependency("/a", "a")}
 	if err := cache.Put(key, deps, base); err != nil {
 		t.Fatal(err)
 	}
@@ -259,4 +259,8 @@ func readCacheTestValue(t *testing.T, factory *ResultFactory, callID, summary, p
 
 func writeReadCacheTestFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func readCacheTestDependency(path, digest string) FileVersion {
+	return FileVersion{Path: path, Digest: digest, IdentityDigest: strings.Repeat("d", 64)}
 }

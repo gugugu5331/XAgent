@@ -64,6 +64,7 @@ type Engine struct {
 	endingSessions    map[string]bool
 	endingExecutions  map[string]bool
 	shutdownNotices   []diagnostics.Diagnostic
+	workspaceInvalid  sync.Once
 }
 
 type actionOutcome struct {
@@ -605,6 +606,9 @@ func (e *Engine) AcquirePrompts(ctx context.Context, ref ExecutionRef) (PromptLe
 	if e == nil {
 		return noopPromptLease{}, nil
 	}
+	if !e.workspaceRootAvailable() {
+		return noopPromptLease{}, ErrWorkspaceFactoryInvalid
+	}
 	e.lifecycleMu.Lock()
 	stopping := e.systemState == 2 || e.systemState == 4
 	e.lifecycleMu.Unlock()
@@ -616,6 +620,12 @@ func (e *Engine) AcquirePrompts(ctx context.Context, ref ExecutionRef) (PromptLe
 
 func (e *Engine) dispatch(ctx context.Context, event *frozenEvent, decisionEvent bool) ToolDecision {
 	decision := Continue()
+	if !e.workspaceRootAvailable() {
+		if decisionEvent {
+			return Deny("workspace hook unavailable")
+		}
+		return decision
+	}
 	for index := range e.rules {
 		rule := e.rules[index]
 		if rule.Event != event.value.Event {
@@ -679,6 +689,21 @@ func (e *Engine) dispatch(ctx context.Context, event *frozenEvent, decisionEvent
 		}
 	}
 	return decision
+}
+
+func (e *Engine) workspaceRootAvailable() bool {
+	if e == nil || e.factory == nil || e.factory.validWorkspaceRoot() {
+		return e != nil && e.factory != nil
+	}
+	e.workspaceInvalid.Do(func() {
+		if e.diagnostics != nil {
+			e.diagnostics.Add(diagnostics.SanitizeInput{
+				Code: DiagnosticWorkspaceIdentityChanged, Source: "hook.workspace", Hint: "workspace hook disabled",
+				Severity: diagnostics.SeverityWarning, Err: errors.New("workspace hook disabled because its project identity changed"),
+			})
+		}
+	})
+	return false
 }
 
 func (e *Engine) runSync(ctx context.Context, rule Rule, event *frozenEvent) (outcome actionOutcome) {

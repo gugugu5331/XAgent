@@ -60,8 +60,11 @@ type TaskRuntimeState struct {
 	Conversation    *conversation.Conversation
 	Profile         RuntimeProfile
 	ActiveTools     CapabilitySwitch
+	Registry        *tool.Registry
+	ToolExecutor    *tool.Executor
 	Authorizer      *permission.Authorizer
 	Executor        *tool.ScopedExecutor
+	Hooks           hook.Runtime
 	Confirm         subagent.ConfirmationBroker
 	ReadCache       *tool.ReadCache
 	Usage           provider.Usage

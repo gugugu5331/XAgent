@@ -40,6 +40,12 @@ func (factory *managerTestRunnerFactory) Calls() int {
 type managerTestPreparedTask struct {
 	metadata PreparedMetadata
 	run      func(context.Context, EventSink) Completion
+	settle   func(context.Context, RunResult) Completion
+
+	mu            sync.Mutex
+	settleOnce    sync.Once
+	runCompletion Completion
+	settled       Completion
 }
 
 func (task *managerTestPreparedTask) Metadata() PreparedMetadata {
@@ -53,8 +59,34 @@ func (task *managerTestPreparedTask) Metadata() PreparedMetadata {
 	return metadata
 }
 
-func (task *managerTestPreparedTask) Run(ctx context.Context, sink EventSink) Completion {
-	return task.run(ctx, sink)
+func (task *managerTestPreparedTask) Run(ctx context.Context, sink EventSink) RunResult {
+	completion := task.run(ctx, sink)
+	task.mu.Lock()
+	task.runCompletion = completion.Clone()
+	task.mu.Unlock()
+	return RunResult{
+		Status: completion.Status, StopReason: completion.StopReason, Summary: completion.Summary,
+		Usage: completion.Usage, Error: completion.Error,
+	}.Clone()
+}
+
+func (task *managerTestPreparedTask) Settle(ctx context.Context, result RunResult) Completion {
+	task.settleOnce.Do(func() {
+		if task.settle != nil {
+			task.settled = task.settle(ctx, result).Clone()
+			return
+		}
+		task.mu.Lock()
+		completion := task.runCompletion.Clone()
+		task.mu.Unlock()
+		completion.Status = result.Status
+		completion.StopReason = result.StopReason
+		completion.Summary = result.Summary
+		completion.Usage = result.Usage
+		completion.Error = cloneSafeError(result.Error)
+		task.settled = completion
+	})
+	return task.settled.Clone()
 }
 
 type managerTestControlledTask struct {

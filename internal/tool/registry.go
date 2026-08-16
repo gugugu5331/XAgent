@@ -32,6 +32,7 @@ type ToolDescriptor struct {
 	Risk         Risk
 	Route        ExecutionRoute
 	Policy       ExecutionPolicy
+	Workspace    WorkspacePolicy
 	TargetDigest *[32]byte
 }
 
@@ -40,6 +41,8 @@ type ToolDescriptor struct {
 type RegistrationOptions struct {
 	Route             ExecutionRoute
 	Policy            ExecutionPolicy
+	Workspace         WorkspacePolicy
+	WorkspaceBinder   WorkspaceBinder
 	TargetDigest      *[32]byte
 	RemoteAnnotations json.RawMessage
 }
@@ -53,14 +56,15 @@ type SafeResultProducer interface {
 }
 
 type Registry struct {
-	tools         map[string]Definition
-	executors     map[string]Tool
-	descriptors   map[string]ToolDescriptor
-	order         []string
-	lineage       *registryLineage
-	immutable     bool
-	sealed        bool
-	safeCandidate bool
+	tools            map[string]Definition
+	executors        map[string]Tool
+	descriptors      map[string]ToolDescriptor
+	workspaceBinders map[string]WorkspaceBinder
+	order            []string
+	lineage          *registryLineage
+	immutable        bool
+	sealed           bool
+	safeCandidate    bool
 }
 
 // registryLineage is an opaque identity shared only by monotonic views made
@@ -94,7 +98,7 @@ func NewRegistry(projectRoot string) (*Registry, error) {
 		{tool: NewGrepTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
 	}
 	for _, item := range defaults {
-		if err := registry.RegisterWithOptions(item.tool, RegistrationOptions{Policy: item.policy}); err != nil {
+		if err := registry.RegisterWithOptions(item.tool, builtinRegistrationOptions(item.tool, item.policy)); err != nil {
 			return nil, err
 		}
 	}
@@ -109,11 +113,47 @@ func NewReadOnlyRegistry(projectRoot string) (*Registry, error) {
 		NewGrepTool(projectRoot),
 	}
 	for _, tool := range defaults {
-		if err := registry.RegisterWithOptions(tool, RegistrationOptions{Policy: ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}}); err != nil {
+		if err := registry.RegisterWithOptions(tool, builtinRegistrationOptions(tool, ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true})); err != nil {
 			return nil, err
 		}
 	}
 	return registry, nil
+}
+
+func builtinRegistrationOptions(target Tool, policy ExecutionPolicy) RegistrationOptions {
+	options, _ := applyBuiltinWorkspaceDefaults(target, RegistrationOptions{Policy: policy})
+	return options
+}
+
+func applyBuiltinWorkspaceDefaults(target Tool, options RegistrationOptions) (RegistrationOptions, error) {
+	switch target.(type) {
+	case loadSkillTool, agentTool:
+		if options.Workspace.Mode != WorkspaceUnknown && options.Workspace.Mode != WorkspaceFixed {
+			return RegistrationOptions{}, fmt.Errorf("system tool workspace policy must be fixed")
+		}
+		if options.WorkspaceBinder != nil {
+			return RegistrationOptions{}, fmt.Errorf("system tool workspace binder is invalid")
+		}
+		options.Workspace = WorkspacePolicy{Mode: WorkspaceFixed}
+	case *ReadTool, *GlobTool, *GrepTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceContextual}
+			options.WorkspaceBinder = target.(WorkspaceBinder)
+		}
+	case *WriteTool, *EditTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceContextual, WriteContainment: true}
+			options.WorkspaceBinder = target.(WorkspaceBinder)
+		}
+	case *BashTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			// A protected task Bash requires a task-owned protection plan and root.
+			// The assembly-root instance cannot manufacture either, so it remains
+			// fixed until Workspace Factory supplies an explicit trusted binder.
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceFixed}
+		}
+	}
+	return options, nil
 }
 
 func (r *Registry) Register(tool Tool) error {
@@ -143,6 +183,11 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	if _, exists := r.tools[name]; exists {
 		return fmt.Errorf("工具 %q 已注册", name)
 	}
+	var err error
+	options, err = applyBuiltinWorkspaceDefaults(tool, options)
+	if err != nil {
+		return fmt.Errorf("工具 %q workspace metadata 无效: %w", name, err)
+	}
 	schema := cloneSchema(tool.Schema())
 	if err := validateSchemaDefinition(schema); err != nil {
 		return fmt.Errorf("工具 %q schema 无效: %w", name, err)
@@ -150,6 +195,15 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	policy, err := restrictPolicyWithRemoteAnnotations(options.Policy, options.RemoteAnnotations)
 	if err != nil {
 		return fmt.Errorf("工具 %q annotations 无效: %w", name, err)
+	}
+	if err := options.Workspace.validate(); err != nil {
+		return fmt.Errorf("工具 %q workspace policy 无效: %w", name, err)
+	}
+	if options.Workspace.Mode == WorkspaceContextual && options.WorkspaceBinder == nil {
+		return fmt.Errorf("工具 %q contextual workspace binder 缺失", name)
+	}
+	if options.Workspace.Mode != WorkspaceContextual && options.WorkspaceBinder != nil {
+		return fmt.Errorf("工具 %q 非 contextual workspace binder 无效", name)
 	}
 	route := options.Route
 	if routed, ok := tool.(interface{ executionRoute() ExecutionRoute }); ok {
@@ -171,6 +225,7 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 		Risk:         tool.Risk(),
 		Route:        route,
 		Policy:       policy,
+		Workspace:    options.Workspace,
 		TargetDigest: cloneDigest(options.TargetDigest),
 	}
 	if r.executors == nil {
@@ -179,6 +234,12 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	r.tools[name] = &registeredTool{descriptor: cloneDescriptor(descriptor)}
 	r.executors[name] = tool
 	r.descriptors[name] = descriptor
+	if options.WorkspaceBinder != nil {
+		if r.workspaceBinders == nil {
+			r.workspaceBinders = make(map[string]WorkspaceBinder)
+		}
+		r.workspaceBinders[name] = options.WorkspaceBinder
+	}
 	r.order = append(r.order, name)
 	return nil
 }
@@ -236,7 +297,7 @@ func (r *Registry) knowsRegisteredName(name string) bool {
 }
 
 func newEmptyRegistry() *Registry {
-	return &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), lineage: &registryLineage{}}
+	return &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), workspaceBinders: make(map[string]WorkspaceBinder), lineage: &registryLineage{}}
 }
 
 func (r *Registry) Get(name string) (Definition, bool) {

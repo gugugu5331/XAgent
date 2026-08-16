@@ -95,6 +95,37 @@ func TestScopedExecutorConsumesTaskTicketExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestScopedExecutorRejectsValidatedCallFromAnotherExecutor(t *testing.T) {
+	base, capabilities, cache, fixture, root := newScopedExecutorTestRuntime(t, "Foreign", nil)
+	scope := newScopedExecutorTestTaskScope(t, "task-provenance")
+	executor, err := NewScopedExecutor(base, scope.Verifier, scope.ScopeID, capabilities, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := NewExecutorWithResultFactory(base.Registry, root, time.Second, 1024, base.resultFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := Call{ID: "foreign-call", Name: fixture.Name(), ArgumentsJSON: `{}`}
+	validated, ticket := scopedExecutorTestAuthorization(t, foreign, scope, call)
+	if result := executor.ExecuteValidatedAuthorized(context.Background(), validated, ticket); result.Status != StatusDenied {
+		t.Fatalf("foreign executor call was accepted: %#v", result)
+	}
+	if fixture.calls.Load() != 0 {
+		t.Fatal("foreign executor call reached the task target")
+	}
+
+	// Provenance rejection happens before ticket consumption, so an equivalent
+	// call prepared by the task executor can still use the issued identity.
+	local, err := base.PrepareCall(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := executor.ExecuteValidatedAuthorized(context.Background(), local, ticket); result.Status != StatusSuccess {
+		t.Fatalf("provenance rejection consumed the ticket: %#v", result)
+	}
+}
+
 func TestScopedExecutorRejectsCrossTaskTicket(t *testing.T) {
 	base, capabilities, cache, fixture, _ := newScopedExecutorTestRuntime(t, "TaskTool", []string{"TaskTool"})
 	first := newScopedExecutorTestTaskScope(t, "task-first")

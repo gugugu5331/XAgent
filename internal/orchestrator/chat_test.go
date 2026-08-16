@@ -1402,7 +1402,9 @@ func TestStreamPreparesSessionContextBeforeProviderRequest(t *testing.T) {
 	provider := &captureProvider{}
 	registry, _ := tool.NewRegistry(root)
 	executor := tool.NewExecutor(registry, root, time.Second, 1024)
-	prep := &fakeSessionContext{sections: []prompt.Section{{Name: "session", Priority: 1000, Content: "session context section", Stable: true}}, changed: true}
+	prep := &fakeSessionContext{sections: []prompt.Section{{
+		Name: "session", Priority: 1000, Content: "session context section", Stable: true, Scope: prompt.ScopeProject,
+	}}, changed: true}
 	orch := NewWithOptions(OrchestratorOptions{Provider: provider, Store: store, Resources: resources.New(), Registry: registry, Executor: executor, SessionContext: prep})
 	stream, err := orch.Send(context.Background(), conv, "hello")
 	if err != nil {

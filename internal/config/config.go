@@ -4,6 +4,7 @@ import (
 	"xagent/internal/agentrole"
 	"xagent/internal/redact"
 	"xagent/internal/subagent"
+	"xagent/internal/worktree"
 )
 
 type AppConfig struct {
@@ -50,6 +51,7 @@ type SubagentConfig struct {
 	RoleLimits      agentrole.Limits
 	Limits          subagent.Limits
 	BackgroundTools []string
+	Worktree        worktree.Config
 }
 
 type StreamConfig struct {

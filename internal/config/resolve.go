@@ -10,6 +10,7 @@ import (
 	"xagent/internal/agentrole"
 	"xagent/internal/redact"
 	"xagent/internal/subagent"
+	"xagent/internal/worktree"
 )
 
 // appConfigNumericManifest is the closed set of numeric values owned by the
@@ -112,6 +113,24 @@ var appConfigNumericManifest = [...]string{
 	"subagent.role_limits.max_tool_name_bytes",
 	"subagent.role_limits.max_tool_names",
 	"subagent.role_limits.max_total_bytes",
+	"subagent.worktree.lifecycle.git_timeout_ms",
+	"subagent.worktree.lifecycle.init_timeout_ms",
+	"subagent.worktree.lifecycle.janitor_interval_ms",
+	"subagent.worktree.lifecycle.janitor_timeout_ms",
+	"subagent.worktree.lifecycle.lock_timeout_ms",
+	"subagent.worktree.lifecycle.recovery_timeout_ms",
+	"subagent.worktree.lifecycle.retention_ttl_ms",
+	"subagent.worktree.lifecycle.settle_timeout_ms",
+	"subagent.worktree.limits.max_active",
+	"subagent.worktree.limits.max_depth",
+	"subagent.worktree.limits.max_init_bytes",
+	"subagent.worktree.limits.max_init_depth",
+	"subagent.worktree.limits.max_init_files",
+	"subagent.worktree.limits.max_janitor_candidates",
+	"subagent.worktree.limits.max_janitor_concurrency",
+	"subagent.worktree.limits.max_name_bytes",
+	"subagent.worktree.limits.max_retained",
+	"subagent.worktree.limits.max_segment_bytes",
 }
 
 func appConfigNumericKeys() []string {
@@ -258,6 +277,27 @@ var subagentRuntimeNumericSpecs = [...]numericSpec{
 	{path: "subagent.max_task_duration_ms", defaultVal: 0, minimum: 0, hardCap: 86_400_000},
 }
 
+var worktreeNumericSpecs = [...]numericSpec{
+	{path: "subagent.worktree.lifecycle.retention_ttl_ms", defaultVal: 86_400_000, minimum: 60_000, hardCap: 2_592_000_000},
+	{path: "subagent.worktree.lifecycle.janitor_interval_ms", defaultVal: 1_800_000, minimum: 60_000, hardCap: 86_400_000},
+	{path: "subagent.worktree.lifecycle.git_timeout_ms", defaultVal: 30_000, minimum: 100, hardCap: 300_000},
+	{path: "subagent.worktree.lifecycle.lock_timeout_ms", defaultVal: 10_000, minimum: 100, hardCap: 60_000},
+	{path: "subagent.worktree.lifecycle.init_timeout_ms", defaultVal: 120_000, minimum: 1_000, hardCap: 300_000},
+	{path: "subagent.worktree.lifecycle.recovery_timeout_ms", defaultVal: 30_000, minimum: 100, hardCap: 300_000},
+	{path: "subagent.worktree.lifecycle.settle_timeout_ms", defaultVal: 120_000, minimum: 1_000, hardCap: 1_800_000},
+	{path: "subagent.worktree.lifecycle.janitor_timeout_ms", defaultVal: 60_000, minimum: 1_000, hardCap: 1_800_000},
+	{path: "subagent.worktree.limits.max_active", defaultVal: 8, minimum: 1, hardCap: 64},
+	{path: "subagent.worktree.limits.max_retained", defaultVal: 32, minimum: 1, hardCap: 4_096},
+	{path: "subagent.worktree.limits.max_name_bytes", defaultVal: 192, minimum: 1, hardCap: 1_024},
+	{path: "subagent.worktree.limits.max_segment_bytes", defaultVal: 64, minimum: 1, hardCap: 255},
+	{path: "subagent.worktree.limits.max_depth", defaultVal: 8, minimum: 1, hardCap: 32},
+	{path: "subagent.worktree.limits.max_init_files", defaultVal: 10_000, minimum: 1, hardCap: 10_000},
+	{path: "subagent.worktree.limits.max_init_bytes", defaultVal: 1 * gibibyte, minimum: 1, hardCap: 1 * gibibyte},
+	{path: "subagent.worktree.limits.max_init_depth", defaultVal: 32, minimum: 1, hardCap: 64},
+	{path: "subagent.worktree.limits.max_janitor_candidates", defaultVal: 256, minimum: 1, hardCap: 10_000},
+	{path: "subagent.worktree.limits.max_janitor_concurrency", defaultVal: 4, minimum: 1, hardCap: 64},
+}
+
 func (s numericSpec) resolve(candidate Optional[int64]) (int64, error) {
 	if !candidate.Set {
 		return s.defaultVal, nil
@@ -369,7 +409,105 @@ func ResolveSubagentConfig(partial PartialSubagentConfig) (SubagentConfig, error
 	if partial.BackgroundTools.Set {
 		backgroundTools = append([]string{}, partial.BackgroundTools.Value...)
 	}
-	return SubagentConfig{RoleLimits: roleLimits, Limits: runtimeLimits, BackgroundTools: backgroundTools}, nil
+	worktreeConfig, err := resolveWorktreeConfig(partial.Worktree)
+	if err != nil {
+		return SubagentConfig{}, err
+	}
+	return SubagentConfig{RoleLimits: roleLimits, Limits: runtimeLimits, BackgroundTools: backgroundTools, Worktree: worktreeConfig}, nil
+}
+
+func resolveWorktreeConfig(partial PartialWorktreeConfig) (worktree.Config, error) {
+	var config worktree.Config
+	durationFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(time.Duration)
+	}{
+		{"subagent.worktree.lifecycle.retention_ttl_ms", partial.Lifecycle.RetentionTTLMS, func(value time.Duration) { config.Lifecycle.RetentionTTL = value }},
+		{"subagent.worktree.lifecycle.janitor_interval_ms", partial.Lifecycle.JanitorIntervalMS, func(value time.Duration) { config.Lifecycle.JanitorInterval = value }},
+		{"subagent.worktree.lifecycle.git_timeout_ms", partial.Lifecycle.GitTimeoutMS, func(value time.Duration) { config.Lifecycle.GitTimeout = value }},
+		{"subagent.worktree.lifecycle.lock_timeout_ms", partial.Lifecycle.LockTimeoutMS, func(value time.Duration) { config.Lifecycle.LockTimeout = value }},
+		{"subagent.worktree.lifecycle.init_timeout_ms", partial.Lifecycle.InitTimeoutMS, func(value time.Duration) { config.Lifecycle.InitTimeout = value }},
+		{"subagent.worktree.lifecycle.recovery_timeout_ms", partial.Lifecycle.RecoveryTimeoutMS, func(value time.Duration) { config.Lifecycle.RecoveryTimeout = value }},
+		{"subagent.worktree.lifecycle.settle_timeout_ms", partial.Lifecycle.SettleTimeoutMS, func(value time.Duration) { config.Lifecycle.SettleTimeout = value }},
+		{"subagent.worktree.lifecycle.janitor_timeout_ms", partial.Lifecycle.JanitorTimeoutMS, func(value time.Duration) { config.Lifecycle.JanitorTimeout = value }},
+	}
+	for _, field := range durationFields {
+		value, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return worktree.Config{}, err
+		}
+		field.set(time.Duration(value) * time.Millisecond)
+	}
+	intFields := []struct {
+		path  string
+		value Optional[int64]
+		set   func(int)
+	}{
+		{"subagent.worktree.limits.max_active", partial.Limits.MaxActive, func(value int) { config.Limits.MaxActive = value }},
+		{"subagent.worktree.limits.max_retained", partial.Limits.MaxRetained, func(value int) { config.Limits.MaxRetained = value }},
+		{"subagent.worktree.limits.max_name_bytes", partial.Limits.MaxNameBytes, func(value int) { config.Limits.MaxNameBytes = value }},
+		{"subagent.worktree.limits.max_segment_bytes", partial.Limits.MaxSegmentBytes, func(value int) { config.Limits.MaxSegmentBytes = value }},
+		{"subagent.worktree.limits.max_depth", partial.Limits.MaxDepth, func(value int) { config.Limits.MaxDepth = value }},
+		{"subagent.worktree.limits.max_init_files", partial.Limits.MaxInitFiles, func(value int) { config.Limits.MaxInitFiles = value }},
+		{"subagent.worktree.limits.max_init_depth", partial.Limits.MaxInitDepth, func(value int) { config.Limits.MaxInitDepth = value }},
+		{"subagent.worktree.limits.max_janitor_candidates", partial.Limits.MaxJanitorCandidates, func(value int) { config.Limits.MaxJanitorCandidates = value }},
+		{"subagent.worktree.limits.max_janitor_concurrency", partial.Limits.MaxJanitorConcurrency, func(value int) { config.Limits.MaxJanitorConcurrency = value }},
+	}
+	for _, field := range intFields {
+		value, err := resolveSubagentNumeric(field.path, field.value)
+		if err != nil {
+			return worktree.Config{}, err
+		}
+		resolved, err := positiveInt(field.path, value)
+		if err != nil {
+			return worktree.Config{}, err
+		}
+		field.set(resolved)
+	}
+	maxInitBytes, err := resolveSubagentNumeric("subagent.worktree.limits.max_init_bytes", partial.Limits.MaxInitBytes)
+	if err != nil {
+		return worktree.Config{}, err
+	}
+	config.Limits.MaxInitBytes = maxInitBytes
+
+	if partial.Init.Copy.Set {
+		config.Init.Copy = make([]worktree.CopyRule, len(partial.Init.Copy.Value))
+		for index, rule := range partial.Init.Copy.Value {
+			config.Init.Copy[index] = worktree.CopyRule{Source: strings.TrimSpace(rule.Source), Target: strings.TrimSpace(rule.Target)}
+		}
+	}
+	if partial.Init.Link.Set {
+		config.Init.Link = make([]worktree.LinkRule, len(partial.Init.Link.Value))
+		for index, rule := range partial.Init.Link.Value {
+			config.Init.Link[index] = worktree.LinkRule{Source: strings.TrimSpace(rule.Source), Target: strings.TrimSpace(rule.Target)}
+		}
+	}
+	if partial.Init.IgnoredCopy.Set {
+		config.Init.IgnoredCopy = make([]worktree.CopyRule, len(partial.Init.IgnoredCopy.Value))
+		for index, rule := range partial.Init.IgnoredCopy.Value {
+			config.Init.IgnoredCopy[index] = worktree.CopyRule{Source: strings.TrimSpace(rule.Source), Target: strings.TrimSpace(rule.Target)}
+		}
+	}
+	if partial.Init.GitHooks.Enabled.Set {
+		config.Init.GitHooks.Enabled = partial.Init.GitHooks.Enabled.Value
+	}
+	if partial.Init.GitHooks.Path.Set {
+		config.Init.GitHooks.Path = strings.TrimSpace(partial.Init.GitHooks.Path.Value)
+	}
+	if config.Limits.MaxRetained < config.Limits.MaxActive {
+		return worktree.Config{}, errors.New("config field \"subagent.worktree.limits.max_retained\" must be at least max_active")
+	}
+	if config.Limits.MaxSegmentBytes > config.Limits.MaxNameBytes {
+		return worktree.Config{}, errors.New("config field \"subagent.worktree.limits.max_segment_bytes\" must not exceed max_name_bytes")
+	}
+	if config.Limits.MaxJanitorConcurrency > config.Limits.MaxJanitorCandidates {
+		return worktree.Config{}, errors.New("config field \"subagent.worktree.limits.max_janitor_concurrency\" must not exceed max_janitor_candidates")
+	}
+	if err := config.Validate(); err != nil {
+		return worktree.Config{}, fmt.Errorf("config field \"subagent.worktree\": %w", err)
+	}
+	return config, nil
 }
 
 func applyRoleLimits(target *agentrole.Limits, partial PartialRoleLimits) error {
@@ -510,7 +648,7 @@ func applySubagentLimits(target *subagent.Limits, partial PartialSubagentConfig)
 }
 
 func resolveSubagentNumeric(path string, candidate Optional[int64]) (int64, error) {
-	for _, specs := range [][]numericSpec{roleLimitNumericSpecs[:], subagentRuntimeNumericSpecs[:]} {
+	for _, specs := range [][]numericSpec{roleLimitNumericSpecs[:], subagentRuntimeNumericSpecs[:], worktreeNumericSpecs[:]} {
 		for _, spec := range specs {
 			if spec.path == path {
 				return spec.resolve(candidate)

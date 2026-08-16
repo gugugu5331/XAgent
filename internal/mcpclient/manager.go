@@ -41,6 +41,7 @@ var (
 	errManagerAlreadyStarted   = errors.New("MCP manager was already started")
 	errManagerStartInterrupted = errors.New("MCP manager startup was interrupted")
 	errManagerConfigDigest     = errors.New("MCP server configuration digest failed")
+	errManagerWorkspacePolicy  = errors.New("MCP workspace policy is invalid")
 )
 
 type ServerState string
@@ -74,6 +75,9 @@ type ManagerOptions struct {
 	MaxProtocolErrors  int64
 	DefaultTimeout     time.Duration
 	CleanupTimeout     time.Duration
+	// IndependentHTTPServers is a local trusted allowlist. Remote MCP
+	// annotations and server-returned metadata cannot modify it.
+	IndependentHTTPServers map[string]bool
 	// Diagnostics is the bounded C7 sink propagated unchanged to every
 	// Manager-owned Session, Connection and Transport. ManagerDependencies
 	// retains the compatibility input used by callers from before T4.27; when
@@ -203,6 +207,10 @@ func newManager(
 	}
 	dependencies.Diagnostics = options.Diagnostics
 	options = resolveManagerOptions(cfg, options)
+	if err := validateIndependentHTTPServers(cfg, options.IndependentHTTPServers); err != nil {
+		return nil, err
+	}
+	options.IndependentHTTPServers = cloneBoolMap(options.IndependentHTTPServers)
 	if options.MaxTools <= 0 {
 		options.MaxTools = DefaultMaxTools
 	}
@@ -645,6 +653,7 @@ func (manager *Manager) buildToolCandidates(
 			Schema:             tool.Schema{Raw: append(json.RawMessage(nil), remoteTool.InputSchema...)},
 			ServerConfigDigest: server.configDigest,
 			RemoteAnnotations:  append(json.RawMessage(nil), remoteTool.Annotations...),
+			Workspace:          manager.workspacePolicy(server),
 			Caller:             manager,
 			ResultFactory:      manager.resultFactory,
 			Capture:            manager.capture,
@@ -670,6 +679,45 @@ func (manager *Manager) buildToolCandidates(
 		}
 	}
 	return tools, routes
+}
+
+func (manager *Manager) workspacePolicy(server *managedServer) tool.WorkspacePolicy {
+	if server == nil {
+		return tool.WorkspacePolicy{}
+	}
+	switch server.config.Type {
+	case config.MCPTransportStdio:
+		return tool.WorkspacePolicy{Mode: tool.WorkspaceFixed}
+	case config.MCPTransportHTTP:
+		if manager != nil && manager.options.IndependentHTTPServers[server.name] {
+			return tool.WorkspacePolicy{Mode: tool.WorkspaceIndependent}
+		}
+	}
+	return tool.WorkspacePolicy{}
+}
+
+func validateIndependentHTTPServers(cfg config.MCPConfig, trusted map[string]bool) error {
+	for name, independent := range trusted {
+		if !independent {
+			continue
+		}
+		server, ok := cfg.Servers[name]
+		if !ok || server.Type != config.MCPTransportHTTP {
+			return errManagerWorkspacePolicy
+		}
+	}
+	return nil
+}
+
+func cloneBoolMap(source map[string]bool) map[string]bool {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]bool, len(source))
+	for name, value := range source {
+		cloned[name] = value
+	}
+	return cloned
 }
 
 func (manager *Manager) startupContext(caller context.Context) (context.Context, func()) {

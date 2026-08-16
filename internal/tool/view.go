@@ -189,7 +189,8 @@ func capabilityFingerprint(capabilities CapabilitySet) string {
 				Risk        Risk
 				Route       ExecutionRoute
 				Policy      ExecutionPolicy
-			}{descriptor.Name, descriptor.Description, descriptor.Schema, descriptor.Risk, descriptor.Route, descriptor.Policy})
+				Workspace   WorkspacePolicy
+			}{descriptor.Name, descriptor.Description, descriptor.Schema, descriptor.Risk, descriptor.Route, descriptor.Policy, descriptor.Workspace})
 			_, _ = hash.Write(encoded)
 			_, _ = hash.Write([]byte{0})
 		}
@@ -291,7 +292,7 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 		}
 	}
 
-	view := &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), order: make([]string, 0), lineage: r.lineage, immutable: true, sealed: true}
+	view := &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), workspaceBinders: make(map[string]WorkspaceBinder), order: make([]string, 0), lineage: r.lineage, immutable: true, sealed: true}
 	always := make(map[string]struct{}, len(options.AlwaysInclude))
 	for _, name := range options.AlwaysInclude {
 		always[name] = struct{}{}
@@ -304,6 +305,9 @@ func (r *Registry) View(options ViewOptions) (*Registry, error) {
 		view.executors[name] = r.executors[name]
 		if descriptor, ok := r.descriptors[name]; ok {
 			view.descriptors[name] = cloneDescriptor(descriptor)
+		}
+		if binder, ok := r.workspaceBinders[name]; ok {
+			view.workspaceBinders[name] = binder
 		}
 		view.order = append(view.order, name)
 	}

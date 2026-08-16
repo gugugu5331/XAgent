@@ -29,6 +29,7 @@ type frontmatterDocument struct {
 	Model          *string   `yaml:"model"`
 	MaxIterations  *int      `yaml:"max_iterations"`
 	PermissionMode *string   `yaml:"permission_mode"`
+	Isolation      *string   `yaml:"isolation"`
 }
 
 var roleNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -41,6 +42,7 @@ var frontmatterFields = map[string]yaml.Kind{
 	"model":           yaml.ScalarNode,
 	"max_iterations":  yaml.ScalarNode,
 	"permission_mode": yaml.ScalarNode,
+	"isolation":       yaml.ScalarNode,
 }
 
 func ParseMarkdown(raw []byte, options ParseOptions) (Candidate, error) {
@@ -191,7 +193,7 @@ func validateFrontmatterNode(root *yaml.Node) error {
 			return err
 		}
 		switch key.Value {
-		case "name", "description", "model", "permission_mode":
+		case "name", "description", "model", "permission_mode", "isolation":
 			if value.Tag != "!!str" {
 				return errors.New("field must be a string")
 			}
@@ -284,6 +286,13 @@ func normalizeMetadata(document frontmatterDocument, options ParseOptions) (Meta
 		value := *document.MaxIterations
 		maxIterations = &value
 	}
+	isolation := IsolationNone
+	if document.Isolation != nil {
+		isolation = IsolationMode(*document.Isolation)
+		if isolation != IsolationWorktree {
+			return Metadata{}, errors.New("invalid isolation mode")
+		}
+	}
 	return Metadata{
 		Name:           name,
 		Description:    safeDescription,
@@ -292,6 +301,7 @@ func normalizeMetadata(document frontmatterDocument, options ParseOptions) (Meta
 		Model:          model,
 		MaxIterations:  maxIterations,
 		PermissionMode: permissionMode,
+		Isolation:      isolation,
 	}, nil
 }
 

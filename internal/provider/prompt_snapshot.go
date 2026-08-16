@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"xagent/internal/config"
+	"xagent/internal/prompt"
 	"xagent/internal/tool"
 )
 
@@ -77,6 +78,13 @@ func (snapshot PromptPrefixSnapshot) Validate() error {
 	} else if snapshot.System != nil {
 		return ErrInvalidPromptPrefixSnapshot
 	}
+	for _, blocks := range [][]SystemBlock{snapshot.System, snapshot.StableSystem, snapshot.DynamicSystem} {
+		for _, block := range blocks {
+			if !block.Scope.Valid() {
+				return ErrInvalidPromptPrefixSnapshot
+			}
+		}
+	}
 	request := snapshot.baseRequest()
 	if err := request.Validate(); err != nil {
 		return ErrInvalidPromptPrefixSnapshot
@@ -121,6 +129,68 @@ func (snapshot PromptPrefixSnapshot) BuildChild(
 	return request
 }
 
+// BuildWorkspaceChild derives a task-local request from a parent prefix. Only
+// Global/User parent system blocks cross the Workspace boundary; Project and
+// Runtime blocks are rebuilt by the caller from the bound Workspace. Parent
+// messages are retained, while tools and their cache fingerprint are replaced.
+func (snapshot PromptPrefixSnapshot) BuildWorkspaceChild(
+	projectBlocks []SystemBlock,
+	runtimeBlocks []SystemBlock,
+	tools []ToolDefinition,
+) (ChatRequest, error) {
+	if err := snapshot.Validate(); err != nil {
+		return ChatRequest{}, err
+	}
+	for _, block := range projectBlocks {
+		if block.Scope != prompt.ScopeProject {
+			return ChatRequest{}, ErrInvalidPromptPrefixSnapshot
+		}
+	}
+	for _, block := range runtimeBlocks {
+		if block.Scope != prompt.ScopeRuntime {
+			return ChatRequest{}, ErrInvalidPromptPrefixSnapshot
+		}
+	}
+	retain := func(blocks []SystemBlock) []SystemBlock {
+		result := make([]SystemBlock, 0, len(blocks))
+		for _, block := range blocks {
+			switch block.Scope {
+			case prompt.ScopeGlobal, prompt.ScopeUser:
+				result = append(result, block)
+			}
+		}
+		return cloneSystemBlocks(result)
+	}
+	request := ChatRequest{
+		Model: snapshot.Model, Messages: cloneModelMessages(snapshot.Messages), Tools: cloneToolDefinitions(tools),
+		Thinking: snapshot.Thinking, Cache: snapshot.Cache,
+	}
+	// A parent breakpoint may name a removed Project block or even contain a
+	// private main-workspace path. The child lets Provider policy select a new
+	// breakpoint from its rebuilt system instead.
+	request.Cache.SystemBreakpointName = ""
+	if snapshot.OrderedSystem {
+		request.System = retain(snapshot.System)
+		request.System = append(request.System, cloneSystemBlocks(projectBlocks)...)
+		request.System = append(request.System, cloneSystemBlocks(runtimeBlocks)...)
+	} else {
+		request.StableSystem = retain(snapshot.StableSystem)
+		request.StableSystem = append(request.StableSystem, cloneSystemBlocks(projectBlocks)...)
+		request.DynamicSystem = cloneSystemBlocks(runtimeBlocks)
+	}
+	toolFingerprint, err := toolDefinitionsFingerprint(request.Tools)
+	if err != nil {
+		return ChatRequest{}, ErrInvalidPromptPrefixSnapshot
+	}
+	if toolFingerprint != snapshot.ToolFingerprint {
+		request.Cache.CacheTools = false
+	}
+	if err := request.Validate(); err != nil {
+		return ChatRequest{}, ErrInvalidPromptPrefixSnapshot
+	}
+	return request, nil
+}
+
 func (snapshot PromptPrefixSnapshot) baseRequest() ChatRequest {
 	request := ChatRequest{
 		Model: snapshot.Model, Messages: cloneModelMessages(snapshot.Messages), Tools: cloneToolDefinitions(snapshot.Tools),
@@ -146,7 +216,9 @@ func cloneSystemBlocks(blocks []SystemBlock) []SystemBlock {
 	if blocks == nil {
 		return nil
 	}
-	return append([]SystemBlock(nil), blocks...)
+	cloned := make([]SystemBlock, len(blocks))
+	copy(cloned, blocks)
+	return cloned
 }
 
 func cloneModelMessages(messages []ModelMessage) []ModelMessage {
@@ -188,6 +260,7 @@ type promptSystemFingerprintBlock struct {
 	Name      string `json:"name"`
 	Content   string `json:"content"`
 	Cacheable bool   `json:"cacheable"`
+	Scope     string `json:"scope"`
 }
 
 type promptMessageFingerprint struct {
@@ -238,7 +311,7 @@ func promptSnapshotFingerprint(snapshot PromptPrefixSnapshot) (string, error) {
 		return "", err
 	}
 	return fingerprintJSON(promptSnapshotFingerprintPayload{
-		Version: 1, OrderedSystem: snapshot.OrderedSystem, Model: snapshot.Model,
+		Version: 2, OrderedSystem: snapshot.OrderedSystem, Model: snapshot.Model,
 		System: promptSystemFingerprints(snapshot.System), StableSystem: promptSystemFingerprints(snapshot.StableSystem),
 		DynamicSystem: promptSystemFingerprints(snapshot.DynamicSystem), Messages: promptMessageFingerprints(snapshot.Messages),
 		Tools: tools, Thinking: snapshot.Thinking, Cache: snapshot.Cache, MessagePrefix: snapshot.MessagePrefix,
@@ -252,7 +325,9 @@ func promptSystemFingerprints(blocks []SystemBlock) []promptSystemFingerprintBlo
 	}
 	result := make([]promptSystemFingerprintBlock, len(blocks))
 	for index, block := range blocks {
-		result[index] = promptSystemFingerprintBlock{Name: block.Name, Content: block.Content.Text(), Cacheable: block.Cacheable}
+		result[index] = promptSystemFingerprintBlock{
+			Name: block.Name, Content: block.Content.Text(), Cacheable: block.Cacheable, Scope: string(block.Scope),
+		}
 	}
 	return result
 }

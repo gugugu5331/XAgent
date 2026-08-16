@@ -187,6 +187,7 @@ func encodeMetadata(encoder *canonicalEncoder, metadata Metadata) {
 		encoder.add(strconv.Itoa(*metadata.MaxIterations))
 	}
 	encoder.add(string(metadata.PermissionMode))
+	encoder.add(string(metadata.Isolation))
 }
 
 type canonicalEncoder struct {

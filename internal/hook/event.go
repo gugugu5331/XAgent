@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"xagent/internal/safefs"
 )
 
 type ProjectContext struct {
@@ -107,6 +109,7 @@ type eventFactory struct {
 	clock       func() time.Time
 	idSource    func() string
 	projectRoot string
+	workspaceID safefs.Identity
 	limits      Limits
 }
 
@@ -123,6 +126,34 @@ func newEventFactory(projectRoot string, limits Limits, clock func() time.Time, 
 		idSource = func() string { return strconv.FormatUint(ids.Add(1), 36) }
 	}
 	return &eventFactory{clock: clock, idSource: idSource, projectRoot: filepath.Clean(abs), limits: normalizeLimits(limits)}, nil
+}
+
+func (f *eventFactory) bindWorkspaceIdentity(identity safefs.Identity) {
+	if f != nil {
+		f.workspaceID = identity
+	}
+}
+
+func (f *eventFactory) validWorkspaceRoot() bool {
+	if f == nil {
+		return false
+	}
+	if f.workspaceID == (safefs.Identity{}) {
+		return true
+	}
+	return liveWorkspaceIdentity(f.projectRoot, f.workspaceID)
+}
+
+func liveWorkspaceIdentity(projectRoot string, identity safefs.Identity) bool {
+	if identity == (safefs.Identity{}) || !canonicalWorkspaceRoot(projectRoot) {
+		return false
+	}
+	opened, err := safefs.Bootstrap(projectRoot, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		return false
+	}
+	defer opened.Root.Close()
+	return opened.Root.Identity() == identity
 }
 
 func (f *eventFactory) base(event Event) EventContext {

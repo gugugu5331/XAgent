@@ -206,6 +206,23 @@ func projectTaskEventViewSpec(event subagent.Event) tui.TaskEventViewSpec {
 		spec.Text = event.Result.Summary
 		spec.Error = projectTaskSafeError(event.Result.Error)
 	}
+	if workspace, present := taskEventWorkspace(event); present {
+		projection, valid := projectTaskWorkspace(workspace)
+		if !valid {
+			spec.Text = redact.NewRuntimeRedactor().Redact("任务工作区状态无效")
+			spec.Error = projectTaskSafeError(subagent.SafeError(
+				subagent.ErrInvalidTransition,
+				redact.NewRuntimeRedactor().Redact("任务工作区状态无效"),
+				false,
+			))
+		} else if projection != "" {
+			text := projection
+			if summary := spec.Text.Text(); summary != "" {
+				text = summary + " | " + projection
+			}
+			spec.Text = redact.NewRuntimeRedactor().Redact(text)
+		}
+	}
 	if event.Agent != nil {
 		payload := event.Agent.Payload
 		spec.Text = payload.Text
@@ -264,7 +281,100 @@ func appTaskDetailNotice(detail subagent.TaskDetailSnapshot) string {
 	if task.Error != nil {
 		message += fmt.Sprintf(" error=%s:%s", task.Error.Code, task.Error.Message.Text())
 	}
+	for index := len(detail.RecentEvents) - 1; index >= 0; index-- {
+		workspace, present := taskEventWorkspace(detail.RecentEvents[index])
+		if !present {
+			continue
+		}
+		projection, valid := projectTaskWorkspace(workspace)
+		if !valid {
+			message += " 任务工作区状态无效"
+		} else if projection != "" {
+			message += " " + projection
+		}
+		break
+	}
 	return message
+}
+
+func taskEventWorkspace(event subagent.Event) (subagent.WorkspaceSummary, bool) {
+	if event.Result != nil {
+		return event.Result.Workspace.Clone(), true
+	}
+	if event.Completion != nil {
+		return event.Completion.Workspace.Clone(), true
+	}
+	return subagent.WorkspaceSummary{}, false
+}
+
+// projectTaskWorkspace is the only App/TUI projection for task workspace
+// lifecycle state. It deliberately omits absolute paths, Git object IDs,
+// branches, and free-form errors. Shared tasks have no workspace projection.
+func projectTaskWorkspace(workspace subagent.WorkspaceSummary) (string, bool) {
+	if workspace == (subagent.WorkspaceSummary{}) {
+		return "", true
+	}
+	if workspace.Validate() != nil || workspace.Isolation != "worktree" ||
+		workspace.State != workspace.Cleanup || len(workspace.WorkspaceID) != 32 {
+		return "", false
+	}
+	switch workspace.State {
+	case "deleted":
+		if workspace.RetentionCause != "clean" || workspace.Dirty || workspace.Unpushed {
+			return "", false
+		}
+	case "retained", "partial", "manual_attention":
+		if !appWorkspaceRetentionReasonAllowed(workspace.RetentionCause) {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	return fmt.Sprintf(
+		"workspace=%s state=%s cleanup=%s dirty=%t unpushed=%t reason=%s",
+		workspace.WorkspaceID[:8], workspace.State, workspace.Cleanup,
+		workspace.Dirty, workspace.Unpushed, workspace.RetentionCause,
+	), true
+}
+
+func appWorkspaceRetentionReasonAllowed(reason string) bool {
+	switch reason {
+	case "runtime_active",
+		"settlement_failed",
+		"lease_release_failed",
+		"identity_unknown",
+		"manifest_unknown",
+		"initialization_changed",
+		"inspection_unknown",
+		"protected_changes",
+		"unpushed_commits",
+		"delete_unavailable",
+		"delete_lock_failed",
+		"delete_lease_failed",
+		"worktree_in_use",
+		"identity_mismatch",
+		"directory_identity_mismatch",
+		"record_changed",
+		"git_management_mismatch",
+		"branch_moved",
+		"manifest_mismatch",
+		"worktree_remove_failed",
+		"worktree_remove_interrupted",
+		"branch_cas_failed",
+		"branch_cas_interrupted",
+		"tombstone_failed",
+		"tombstone_interrupted",
+		"lease_identity_mismatch",
+		"partial_directory_unknown",
+		"partial_registration_unknown",
+		"partial_registration_present",
+		"partial_branch_unknown",
+		"partial_branch_moved",
+		"partial_branch_present":
+		return true
+	default:
+		return false
+	}
 }
 
 func projectAppTaskError(model *Model, source error) error {

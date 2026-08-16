@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/sha256"
@@ -22,7 +23,11 @@ import (
 	"xagent/internal/safefs"
 )
 
-const maxReadCacheFingerprintBytes = 256
+const (
+	maxReadCacheFingerprintBytes      = 256
+	maxReadCacheDependencyPathBytes   = 4_096
+	maxReadCacheDependencyDigestBytes = 256
+)
 
 // ReadCacheLimits are fully resolved construction limits. ReadCache never
 // interprets missing or zero values as defaults.
@@ -38,14 +43,15 @@ type ReadCacheKey struct {
 	ArgumentsFingerprint string
 }
 
-// FileVersion is a stable dependency snapshot. Digest covers contents for a
-// regular file and the immediate entry set for a directory. Size=-1 denotes a
-// path that did not exist when the result was produced.
+// FileVersion is a stable dependency snapshot. Path is a canonical absolute
+// path, Digest covers contents or directory entries, and IdentityDigest binds
+// the snapshot to the live filesystem object. Size=-1 denotes a missing path.
 type FileVersion struct {
-	Path    string
-	Size    int64
-	ModTime int64
-	Digest  string
+	Path           string
+	Size           int64
+	ModTime        int64
+	Digest         string
+	IdentityDigest string
 }
 
 // CachedReadResult contains only already-redacted, bounded projections and an
@@ -293,7 +299,14 @@ func (c *ReadCache) identity(ctx context.Context, validated ValidatedCall) (Read
 	if len(canonicalArguments) == 0 {
 		return ReadCacheKey{}, nil, errors.New("validated read arguments are unavailable")
 	}
-	rootFingerprint, err := readRootFingerprint(ctx, validated)
+	rootPath, rootIdentity, err := validateReadCacheRoot(validated)
+	if err != nil {
+		return ReadCacheKey{}, nil, err
+	}
+	if err := revalidateReadCacheBindings(validated, rootPath); err != nil {
+		return ReadCacheKey{}, nil, err
+	}
+	rootFingerprint, err := readRootFingerprint(ctx, validated, rootIdentity)
 	if err != nil {
 		return ReadCacheKey{}, nil, err
 	}
@@ -303,7 +316,7 @@ func (c *ReadCache) identity(ctx context.Context, validated ValidatedCall) (Read
 	writeFingerprintPart(hash, canonicalArguments)
 	writeFingerprintPart(hash, []byte(rootFingerprint))
 	key := ReadCacheKey{Tool: validated.Call.Name, ArgumentsFingerprint: hex.EncodeToString(hash.Sum(nil))}
-	dependencies, err := collectReadDependencies(ctx, validated, c.limits.MaxDependenciesPerEntry)
+	dependencies, err := collectReadDependencies(ctx, validated, rootPath, c.limits.MaxDependenciesPerEntry)
 	if err != nil {
 		return ReadCacheKey{}, nil, err
 	}
@@ -387,7 +400,9 @@ func normalizeFileVersions(input []FileVersion, maxDependencies int) ([]FileVers
 	versions := append([]FileVersion(nil), input...)
 	sort.Slice(versions, func(i, j int) bool { return versions[i].Path < versions[j].Path })
 	for index, version := range versions {
-		if version.Path == "" || version.Digest == "" || version.Size < -1 {
+		if version.Path == "" || len(version.Path) > maxReadCacheDependencyPathBytes || !filepath.IsAbs(version.Path) ||
+			filepath.Clean(version.Path) != version.Path || version.Digest == "" || len(version.Digest) > maxReadCacheDependencyDigestBytes ||
+			!validReadCacheIdentityDigest(version.IdentityDigest) || version.Size < -1 {
 			return nil, errors.New("read cache dependency is invalid")
 		}
 		if index > 0 && versions[index-1].Path == version.Path {
@@ -395,6 +410,14 @@ func normalizeFileVersions(input []FileVersion, maxDependencies int) ([]FileVers
 		}
 	}
 	return versions, nil
+}
+
+func validReadCacheIdentityDigest(value string) bool {
+	if len(value) != sha256.Size*2 || strings.ToLower(value) != value {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func fileVersionsEqual(left, right []FileVersion) bool {
@@ -438,7 +461,7 @@ func readCacheEntrySize(key ReadCacheKey, dependencies []FileVersion, valueBytes
 		}
 	}
 	for _, dependency := range dependencies {
-		for _, part := range []int64{int64(len(dependency.Path)), int64(len(dependency.Digest)), 32} {
+		for _, part := range []int64{int64(len(dependency.Path)), int64(len(dependency.Digest)), int64(len(dependency.IdentityDigest)), 32} {
 			if err := add(part); err != nil {
 				return 0, err
 			}
@@ -454,14 +477,110 @@ func saturatingAdd(left, right int64) int64 {
 	return left + right
 }
 
-func readRootFingerprint(ctx context.Context, validated ValidatedCall) (string, error) {
-	if validated.workingDirectory == nil {
-		return "", errors.New("validated read root identity is unavailable")
+func validateReadCacheRoot(validated ValidatedCall) (string, []byte, error) {
+	if validated.workingDirectory == nil || validated.executionRoot == nil ||
+		validated.executionRootPath == "" || !filepath.IsAbs(validated.executionRootPath) {
+		return "", nil, errors.New("validated read root identity is unavailable")
 	}
-	workingIdentity, err := validated.workingDirectory.MarshalBinary()
+	canonicalRoot, err := filepath.EvalSymlinks(filepath.Clean(validated.executionRootPath))
+	if err != nil || !filepath.IsAbs(canonicalRoot) {
+		return "", nil, errors.New("validated read root identity is unavailable")
+	}
+	canonicalRoot, err = canonicalReadCacheExistingPath(canonicalRoot)
 	if err != nil {
-		return "", errors.New("validated read root identity is invalid")
+		return "", nil, errors.New("validated read root identity is unavailable")
 	}
+	frozen, err := validated.workingDirectory.MarshalBinary()
+	if err != nil {
+		return "", nil, errors.New("validated read root identity is invalid")
+	}
+	executionIdentity, err := validated.executionRoot.Identity().MarshalBinary()
+	if err != nil || !bytes.Equal(frozen, executionIdentity) {
+		return "", nil, errors.New("validated read root identity drifted")
+	}
+	opened, err := safefs.Bootstrap(canonicalRoot, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		return "", nil, errors.New("validated read root identity is unavailable")
+	}
+	live, marshalErr := opened.Root.Identity().MarshalBinary()
+	closeErr := opened.Root.Close()
+	if marshalErr != nil || closeErr != nil || !bytes.Equal(frozen, live) {
+		return "", nil, errors.New("validated read root identity drifted")
+	}
+	return filepath.Clean(canonicalRoot), frozen, nil
+}
+
+func canonicalReadCacheExistingPath(path string) (string, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return "", errors.New("read cache path is not absolute")
+	}
+	path = filepath.Clean(path)
+	volume := filepath.VolumeName(path)
+	current := volume + string(filepath.Separator)
+	if volume == "" {
+		current = string(filepath.Separator)
+	}
+	remainder := strings.TrimPrefix(path, current)
+	if remainder == "" {
+		return current, nil
+	}
+	for _, component := range strings.Split(remainder, string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." {
+			return "", errors.New("read cache path is invalid")
+		}
+		candidate := filepath.Join(current, component)
+		candidateInfo, err := os.Lstat(candidate)
+		if err != nil {
+			return "", err
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", err
+		}
+		actual := ""
+		for _, entry := range entries {
+			entryInfo, infoErr := entry.Info()
+			if infoErr == nil && os.SameFile(candidateInfo, entryInfo) {
+				actual = entry.Name()
+				break
+			}
+		}
+		if actual == "" {
+			return "", errors.New("read cache path identity is unavailable")
+		}
+		current = filepath.Join(current, actual)
+	}
+	return filepath.Clean(current), nil
+}
+
+func revalidateReadCacheBindings(validated ValidatedCall, rootPath string) error {
+	if validated.Call.Name != "Read" {
+		if len(validated.resourceBindings) != 0 {
+			return errors.New("validated read bindings are inconsistent")
+		}
+		return nil
+	}
+	if validated.executionRoot == nil || len(validated.resourceBindings) != 1 {
+		return errors.New("validated read binding is unavailable")
+	}
+	requested, _ := validated.Arguments["path"].(string)
+	relative, err := rootRelativeBindingPath(requested, rootPath)
+	if err != nil {
+		return errors.New("validated read binding is unavailable")
+	}
+	current, err := validated.executionRoot.Bind(relative)
+	if err != nil {
+		return errors.New("validated read binding drifted")
+	}
+	frozenBytes, frozenErr := validated.resourceBindings[0].MarshalBinary()
+	currentBytes, currentErr := current.MarshalBinary()
+	if frozenErr != nil || currentErr != nil || !bytes.Equal(frozenBytes, currentBytes) {
+		return errors.New("validated read binding drifted")
+	}
+	return nil
+}
+
+func readRootFingerprint(ctx context.Context, validated ValidatedCall, workingIdentity []byte) (string, error) {
 	hash := sha256.New()
 	writeFingerprintPart(hash, []byte("read-root-v1"))
 	writeFingerprintPart(hash, workingIdentity)
@@ -469,6 +588,7 @@ func readRootFingerprint(ctx context.Context, validated ValidatedCall) (string, 
 	requested, ok := ReadScopeFromContext(ctx)
 	if ok {
 		var normalized ReadScope
+		var err error
 		if requested.pinned {
 			normalized, err = NewPinnedReadScope(requested.ProjectRoot, requested.ExtraRoots)
 		} else {
@@ -503,7 +623,7 @@ func writeFingerprintPart(writer io.Writer, value []byte) {
 	_, _ = writer.Write(value)
 }
 
-func collectReadDependencies(ctx context.Context, validated ValidatedCall, maxDependencies int) ([]FileVersion, error) {
+func collectReadDependencies(ctx context.Context, validated ValidatedCall, rootPath string, maxDependencies int) ([]FileVersion, error) {
 	arguments := make(map[string]any)
 	decoder := json.NewDecoder(strings.NewReader(string(validated.CanonicalArguments())))
 	decoder.UseNumber()
@@ -514,7 +634,7 @@ func collectReadDependencies(ctx context.Context, validated ValidatedCall, maxDe
 	switch validated.Call.Name {
 	case "Read":
 		path, _ := arguments["path"].(string)
-		target, err := readCacheTarget(validated.executionRootPath, path)
+		target, err := readCacheTarget(rootPath, path)
 		if err != nil {
 			return nil, err
 		}
@@ -526,7 +646,7 @@ func collectReadDependencies(ctx context.Context, validated ValidatedCall, maxDe
 		if path == "" {
 			path = "."
 		}
-		target, err := readCacheTarget(validated.executionRootPath, path)
+		target, err := readCacheTarget(rootPath, path)
 		if err != nil {
 			return nil, err
 		}
@@ -535,7 +655,7 @@ func collectReadDependencies(ctx context.Context, validated ValidatedCall, maxDe
 		}
 	case "Glob":
 		pattern, _ := arguments["pattern"].(string)
-		scope, err := readCacheScope(ctx, validated.executionRootPath)
+		scope, err := readCacheScope(ctx, rootPath)
 		if err != nil {
 			return nil, err
 		}
@@ -646,10 +766,20 @@ func snapshotFileVersion(ctx context.Context, path string) (FileVersion, error) 
 	if err := ctx.Err(); err != nil {
 		return FileVersion{}, err
 	}
+	identity, err := readCachePathIdentity(path)
+	if err != nil {
+		return FileVersion{}, err
+	}
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
+		liveIdentity, identityErr := readCachePathIdentity(path)
+		if identityErr != nil || liveIdentity != identity {
+			return FileVersion{}, errors.New("read cache dependency identity drifted")
+		}
 		digest := sha256.Sum256([]byte("missing"))
-		return FileVersion{Path: filepath.Clean(path), Size: -1, Digest: hex.EncodeToString(digest[:])}, nil
+		return FileVersion{
+			Path: filepath.Clean(path), Size: -1, Digest: hex.EncodeToString(digest[:]), IdentityDigest: identity,
+		}, nil
 	}
 	if err != nil {
 		return FileVersion{}, errors.New("read cache dependency stat failed")
@@ -703,10 +833,88 @@ func snapshotFileVersion(ctx context.Context, path string) (FileVersion, error) 
 	default:
 		_, _ = hash.Write([]byte("other\x00" + info.Mode().String()))
 	}
+	liveIdentity, err := readCachePathIdentity(path)
+	if err != nil || liveIdentity != identity {
+		return FileVersion{}, errors.New("read cache dependency identity drifted")
+	}
 	return FileVersion{
-		Path:    filepath.Clean(path),
-		Size:    info.Size(),
-		ModTime: info.ModTime().UnixNano(),
-		Digest:  hex.EncodeToString(hash.Sum(nil)),
+		Path:           filepath.Clean(path),
+		Size:           info.Size(),
+		ModTime:        info.ModTime().UnixNano(),
+		Digest:         hex.EncodeToString(hash.Sum(nil)),
+		IdentityDigest: identity,
 	}, nil
+}
+
+func readCachePathIdentity(path string) (string, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", errors.New("read cache dependency path is invalid")
+	}
+	_, targetErr := os.Lstat(path)
+	targetExists := targetErr == nil
+	if targetErr != nil && !os.IsNotExist(targetErr) {
+		return "", errors.New("read cache dependency identity is unavailable")
+	}
+	parent := filepath.Dir(path)
+	leaf := filepath.Base(path)
+	if path == string(filepath.Separator) {
+		parent, leaf = path, "."
+	}
+	for {
+		info, err := os.Lstat(parent)
+		if err == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", errors.New("read cache dependency parent is invalid")
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return "", errors.New("read cache dependency identity is unavailable")
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", errors.New("read cache dependency identity is unavailable")
+		}
+		parent = next
+	}
+	relative, err := filepath.Rel(parent, path)
+	if err != nil || relative == "" || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("read cache dependency identity is unavailable")
+	}
+	opened, err := safefs.Bootstrap(parent, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		return "", errors.New("read cache dependency identity is unavailable")
+	}
+	defer opened.Root.Close()
+	hash := sha256.New()
+	writeFingerprintPart(hash, []byte("read-dependency-identity-v1"))
+	if relative == "." && leaf == "." {
+		rootIdentity, err := opened.Root.Identity().MarshalBinary()
+		if err != nil {
+			return "", errors.New("read cache dependency identity is unavailable")
+		}
+		writeFingerprintPart(hash, rootIdentity)
+		return hex.EncodeToString(hash.Sum(nil)), nil
+	}
+	binding, err := opened.Root.Bind(filepath.ToSlash(relative))
+	if err != nil {
+		if targetExists {
+			return "", errors.New("read cache dependency identity is unavailable")
+		}
+		// A missing intermediate cannot be bound as an object. Bind the existing
+		// ancestor identity and the canonical remaining suffix instead.
+		rootIdentity, marshalErr := opened.Root.Identity().MarshalBinary()
+		if marshalErr != nil {
+			return "", errors.New("read cache dependency identity is unavailable")
+		}
+		writeFingerprintPart(hash, rootIdentity)
+		writeFingerprintPart(hash, []byte(filepath.ToSlash(relative)))
+		return hex.EncodeToString(hash.Sum(nil)), nil
+	}
+	encoded, err := binding.MarshalBinary()
+	if err != nil {
+		return "", errors.New("read cache dependency identity is unavailable")
+	}
+	writeFingerprintPart(hash, encoded)
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }

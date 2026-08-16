@@ -343,6 +343,8 @@ type assemblyAdaptersRequest struct {
 type assemblyAdapters struct {
 	provider      provider.Provider
 	hooks         *hook.Engine
+	hookSnapshot  hook.Snapshot
+	hookHTTP      hook.HTTPRunner
 	hookResults   *hook.SyntheticResultAdapter
 	mcp           *mcpclient.Manager
 	conversations conversation.Store
@@ -1074,6 +1076,8 @@ func newAssemblyAdaptersStage(request assemblyAdaptersRequest) assemblyStageBuil
 		state.adapters = &assemblyAdapters{
 			provider:      providerService,
 			hooks:         hookEngine,
+			hookSnapshot:  hookSnapshot,
+			hookHTTP:      hookHTTP,
 			hookResults:   hookResults,
 			mcp:           mcpManager,
 			conversations: conversationStore,
@@ -1096,7 +1100,9 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 	return func(ctx context.Context, state *assemblyBuildState, register assemblyOwnerRegistrar) error {
 		if ctx == nil || state == nil || state.configuration == nil || state.configuration.redactor == nil ||
 			state.adapters == nil || state.adapters.provider == nil || state.adapters.hooks == nil ||
+			state.adapters.hookHTTP == nil ||
 			state.adapters.conversations == nil || state.adapters.diagnostics == nil || state.execution == nil ||
+			state.security == nil || state.security.processes == nil ||
 			state.execution.registry == nil || state.execution.executor == nil || state.execution.instructions == nil ||
 			state.execution.skills == nil || state.execution.resultFactory == nil || register == nil {
 			return errors.New("assembly orchestration stage is unavailable")
@@ -1104,7 +1110,8 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 		if !validAssemblyOrchestrationPermissionBoundary(state.execution) {
 			return errors.New("assembly orchestration permission boundary is invalid")
 		}
-		if !validAssemblyPath(request.paths.ProjectRoot) || !validAssemblyPath(request.paths.UserDataRoot) {
+		if !validAssemblyPath(request.paths.ProjectRoot) || !validAssemblyPath(request.paths.UserConfigRoot) ||
+			!validAssemblyPath(request.paths.UserDataRoot) || !validAssemblyPath(request.paths.UserCacheRoot) {
 			return errors.New("assembly orchestration roots are invalid")
 		}
 		resolved := state.configuration.loaded.Config
@@ -1116,6 +1123,31 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 		})
 		if err != nil || contextServices == nil {
 			return safeAssemblyOrchestrationError("context services")
+		}
+
+		subagentWorktrees, err := newAssemblySubagentWorktrees(assemblySubagentWorktreeRequest{
+			Paths: request.paths, Config: resolved, Registry: state.execution.registry,
+			ResultFactory: state.execution.resultFactory, Provider: state.adapters.provider,
+			UserInstructions: contextServices.instructionLoader, UserMemory: contextServices.memory,
+			HookSnapshot: state.adapters.hookSnapshot, HookHTTP: state.adapters.hookHTTP,
+			ProcessRunner: state.security.processes, RuntimeRedactor: state.configuration.redactor,
+			LifecycleDiagnostics: state.configuration.diagnostics, CleanupTimeout: state.configuration.cleanupTimeout,
+		})
+		if err != nil {
+			return safeAssemblyOrchestrationError("worktree services")
+		}
+		if subagentWorktrees != nil {
+			if err := register(subagentWorktrees.graph.owners.worktrees); err != nil {
+				_ = subagentWorktrees.graph.owners.janitor(context.Background())
+				_ = subagentWorktrees.graph.owners.workspace(context.Background())
+				_ = subagentWorktrees.graph.owners.worktrees(context.Background())
+				return safeAssemblyOrchestrationError("worktree ownership registration")
+			}
+			if err := register(subagentWorktrees.graph.owners.workspace); err != nil {
+				_ = subagentWorktrees.graph.owners.janitor(context.Background())
+				_ = subagentWorktrees.graph.owners.workspace(context.Background())
+				return safeAssemblyOrchestrationError("workspace ownership registration")
+			}
 		}
 
 		commandRegistry, err := command.New(command.Builtins()...)
@@ -1130,6 +1162,8 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			RequestBudgeter: contextServices.requestBudgeter, ContextPolicy: contextServices.skillHistoryPolicy,
 			Hooks: state.adapters.hooks, RuntimeRedactor: state.configuration.redactor,
 			CleanupTimeout: state.configuration.cleanupTimeout, LifecycleDiagnostics: state.configuration.diagnostics,
+			Worktrees:        assemblySubagentWorktreeGraph(subagentWorktrees),
+			WorktreeTemplate: assemblySubagentWorktreeAcquireTemplate(subagentWorktrees),
 		})
 		if err != nil || subagents == nil {
 			return safeAssemblyOrchestrationError("subagent services")
@@ -1206,6 +1240,15 @@ func newAssemblyOrchestrationStage(request assemblyExecutionRequest) assemblySta
 			_ = subagents.shutdown(context.Background())
 			_ = subagents.closeResultInbox(context.Background())
 			return safeAssemblyOrchestrationError("subagent manager ownership registration")
+		}
+		if subagentWorktrees != nil {
+			if err := registerStartedOwner(
+				func() error { return register(subagentWorktrees.graph.owners.janitor) },
+				func() { subagentWorktrees.graph.janitor.Start(context.Background()) },
+			); err != nil {
+				_ = subagentWorktrees.graph.owners.janitor(context.Background())
+				return safeAssemblyOrchestrationError("worktree janitor ownership registration")
+			}
 		}
 		state.context = contextServices
 		state.orchestration = orchestration

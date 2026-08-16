@@ -41,6 +41,14 @@ const (
 	PermissionPermissive PermissionMode = "permissive"
 )
 
+// IsolationMode 描述角色需要的项目工作区隔离方式。
+type IsolationMode string
+
+const (
+	IsolationNone     IsolationMode = ""
+	IsolationWorktree IsolationMode = "worktree"
+)
+
 type Metadata struct {
 	Name           string
 	Description    redact.SafeText
@@ -49,6 +57,7 @@ type Metadata struct {
 	Model          ModelAlias
 	MaxIterations  *int
 	PermissionMode PermissionMode
+	Isolation      IsolationMode
 }
 
 type Provenance struct {

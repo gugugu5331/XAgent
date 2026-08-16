@@ -398,6 +398,9 @@ type scriptedSubagentPreparedTask struct {
 
 	mu                   sync.Mutex
 	firstRequestObserver func(context.Context)
+	runTemplate          subagent.Completion
+	settleOnce           sync.Once
+	settled              subagent.Completion
 }
 
 func (task *scriptedSubagentPreparedTask) Metadata() subagent.PreparedMetadata {
@@ -407,7 +410,45 @@ func (task *scriptedSubagentPreparedTask) Metadata() subagent.PreparedMetadata {
 	return task.step.Metadata
 }
 
-func (task *scriptedSubagentPreparedTask) Run(ctx context.Context, sink subagent.EventSink) subagent.Completion {
+func (task *scriptedSubagentPreparedTask) Run(ctx context.Context, sink subagent.EventSink) subagent.RunResult {
+	completion := task.runCompletion(ctx, sink)
+	if task != nil {
+		task.mu.Lock()
+		task.runTemplate = completion.Clone()
+		task.mu.Unlock()
+	}
+	return subagent.RunResult{
+		Status: completion.Status, StopReason: completion.StopReason, Summary: completion.Summary,
+		Usage: completion.Usage, Error: completion.Error,
+	}.Clone()
+}
+
+func (task *scriptedSubagentPreparedTask) Settle(_ context.Context, result subagent.RunResult) subagent.Completion {
+	if task == nil {
+		return subagent.Completion{}
+	}
+	task.settleOnce.Do(func() {
+		task.mu.Lock()
+		completion := task.runTemplate.Clone()
+		task.mu.Unlock()
+		result = result.Clone()
+		completion.Status = result.Status
+		completion.StopReason = result.StopReason
+		completion.Summary = result.Summary
+		completion.Usage = result.Usage
+		completion.Error = result.Error
+		if completion.ID == "" {
+			completion.ID = task.id
+		}
+		if completion.EndedAt.IsZero() {
+			completion.EndedAt = task.clock()
+		}
+		task.settled = completion.Clone()
+	})
+	return task.settled.Clone()
+}
+
+func (task *scriptedSubagentPreparedTask) runCompletion(ctx context.Context, sink subagent.EventSink) subagent.Completion {
 	if task == nil {
 		return subagent.Completion{}
 	}

@@ -73,10 +73,6 @@ type sessionPreparer interface {
 	Prepare(ctx context.Context, conv *conversation.Conversation, mode sessionctx.PrepareMode) (sessionctx.PreparedContext, error)
 }
 
-type stableSessionPreparer interface {
-	PrepareStable(ctx context.Context) sessionctx.PreparedContext
-}
-
 type optionsSessionPreparer interface {
 	PrepareWithOptions(ctx context.Context, conv *conversation.Conversation, opts contextmgr.PrepareOptions) (sessionctx.PreparedContext, error)
 }
@@ -556,7 +552,7 @@ func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conve
 		if options, ok := o.sessionContext.(optionsSessionPreparer); ok {
 			prepared, err = options.PrepareWithOptions(ctx, conv, prepareOptions)
 		} else if !profile.Persist {
-			if stable, ok := o.sessionContext.(stableSessionPreparer); ok {
+			if stable, ok := o.sessionContext.(sessionctx.StablePreparer); ok {
 				prepared = stable.PrepareStable(ctx)
 			}
 		} else {
@@ -620,7 +616,9 @@ func (o *Orchestrator) streamWithExecutionState(ctx context.Context, conv *conve
 			}
 		}
 		for _, block := range blocks {
-			hookBlocks = append(hookBlocks, prompt.Block{Name: block.Name, Content: o.redactText(block.Content), Stable: false})
+			hookBlocks = append(hookBlocks, prompt.Block{
+				Name: block.Name, Content: o.redactText(block.Content), Stable: false, Scope: prompt.ScopeRuntime,
+			})
 		}
 	}
 	bundle := prompt.Build(prompt.BuildRequest{
@@ -769,7 +767,7 @@ func promptRunMode(mode RunMode) prompt.RunMode {
 func (o *Orchestrator) providerStableBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: true})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: true, Scope: block.Scope})
 	}
 	return result
 }
@@ -777,7 +775,7 @@ func (o *Orchestrator) providerStableBlocks(blocks []prompt.Block) []provider.Sy
 func (o *Orchestrator) providerDynamicBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: false})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: false, Scope: block.Scope})
 	}
 	return result
 }
@@ -785,7 +783,7 @@ func (o *Orchestrator) providerDynamicBlocks(blocks []prompt.Block) []provider.S
 func (o *Orchestrator) providerOrderedBlocks(blocks []prompt.Block) []provider.SystemBlock {
 	result := make([]provider.SystemBlock, 0, len(blocks))
 	for _, block := range blocks {
-		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: block.Stable})
+		result = append(result, provider.SystemBlock{Name: block.Name, Content: o.safeText(block.Content), Cacheable: block.Stable, Scope: block.Scope})
 	}
 	return result
 }

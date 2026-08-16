@@ -65,6 +65,48 @@ Do the work.
 	}
 }
 
+func TestParseMarkdownIsolation(t *testing.T) {
+	redactor := redact.NewRuntimeRedactor()
+	parse := func(t *testing.T, isolationLine string) Candidate {
+		t.Helper()
+		raw := "---\nname: helper\ndescription: Helps safely\n" + isolationLine + "---\nDo the work.\n"
+		candidate, err := ParseMarkdown([]byte(raw), ParseOptions{
+			Origin: "helper.md", Limits: DefaultLimits(), Redactor: redactor,
+		})
+		if err != nil {
+			t.Fatalf("ParseMarkdown() error = %v", err)
+		}
+		return candidate
+	}
+
+	omitted := parse(t, "")
+	if !omitted.Valid || omitted.Isolation != IsolationNone {
+		t.Fatalf("omitted isolation candidate = %#v", omitted)
+	}
+	worktree := parse(t, "isolation: worktree\n")
+	if !worktree.Valid || worktree.Isolation != IsolationWorktree {
+		t.Fatalf("worktree isolation candidate = %#v", worktree)
+	}
+
+	invalid := []string{
+		"isolation: ''\n",
+		"isolation: null\n",
+		"isolation: false\n",
+		"isolation: [worktree]\n",
+		"isolation: shared\n",
+		"isolation: secret-invalid-value\n",
+	}
+	for _, line := range invalid {
+		candidate := parse(t, line)
+		assertInvalidRoleCandidate(t, candidate)
+		for _, diagnostic := range candidate.Diagnostics {
+			if strings.Contains(diagnostic.Message.Text(), "secret-invalid-value") {
+				t.Fatalf("diagnostic leaked invalid isolation value: %#v", diagnostic)
+			}
+		}
+	}
+}
+
 func TestParseMarkdownRedactsBeforePublishing(t *testing.T) {
 	redactor := redact.NewRuntimeRedactor()
 	redactor.RegisterSecret("super-secret-token")

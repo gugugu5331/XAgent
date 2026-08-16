@@ -65,6 +65,15 @@ func NewGlobToolWithResultBoundary(projectRoot string, factory *ResultFactory, c
 	return &GlobTool{projectRoot: projectRoot, limits: defaultGlobLimits(), resultFactory: factory, capture: capture}, nil
 }
 
+func (t *GlobTool) BindWorkspace(binding WorkspaceBinding) (Tool, error) {
+	if t == nil {
+		return nil, errors.New("Glob workspace binder is unavailable")
+	}
+	clone := *t
+	clone.projectRoot = binding.Root
+	return &clone, nil
+}
+
 func (t *GlobTool) Name() string { return "Glob" }
 
 func (t *GlobTool) Description() string {

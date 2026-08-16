@@ -24,6 +24,15 @@ func NewEditToolWithResultFactory(projectRoot string, factory *ResultFactory) (T
 	return &EditTool{projectRoot: projectRoot, resultFactory: factory}, nil
 }
 
+func (t *EditTool) BindWorkspace(binding WorkspaceBinding) (Tool, error) {
+	if t == nil {
+		return nil, fmt.Errorf("Edit workspace binder is unavailable")
+	}
+	clone := *t
+	clone.projectRoot = binding.Root
+	return &clone, nil
+}
+
 func (t *EditTool) Name() string { return "Edit" }
 
 func (t *EditTool) Description() string {

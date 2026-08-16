@@ -221,17 +221,20 @@ func t428ProductionOwnerSlots() []t428OwnerSlot {
 		{assemblyStageAdapters, "adapters/hook-http"},
 		{assemblyStageAdapters, "adapters/hook-engine"},
 		{assemblyStageAdapters, "adapters/mcp-manager"},
+		{assemblyStageOrchestration, "orchestration/worktree-manager"},
+		{assemblyStageOrchestration, "orchestration/workspace-factory"},
 		{assemblyStageOrchestration, "orchestration/orchestrator"},
 		{assemblyStageOrchestration, "orchestration/subagent-result-inbox"},
 		{assemblyStageOrchestration, "orchestration/subagent-manager"},
+		{assemblyStageOrchestration, "orchestration/worktree-janitor"},
 		{assemblyStageUI, "ui/candidate"},
 	}
 }
 
 func assertT428ProductionOwnerManifest(t *testing.T, slots []t428OwnerSlot) {
 	t.Helper()
-	if len(slots) != 18 {
-		t.Fatalf("T4.28 owner manifest has %d slots, want 18", len(slots))
+	if len(slots) != 21 {
+		t.Fatalf("T4.28 owner manifest has %d slots, want 21", len(slots))
 	}
 	wantCounts := make(map[assemblyStage]int, assemblyStageCount)
 	previous := assemblyStage(0)

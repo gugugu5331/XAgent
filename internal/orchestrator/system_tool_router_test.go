@@ -64,6 +64,43 @@ func TestSystemToolRouterForegroundUsesSingleSubmitAndOriginalToolCallID(t *test
 	}
 }
 
+func TestWorkspaceSummaryForegroundResultProjectionIsStableAndPathFree(t *testing.T) {
+	factory, validated := systemRouterAgentCall(t, "agent-workspace-call", `{"task":"inspect worktree","type":"defined","placement":"foreground"}`)
+	parent := subagent.ParentRef{ConversationID: "conversation-workspace", ExecutionID: "execution-workspace", RequestGeneration: 8}
+	workspaceID := strings.Repeat("a", 32)
+	service := &recordingSystemSubagentService{
+		submission: subagent.Submission{
+			ID: "task-workspace", Type: subagent.TypeDefined, Origin: subagent.OriginModel, Parent: parent,
+			Placement: subagent.Foreground, Status: subagent.StatusQueued, Revision: 1, CreatedAt: time.Unix(1, 0),
+		},
+		foreground: subagent.ForegroundOutcome{Completion: &subagent.Completion{
+			ID: "task-workspace", Status: subagent.StatusCompleted, Summary: redact.NewRuntimeRedactor().Redact("settled"),
+			StopReason: subagent.StopCompleted, EndedAt: time.Unix(2, 0),
+			Workspace: subagent.WorkspaceSummary{
+				WorkspaceID: workspaceID, Isolation: "worktree", State: "retained",
+				BaseOID: strings.Repeat("b", 40), Branch: "xagent/worktree/" + workspaceID,
+				Dirty: true, Unpushed: true, Cleanup: "retained", RetentionCause: "dirty_worktree",
+				Error: subagent.SafeError(subagent.ErrInternal, redact.NewRuntimeRedactor().Redact("/private/worktree/root"), false),
+			},
+		}},
+	}
+	router, err := NewSystemToolRouter(SystemToolRouterOptions{Service: service, ResultFactory: factory, Limits: subagent.DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := router.RouteSystem(context.Background(), SystemToolRouteRequest{
+		Call: validated, Parent: parent, Invocation: subagent.InvocationRef{ToolCallID: "agent-workspace-call"}, RequestGeneration: 8,
+	})
+	for _, stable := range []string{workspaceID, strings.Repeat("b", 40), "xagent/worktree/" + workspaceID, "dirty_worktree"} {
+		if !strings.Contains(result.Content, stable) || !strings.Contains(result.ModelContent().Text(), stable) {
+			t.Fatalf("foreground workspace projection omitted %q: %#v", stable, result)
+		}
+	}
+	if strings.Contains(result.Content, "/private/worktree/root") || strings.Contains(result.ModelContent().Text(), "/private/worktree/root") {
+		t.Fatalf("foreground workspace projection leaked an untrusted absolute path: %#v", result)
+	}
+}
+
 func TestSystemToolRouterBackgroundAndForkReturnBoundedAcceptanceWithoutAwait(t *testing.T) {
 	tests := []struct {
 		name       string

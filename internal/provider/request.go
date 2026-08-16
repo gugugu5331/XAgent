@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"xagent/internal/config"
+	"xagent/internal/prompt"
 	"xagent/internal/redact"
 	"xagent/internal/tool"
 )
@@ -60,6 +61,7 @@ type SystemBlock struct {
 	Name      string
 	Content   redact.SafeText
 	Cacheable bool
+	Scope     prompt.Scope
 }
 
 type ToolDefinition struct {
@@ -184,7 +186,10 @@ func validSubagentResultJSON(payload string) bool {
 		!validSubagentResultTerminalPair(value.Status, value.StopReason) || value.Usage == nil || !value.Usage.valid() {
 		return false
 	}
-	return value.Error == nil || value.Error.valid()
+	if value.Error != nil && !value.Error.valid() {
+		return false
+	}
+	return len(value.Workspace) == 0 || validSubagentResultWorkspace(value.Workspace)
 }
 
 type subagentResultPayload struct {
@@ -197,6 +202,78 @@ type subagentResultPayload struct {
 	StopReason       string                      `json:"stop_reason"`
 	Usage            *subagentResultUsagePayload `json:"usage"`
 	Error            *subagentResultErrorPayload `json:"error"`
+	Workspace        json.RawMessage             `json:"workspace"`
+}
+
+type subagentResultWorkspacePayload struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Isolation      string `json:"isolation"`
+	State          string `json:"state"`
+	BaseOID        string `json:"base_oid"`
+	Branch         string `json:"branch"`
+	Dirty          *bool  `json:"dirty"`
+	Unpushed       *bool  `json:"unpushed"`
+	Cleanup        string `json:"cleanup"`
+	RetentionCause string `json:"retention_cause,omitempty"`
+}
+
+func validSubagentResultWorkspace(raw json.RawMessage) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var workspace subagentResultWorkspacePayload
+	if err := decoder.Decode(&workspace); err != nil {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	return workspace.Isolation == "worktree" && validSubagentLowerHex(workspace.WorkspaceID, 32) &&
+		validSubagentGitOID(workspace.BaseOID) && workspace.Branch == "xagent/worktree/"+workspace.WorkspaceID &&
+		validSubagentWorkspaceTerminal(workspace.State) && validSubagentWorkspaceTerminal(workspace.Cleanup) &&
+		workspace.Dirty != nil && workspace.Unpushed != nil &&
+		(workspace.RetentionCause == "" || validSubagentWorkspaceReason(workspace.RetentionCause))
+}
+
+func validSubagentGitOID(value string) bool {
+	return validSubagentLowerHex(value, 40) || validSubagentLowerHex(value, 64)
+}
+
+func validSubagentLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validSubagentWorkspaceTerminal(value string) bool {
+	switch value {
+	case "deleted", "retained", "partial", "manual_attention":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSubagentWorkspaceReason(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			continue
+		}
+		if index > 0 && (character == '_' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type subagentResultUsagePayload struct {

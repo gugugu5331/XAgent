@@ -359,9 +359,13 @@ func (router *SystemToolRouter) completionResult(call tool.Call, submission suba
 		(completion.Error != nil && !validSystemSafeText(completion.Error.Message.Text(), router.limits.MaxResultBytes)) {
 		return routerFailure(router, call, tool.Completed, subagent.ErrInternal, "subagent foreground completion is invalid", false)
 	}
+	preview, err := marshalForegroundCompletionPreview(completion)
+	if err != nil || int64(len(preview)) > router.limits.MaxResultBytes {
+		return routerFailure(router, call, tool.Completed, subagent.ErrInternal, "subagent foreground completion projection is invalid", false)
+	}
 	input := tool.ResultFactoryInput{
 		CallID: call.ID, Name: call.Name, State: tool.Completed,
-		Summary: completion.Summary.Text(), Preview: completion.Summary.Text(), Status: tool.StatusSuccess,
+		Summary: completion.Summary.Text(), Preview: preview, Status: tool.StatusSuccess,
 	}
 	if completion.Status != subagent.StatusCompleted {
 		input.Status = tool.StatusError
@@ -382,6 +386,40 @@ func (router *SystemToolRouter) completionResult(call tool.Call, submission suba
 		}
 	}
 	return routerBuild(router, input)
+}
+
+type foregroundWorkspaceProjection struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Isolation      string `json:"isolation"`
+	State          string `json:"state"`
+	BaseOID        string `json:"base_oid"`
+	Branch         string `json:"branch"`
+	Dirty          bool   `json:"dirty"`
+	Unpushed       bool   `json:"unpushed"`
+	Cleanup        string `json:"cleanup"`
+	RetentionCause string `json:"retention_cause,omitempty"`
+}
+
+func marshalForegroundCompletionPreview(completion subagent.Completion) (string, error) {
+	if completion.Workspace.Isolation == "" {
+		return completion.Summary.Text(), nil
+	}
+	payload, err := json.Marshal(struct {
+		Summary   string                        `json:"summary"`
+		Workspace foregroundWorkspaceProjection `json:"workspace"`
+	}{
+		Summary: completion.Summary.Text(),
+		Workspace: foregroundWorkspaceProjection{
+			WorkspaceID: completion.Workspace.WorkspaceID, Isolation: completion.Workspace.Isolation,
+			State: completion.Workspace.State, BaseOID: completion.Workspace.BaseOID, Branch: completion.Workspace.Branch,
+			Dirty: completion.Workspace.Dirty, Unpushed: completion.Workspace.Unpushed,
+			Cleanup: completion.Workspace.Cleanup, RetentionCause: completion.Workspace.RetentionCause,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(payload), nil
 }
 
 func routerErrorResult(router *SystemToolRouter, call tool.Call, state tool.ExecutionState, err error) tool.Result {

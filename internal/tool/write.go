@@ -77,6 +77,15 @@ func NewWriteToolWithResultFactory(projectRoot string, factory *ResultFactory) (
 	return &WriteTool{projectRoot: projectRoot, resultFactory: factory}, nil
 }
 
+func (t *WriteTool) BindWorkspace(binding WorkspaceBinding) (Tool, error) {
+	if t == nil {
+		return nil, fmt.Errorf("Write workspace binder is unavailable")
+	}
+	clone := *t
+	clone.projectRoot = binding.Root
+	return &clone, nil
+}
+
 func (t *WriteTool) Name() string { return "Write" }
 
 func (t *WriteTool) Description() string {

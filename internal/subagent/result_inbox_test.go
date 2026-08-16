@@ -399,6 +399,11 @@ func TestResultInboxRejectsMalformedOrMismatchedIdentities(t *testing.T) {
 		value.SummaryTruncated = true
 		return value
 	}())
+	invalidNotifications = append(invalidNotifications, func() ResultNotification {
+		value := resultInboxNotification("notification", "task", validParent, 1, "safe")
+		value.Workspace = WorkspaceSummary{Isolation: "worktree", State: "unknown"}
+		return value
+	}())
 	for _, notification := range invalidNotifications {
 		requireResultInboxCode(t, inbox.Publish(context.Background(), notification), ErrInvalidTransition)
 	}
@@ -518,6 +523,68 @@ func TestMarshalResultMessageUsesFixedSafeSchemaAndExactFieldOrder(t *testing.T)
 	}
 	if strings.Contains(string(payload), "recoverable") {
 		t.Fatalf("optional false recoverable field was not omitted: %s", payload)
+	}
+}
+
+func TestWorkspaceSummaryResultProjectionUsesStablePathFreeSchema(t *testing.T) {
+	workspaceID := strings.Repeat("a", 32)
+	notification := resultInboxNotification("notification-workspace", "task-workspace", ParentRef{
+		ConversationID: "conversation-workspace", ExecutionID: "execution-workspace", RequestGeneration: 1,
+	}, 7, "settled")
+	notification.Workspace = WorkspaceSummary{
+		WorkspaceID: workspaceID, Isolation: "worktree", State: "retained",
+		BaseOID: strings.Repeat("b", 40), Branch: "xagent/worktree/" + workspaceID,
+		Dirty: true, Unpushed: true, Cleanup: "retained", RetentionCause: "dirty_worktree",
+		Error: SafeError(ErrInternal, redact.NewRuntimeRedactor().Redact("/private/worktree/root must not project"), false),
+	}
+
+	payload, err := MarshalResultMessage(notification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWorkspace := `"workspace":{"workspace_id":"` + workspaceID + `","isolation":"worktree","state":"retained","base_oid":"` + strings.Repeat("b", 40) + `","branch":"xagent/worktree/` + workspaceID + `","dirty":true,"unpushed":true,"cleanup":"retained","retention_cause":"dirty_worktree"}`
+	if !strings.Contains(string(payload), wantWorkspace) {
+		t.Fatalf("workspace projection is missing or unstable: %s", payload)
+	}
+	for _, forbidden := range []string{"/private/worktree/root", `"workspace":{"error"`, `"message"`} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("workspace projection leaked untrusted field %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestWorkspaceSummaryStoredResultDoesNotAliasPublisherOrClaim(t *testing.T) {
+	inbox := mustResultInbox(t, resultInboxTestLimits(), sequenceResultIDs("claim-workspace"))
+	parent := ParentRef{ConversationID: "conversation-workspace-clone", ExecutionID: "source", RequestGeneration: 1}
+	owner := ParentRef{ConversationID: parent.ConversationID, ExecutionID: "consumer", RequestGeneration: 2}
+	workspaceID := strings.Repeat("c", 32)
+	notification := resultInboxNotification("notification-workspace-clone", "task-workspace-clone", parent, 9, "settled")
+	notification.Workspace = WorkspaceSummary{
+		WorkspaceID: workspaceID, Isolation: "worktree", State: "partial",
+		BaseOID: strings.Repeat("d", 40), Branch: "xagent/worktree/" + workspaceID,
+		Cleanup: "partial", RetentionCause: "settlement_failed",
+		Error: SafeError(ErrInternal, redact.NewRuntimeRedactor().Redact("settlement failed"), false),
+	}
+	reserveAndPublishResult(t, inbox, notification)
+	notification.Workspace.Error.Code = "publisher-mutated"
+
+	claim, err := inbox.Claim(context.Background(), ResultClaimOptions{Owner: owner, MaxNotifications: 1, MaxBytes: math.MaxInt64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := claim.Notifications[0].Workspace.Error.Code; got != string(ErrInternal) {
+		t.Fatalf("stored workspace aliased publisher: code=%q", got)
+	}
+	claim.Notifications[0].Workspace.Error.Code = "claim-mutated"
+	if err := inbox.Release(context.Background(), claim.ClaimID, owner); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := inbox.Claim(context.Background(), ResultClaimOptions{Owner: owner, MaxNotifications: 1, MaxBytes: math.MaxInt64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := retry.Notifications[0].Workspace.Error.Code; got != string(ErrInternal) {
+		t.Fatalf("stored workspace aliased released claim: code=%q", got)
 	}
 }
 

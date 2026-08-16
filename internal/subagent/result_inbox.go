@@ -573,6 +573,7 @@ type resultMessage struct {
 	StopReason       string              `json:"stop_reason"`
 	Usage            resultMessageUsage  `json:"usage"`
 	Error            *resultMessageError `json:"error"`
+	Workspace        *resultWorkspace    `json:"workspace,omitempty"`
 }
 
 type resultMessageUsage struct {
@@ -586,6 +587,18 @@ type resultMessageError struct {
 	Code        string `json:"code"`
 	Message     string `json:"message"`
 	Recoverable bool   `json:"recoverable,omitempty"`
+}
+
+type resultWorkspace struct {
+	WorkspaceID    string `json:"workspace_id"`
+	Isolation      string `json:"isolation"`
+	State          string `json:"state"`
+	BaseOID        string `json:"base_oid"`
+	Branch         string `json:"branch"`
+	Dirty          bool   `json:"dirty"`
+	Unpushed       bool   `json:"unpushed"`
+	Cleanup        string `json:"cleanup"`
+	RetentionCause string `json:"retention_cause,omitempty"`
 }
 
 func marshalResultMessage(notification ResultNotification, maxIDBytes int64) ([]byte, error) {
@@ -611,6 +624,7 @@ func marshalResultMessage(notification ResultNotification, maxIDBytes int64) ([]
 		StopReason:       notification.StopReason,
 		Usage:            notification.Usage,
 		Error:            notification.Error,
+		Workspace:        notification.Workspace,
 		EndedAt:          notification.CreatedAt,
 	}
 	if err := completion.Validate(); err != nil {
@@ -631,6 +645,14 @@ func marshalResultMessage(notification ResultNotification, maxIDBytes int64) ([]
 			CacheCreationInputTokens: notification.Usage.CacheCreationInputTokens,
 			CacheReadInputTokens:     notification.Usage.CacheReadInputTokens,
 		},
+	}
+	if notification.Workspace.Isolation != "" {
+		message.Workspace = &resultWorkspace{
+			WorkspaceID: notification.Workspace.WorkspaceID, Isolation: notification.Workspace.Isolation,
+			State: notification.Workspace.State, BaseOID: notification.Workspace.BaseOID, Branch: notification.Workspace.Branch,
+			Dirty: notification.Workspace.Dirty, Unpushed: notification.Workspace.Unpushed,
+			Cleanup: notification.Workspace.Cleanup, RetentionCause: notification.Workspace.RetentionCause,
+		}
 	}
 	if notification.Error != nil {
 		if notification.Error.Source != "subagent" ||

@@ -236,6 +236,25 @@ func TestSnapshotAndResolvedRoleAreDeepCopies(t *testing.T) {
 	}
 }
 
+func TestResolvedRoleIsolationIsFrozenUntilRefresh(t *testing.T) {
+	files := fstest.MapFS{
+		"agents/worker.md": {Data: []byte("---\nname: worker\ndescription: Worker\nisolation: worktree\n---\nDo work.\n")},
+	}
+	manager, err := NewManager(context.Background(), ManagerOptions{
+		Sources: []FileSource{{Source: SourceProject, ID: "project", FS: files, Root: "agents"}},
+		Tools:   testToolMetadata(), Models: testModelCatalog(t), Limits: DefaultLimits(), Redactor: redact.NewRuntimeRedactor(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	files["agents/worker.md"].Data = roleMarkdown("worker", "Do shared work.")
+	resolved, ok := manager.Resolve("worker")
+	if !ok || resolved.Definition.Isolation != IsolationWorktree {
+		t.Fatalf("frozen role changed with source file: %#v", resolved)
+	}
+}
+
 func TestManagerRejectsProviderProtocolFailureWithoutPublishing(t *testing.T) {
 	redactor := redact.NewRuntimeRedactor()
 	provider := newTestRoleProvider("bad-provider")
