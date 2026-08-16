@@ -13,6 +13,7 @@ import (
 	"xagent/internal/events"
 	"xagent/internal/memory"
 	"xagent/internal/redact"
+	"xagent/internal/subagent"
 	"xagent/internal/tui"
 )
 
@@ -77,6 +78,16 @@ func (c *commandController) HandleIntent(intent command.IntentKind) error {
 // request the sessions screen.
 func (m *Model) handleEscape() (bool, tea.Cmd) {
 	waitingConfirmation := m.confirmation != nil && m.confirmation.Confirmation != nil
+	if !waitingConfirmation && !m.streaming {
+		switch m.screen {
+		case screenTaskDetail:
+			m.screen = screenTasks
+			return true, nil
+		case screenTasks:
+			m.screen = screenChat
+			return true, nil
+		}
+	}
 	shortcutContext := command.ShortcutChatIdle
 	switch {
 	case waitingConfirmation:
@@ -231,8 +242,13 @@ func (m *Model) advanceArtifactGeneration() uint64 {
 
 func (m *Model) applyWindowSize(size tea.WindowSizeMsg) {
 	screen := tui.ScreenChat
-	if m.screen == screenList {
+	switch m.screen {
+	case screenList:
 		screen = tui.ScreenList
+	case screenTasks:
+		screen = tui.ScreenTasks
+	case screenTaskDetail:
+		screen = tui.ScreenTaskDetail
 	}
 	input := tui.LayoutInput{
 		Terminal:         tui.Size{Width: size.Width, Height: size.Height},
@@ -247,9 +263,17 @@ func (m *Model) applyWindowSize(size tea.WindowSizeMsg) {
 
 	m.status.SetRegion(layout.Status)
 	if m.screen == screenList {
+		m.taskRegion = tui.Region{}
 		tui.ApplyConversationListLayout(&m.list, layout)
 		return
 	}
+	if m.screen == screenTasks || m.screen == screenTaskDetail {
+		m.taskRegion = layout.Main
+		m.input.SetRegion(layout.Input)
+		m.commandMenu.SetRegion(layout.CommandMenu)
+		return
+	}
+	m.taskRegion = tui.Region{}
 	m.messages.SetRegion(layout.Main)
 	m.input.SetRegion(layout.Input)
 	m.commandMenu.SetRegion(layout.CommandMenu)
@@ -316,6 +340,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		view := loaded.View
 		m.artifactView = &view
 		return m, nil
+	}
+	switch message := msg.(type) {
+	case taskSubscribedMsg:
+		return m, m.handleTaskSubscribed(message)
+	case taskEventMsg:
+		if diagnostic, reject := m.rejectTaskEventProjection(message); reject {
+			m.publishTaskStreamError(subagent.SafeError(
+				subagent.ErrInvalidTransition,
+				redact.NewRuntimeRedactor().Redact(diagnostic),
+				false,
+			))
+			m.taskEventCursor = message.event.Revision
+			return m, waitTaskEvent(message.state, message.epoch, message.events)
+		}
+		return m, m.handleTaskEvent(message)
+	case taskEventStreamClosedMsg:
+		return m, m.handleTaskEventStreamClosed(message)
+	case taskEventResyncMsg:
+		return m, m.handleTaskEventResync(message)
+	case taskEventRetryMsg:
+		return m, m.handleTaskEventRetry(message)
+	case taskForegroundOutcomeMsg:
+		return m, m.handleTaskForegroundOutcome(message)
 	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -532,6 +579,61 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input.Text, cmd = m.input.Text.Update(msg)
 	return m, cmd
+}
+
+func (m *Model) rejectTaskEventProjection(message taskEventMsg) (string, bool) {
+	if m == nil || message.state == nil || !message.state.accepts(message.epoch) {
+		return "", false
+	}
+	event := message.event
+	if event.Kind == subagent.EventGap || event.Revision == 0 || event.Revision <= m.taskEventCursor ||
+		event.Sequence == 0 || event.TaskID == "" || event.ValidateOneOf() != nil || !validTaskEventPayload(event) {
+		return "", false
+	}
+	if workspace, present := taskEventWorkspace(event); present {
+		if _, valid := projectTaskWorkspace(workspace); !valid {
+			return "任务工作区状态无效", true
+		}
+	}
+	next, changesStatus := taskEventProjectedStatus(event)
+	if !changesStatus {
+		return "", false
+	}
+	current, found := m.currentProjectedTaskStatus(event.TaskID)
+	if !found || current == next || subagent.CanTransition(current, next) {
+		return "", false
+	}
+	return "任务状态事件顺序无效", true
+}
+
+func taskEventProjectedStatus(event subagent.Event) (subagent.Status, bool) {
+	if event.Result != nil {
+		return event.Result.Status, true
+	}
+	if event.Snapshot != nil {
+		return event.Snapshot.Status, true
+	}
+	return "", false
+}
+
+func (m *Model) currentProjectedTaskStatus(taskID subagent.ID) (subagent.Status, bool) {
+	var (
+		status   subagent.Status
+		revision uint64
+		found    bool
+	)
+	for _, task := range m.taskListView.Tasks() {
+		candidate := subagent.Status(task.Status())
+		if task.ID() == string(taskID) && candidate.Valid() && (!found || task.Revision() >= revision) {
+			status, revision, found = candidate, task.Revision(), true
+		}
+	}
+	detail := m.taskDetailView.Task()
+	candidate := subagent.Status(detail.Status())
+	if detail.ID() == string(taskID) && candidate.Valid() && (!found || detail.Revision() >= revision) {
+		status, found = candidate, true
+	}
+	return status, found
 }
 
 func (m *Model) trackTransientID(independentID string) {

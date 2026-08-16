@@ -103,12 +103,22 @@ func (o *Orchestrator) prepareToolExecutionWithRegistryAndRef(ctx context.Contex
 	if _, ok := registry.Get(call.Name); !ok {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, o.unknownToolResult(call), out)
 	}
+	descriptor, ok := registry.Descriptor(call.Name)
+	if !ok {
+		return o.rejectPreparedTool(ctx, call, indexed.Index, o.unknownToolResult(call), out)
+	}
 	validated, err := registry.ValidateCall(call)
 	if err != nil {
 		return o.rejectPreparedTool(ctx, call, indexed.Index, o.invalidToolArgumentsResult(call, err), out)
 	}
 
-	systemRoute := call.Name == tool.LoadSkillToolName
+	systemRoute := descriptor.Route == tool.RouteSystem
+	if systemRoute && call.Name == tool.AgentToolName {
+		return ToolExecution{
+			Call: call, State: tool.Prepared, Validated: validated, Ref: ref,
+			SystemRoute: true, Index: indexed.Index,
+		}
+	}
 	if !systemRoute {
 		if o.executor == nil {
 			return o.rejectPreparedTool(ctx, call, indexed.Index, o.unavailableToolExecutorResult(call), out)

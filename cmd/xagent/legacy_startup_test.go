@@ -575,15 +575,6 @@ func newSessionManager(instructionLoader sessionctx.InstructionLoader, memoryMan
 	return manager
 }
 
-func reservedCommandNames(definitions []command.Definition) []string {
-	names := make([]string, 0, len(definitions)*2)
-	for _, definition := range definitions {
-		names = append(names, definition.Name)
-		names = append(names, definition.Aliases...)
-	}
-	return names
-}
-
 func resolveProjectPath(projectRoot string, path string) string {
 	if path == "" || filepath.IsAbs(path) {
 		return path

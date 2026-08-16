@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"path/filepath"
 	"strings"
 
 	"xagent/internal/safefs"
@@ -12,6 +13,10 @@ import (
 const (
 	fileIdentityEncodingVersion byte = 1
 	cacheKeyEncodingVersion     byte = 1
+	maxGraphSourceNameBytes          = 256
+	maxGraphPathBytes                = 4_096
+	maxGraphFiles                    = 1_024
+	maxGraphEdges                    = 8_192
 )
 
 type Scope string
@@ -37,14 +42,14 @@ type Source struct {
 	Content  string
 }
 
-// FileIdentity is the stable filesystem identity of one instruction file.
-// It intentionally contains neither a path nor file content.
+// FileIdentity is the stable filesystem-object identity of one instruction
+// file. Paths are deliberately kept out so hardlink/case aliases of the same
+// object retain include duplicate/cycle semantics.
 type FileIdentity struct {
 	digest [sha256.Size]byte
 }
 
-// FileIdentityFromBinding derives an instruction identity from the canonical
-// identity of a safefs binding.
+// FileIdentityFromBinding derives an instruction object identity from safefs.
 func FileIdentityFromBinding(binding safefs.Binding) (FileIdentity, error) {
 	encoded, err := binding.MarshalBinary()
 	if err != nil {
@@ -76,16 +81,21 @@ func (i FileIdentity) MarshalBinary() ([]byte, error) {
 // building an instruction graph.
 type FileVersion struct {
 	Identity      FileIdentity
+	PathDigest    [sha256.Size]byte
 	ContentDigest [sha256.Size]byte
 }
 
 // NewFileVersion records a content version without retaining instruction
 // bytes in cache-key material.
-func NewFileVersion(identity FileIdentity, content []byte) (FileVersion, error) {
+func NewFileVersion(absolutePath string, identity FileIdentity, content []byte) (FileVersion, error) {
+	absolutePath = strings.TrimSpace(absolutePath)
+	if absolutePath == "" || len(absolutePath) > maxGraphPathBytes || !filepath.IsAbs(absolutePath) || filepath.Clean(absolutePath) != absolutePath {
+		return FileVersion{}, errors.New("instruction file version path is invalid")
+	}
 	if !identity.valid() {
 		return FileVersion{}, errors.New("instruction file version has an invalid identity")
 	}
-	return FileVersion{Identity: identity, ContentDigest: sha256.Sum256(content)}, nil
+	return FileVersion{Identity: identity, PathDigest: sha256.Sum256([]byte(absolutePath)), ContentDigest: sha256.Sum256(content)}, nil
 }
 
 // IncludeEdge is one ordered parent-to-child edge in the expanded graph.
@@ -101,6 +111,7 @@ type GraphSource struct {
 	Name     string
 	Scope    Scope
 	Priority int
+	RootPath string
 	Root     FileIdentity
 }
 
@@ -113,11 +124,18 @@ type CacheKey struct {
 // callers pass deterministic traversal order so include output order remains
 // part of the cached result's identity.
 func NewCacheKey(source GraphSource, files []FileVersion, edges []IncludeEdge) (CacheKey, error) {
-	if strings.TrimSpace(source.Name) == "" || !validScope(source.Scope) || !source.Root.valid() {
+	name := strings.TrimSpace(source.Name)
+	if name == "" || len(name) > maxGraphSourceNameBytes || !validScope(source.Scope) || !validScopePriority(source.Scope, source.Priority) || !source.Root.valid() {
 		return CacheKey{}, errors.New("instruction cache source is invalid")
 	}
-	if len(files) == 0 {
+	if source.RootPath == "" || len(source.RootPath) > maxGraphPathBytes || !filepath.IsAbs(source.RootPath) || filepath.Clean(source.RootPath) != source.RootPath {
+		return CacheKey{}, errors.New("instruction cache source path is invalid")
+	}
+	if len(files) == 0 || len(files) > maxGraphFiles {
 		return CacheKey{}, errors.New("instruction cache graph has no files")
+	}
+	if len(edges) > maxGraphEdges {
+		return CacheKey{}, errors.New("instruction cache graph has too many include edges")
 	}
 
 	known := make(map[FileIdentity]struct{}, len(files))
@@ -125,13 +143,14 @@ func NewCacheKey(source GraphSource, files []FileVersion, edges []IncludeEdge) (
 	frame := make([]byte, 0, 256+len(files)*64+len(edges)*72)
 	frame = append(frame, "xagent-instruction-cache-key-v1"...)
 	frame = append(frame, 0, cacheKeyEncodingVersion)
-	frame = appendLengthPrefixed(frame, []byte(source.Name))
+	frame = appendLengthPrefixed(frame, []byte(name))
 	frame = appendLengthPrefixed(frame, []byte(source.Scope))
 	frame = appendUint64(frame, uint64(int64(source.Priority)))
+	frame = appendLengthPrefixed(frame, []byte(source.RootPath))
 	frame = append(frame, source.Root.digest[:]...)
 	frame = appendUint64(frame, uint64(len(files)))
 	for _, file := range files {
-		if !file.Identity.valid() {
+		if !file.Identity.valid() || file.PathDigest == ([sha256.Size]byte{}) {
 			return CacheKey{}, errors.New("instruction cache graph has an invalid file identity")
 		}
 		if _, duplicate := known[file.Identity]; duplicate {
@@ -140,6 +159,7 @@ func NewCacheKey(source GraphSource, files []FileVersion, edges []IncludeEdge) (
 		known[file.Identity] = struct{}{}
 		rootFound = rootFound || file.Identity == source.Root
 		frame = append(frame, file.Identity.digest[:]...)
+		frame = append(frame, file.PathDigest[:]...)
 		frame = append(frame, file.ContentDigest[:]...)
 	}
 	if !rootFound {
@@ -183,6 +203,19 @@ func validScope(scope Scope) bool {
 	switch scope {
 	case ScopeProjectRoot, ScopeProjectDir, ScopeUserDir:
 		return true
+	default:
+		return false
+	}
+}
+
+func validScopePriority(scope Scope, priority int) bool {
+	switch scope {
+	case ScopeProjectRoot:
+		return priority >= PriorityProjectRoot && priority < PriorityProjectDir
+	case ScopeProjectDir:
+		return priority == PriorityProjectDir
+	case ScopeUserDir:
+		return priority == PriorityUserDir
 	default:
 		return false
 	}

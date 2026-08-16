@@ -72,7 +72,7 @@ func (o *Orchestrator) runAgentLoop(ctx context.Context, conv *conversation.Conv
 			}
 			return finishRunResult(result, start, StopReasonCompleted)
 		}
-		if containsLoadSkillCall(collector.ToolCalls) {
+		if containsSystemRouteCall(o.registry, collector.ToolCalls) {
 			terminal, stopReason, unknownCount, err := o.handleSkillToolCalls(ctx, conv, req, state, parentCheckpoint, iterationProfile, iteration, collector.ToolCalls, out)
 			unknownToolCalls += unknownCount
 			if err != nil {

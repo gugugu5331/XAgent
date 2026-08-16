@@ -30,6 +30,7 @@ type Executor struct {
 	ScanMaxLines   int64
 	TicketVerifier permission.TicketVerifier
 	resultFactory  *ResultFactory
+	provenance     *executorProvenance
 
 	rootOnce                sync.Once
 	root                    *safefs.Root
@@ -39,6 +40,11 @@ type Executor struct {
 	extraRootsMu sync.Mutex
 	extraRoots   map[string]*safefs.Root
 }
+
+// executorProvenance is an unforgeable, process-local seal. Validated calls
+// may cross the authorized execution boundary only through the exact Executor
+// that froze their registry, root, and resource bindings.
+type executorProvenance struct{ seal byte }
 
 // NewExecutor is the legacy execution adapter retained until T4.29a. Results
 // produced through it are compatibility values and must not be projected or
@@ -75,6 +81,7 @@ func newExecutor(registry *Registry, projectRoot string, timeout time.Duration, 
 		ScanMaxDirs:    defaultBudgetValue(budget.FilesScanMaxDirectories),
 		ScanMaxLines:   defaultBudgetValue(budget.FilesScanMaxLines),
 		resultFactory:  factory,
+		provenance:     &executorProvenance{},
 	}
 }
 
@@ -136,11 +143,34 @@ func (e *Executor) ExecuteAuthorized(ctx context.Context, call Call, ticket perm
 // ExecuteValidatedAuthorized verifies and consumes a single-use execution
 // ticket before executing the already parsed call.
 func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated ValidatedCall, ticket permission.ExecutionTicket) Result {
-	call := validated.Call
-	if ctx == nil || ctx.Err() != nil {
+	if e == nil {
 		return Result{}
 	}
-	if validated.Tool == nil || validated.Tool.Name() != call.Name || validated.executor == nil || validated.executor.Name() != call.Name || validated.Arguments == nil || len(validated.CanonicalArguments()) == 0 {
+	return e.ExecuteValidatedAuthorizedWithVerifier(ctx, validated, ticket, e.TicketVerifier, nil)
+}
+
+func (e *Executor) ownsValidatedCall(validated ValidatedCall) bool {
+	return e != nil && e.provenance != nil && validated.provenance == e.provenance
+}
+
+// ExecuteValidatedAuthorizedWithVerifier verifies and consumes a single-use
+// execution ticket at the actual start boundary. Task executors inject their
+// scope-bound verifier here so the legacy Executor verifier is never consulted
+// and the ticket cannot be consumed twice. Authorized read caching starts only
+// after the verifier succeeds.
+func (e *Executor) ExecuteValidatedAuthorizedWithVerifier(
+	ctx context.Context,
+	validated ValidatedCall,
+	ticket permission.ExecutionTicket,
+	verifier permission.TicketVerifier,
+	cache AuthorizedResultCache,
+) Result {
+	call := validated.Call
+	if e == nil || ctx == nil || ctx.Err() != nil {
+		return Result{}
+	}
+	if !e.ownsValidatedCall(validated) ||
+		validated.Tool == nil || validated.Tool.Name() != call.Name || validated.executor == nil || validated.executor.Name() != call.Name || validated.Arguments == nil || len(validated.CanonicalArguments()) == 0 {
 		return e.validationFailure(call, fmt.Errorf("validated call is inconsistent"))
 	}
 
@@ -159,16 +189,62 @@ func (e *Executor) ExecuteValidatedAuthorized(ctx context.Context, validated Val
 	if ctx.Err() != nil {
 		return Result{}
 	}
-	if e.TicketVerifier == nil {
+	if verifier == nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonConfigError, ModelMessage: "Execution ticket verification is unavailable.", Recoverable: true})
 	}
-	if err := e.TicketVerifier.VerifyAndConsume(ticket, call.ID, identity); err != nil {
+	if err := verifier.VerifyAndConsume(ticket, call.ID, identity); err != nil {
 		return e.permissionDenied(call, permission.Decision{Reason: permission.ReasonRuleDeny, ModelMessage: "Execution ticket does not match this tool call.", Recoverable: true})
 	}
 	if ctx.Err() != nil {
 		return Result{}
 	}
-	return e.executeValidated(ctx, current)
+
+	cacheable := cache != nil && isCacheableReadTool(call.Name)
+	lookupFailed := false
+	if cacheable {
+		cached, hit, lookupErr := cache.Lookup(ctx, current)
+		if ctx.Err() != nil {
+			return Result{}
+		}
+		if lookupErr == nil && hit && validAuthorizedCacheHit(cached, current.Call) {
+			return cached
+		}
+		lookupFailed = lookupErr != nil || hit
+	}
+
+	result := e.executeValidated(ctx, current)
+	storeFailed := false
+	if cacheable && ctx.Err() == nil && result.CallID != "" {
+		storeFailed = cache.Store(ctx, current, result) != nil
+	}
+	return withReadCacheDiagnostics(result, lookupFailed, storeFailed)
+}
+
+func validAuthorizedCacheHit(result Result, call Call) bool {
+	return result.CallID == call.ID &&
+		result.Name == call.Name &&
+		result.Status.valid() &&
+		result.ExecutionState().CanProduceResult() &&
+		result.ModelContent().Text() != "" &&
+		result.PersistedContent().Text() != ""
+}
+
+func withReadCacheDiagnostics(result Result, lookupFailed, storeFailed bool) Result {
+	if !lookupFailed && !storeFailed {
+		return result
+	}
+	data := make(map[string]any, len(result.Data)+2)
+	for key, value := range result.Data {
+		data[key] = value
+	}
+	if lookupFailed {
+		data["read_cache_lookup"] = "error"
+	}
+	if storeFailed {
+		data["read_cache_store"] = "error"
+	}
+	result.Data = data
+	return result
 }
 
 // PrepareCall validates a call and freezes its current filesystem bindings.
@@ -178,7 +254,12 @@ func (e *Executor) PrepareCall(ctx context.Context, call Call) (ValidatedCall, e
 		return ValidatedCall{}, fmt.Errorf("%w: %q", errToolNotRegistered, call.Name)
 	}
 	if !isFileToolName(call.Name) {
-		return e.Registry.ValidateCall(call)
+		validated, err := e.Registry.ValidateCall(call)
+		if err != nil {
+			return ValidatedCall{}, err
+		}
+		validated.provenance = e.provenance
+		return validated, nil
 	}
 	rootPath, err := e.bindingRootPath(ctx, call)
 	if err != nil {
@@ -194,7 +275,12 @@ func (e *Executor) PrepareCall(ctx context.Context, call Call) (ValidatedCall, e
 	if err != nil {
 		return ValidatedCall{}, err
 	}
-	return e.Registry.ValidateCallWithContext(call, ValidationContext{Root: root, ProjectRoot: rootPath})
+	validated, err := e.Registry.ValidateCallWithContext(call, ValidationContext{Root: root, ProjectRoot: rootPath})
+	if err != nil {
+		return ValidatedCall{}, err
+	}
+	validated.provenance = e.provenance
+	return validated, nil
 }
 
 // CallIdentity builds the authorization identity from execution semantics,

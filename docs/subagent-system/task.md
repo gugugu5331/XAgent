@@ -1,6 +1,6 @@
 # 子 Agent 委派与后台任务系统 Tasks
 
-本任务表基于已批准的 [spec.md](/Users/luoxinxin/Desktop/XAgent/docs/subagent-system/spec.md) 与 [plan.md](/Users/luoxinxin/Desktop/XAgent/docs/subagent-system/plan.md)。每个任务保持一个聚焦工作单元；完成任务后必须先执行该任务的验证，再进入依赖它的任务。
+本任务表基于已批准的 [spec.md](spec.md) 与 [plan.md](plan.md)。每个任务保持一个聚焦工作单元；完成任务后必须先执行该任务的验证，再进入依赖它的任务。
 
 ## 文件清单
 
@@ -273,7 +273,7 @@
 
 **验证：** `go test ./internal/subagent -run 'Test.*ResultInbox|Test.*Claim|Test.*Lease'`；同一结果不会跨会话或被非 owner 确认两次。
 
-### T20：实现 TaskManager 状态存储与终态投影
+### T20：实现 subagent.Manager 状态存储与终态投影
 
 **文件：** `internal/subagent/manager.go`、`scheduler.go`、测试
 
@@ -398,7 +398,7 @@
 
 **步骤：**
 
-1. 消费 TaskManager 事件，展示状态、Placement、角色 provenance、用量、确认卡和有界轨迹。
+1. 消费 `subagent.Service` 事件，展示状态、Placement、角色 provenance、用量、确认卡和有界轨迹。
 2. 在当前主对话按 NotificationID 去重展示完成/失败通知，不写入导航事务。
 
 **验证：** `go test ./internal/tui -run 'Test.*Task|Test.*Notification|Test.*Confirmation'`。
@@ -424,7 +424,7 @@
 
 **步骤：**
 
-1. 按 Registry.Seal → ModelCatalog → agentrole.Manager → RunnerFactory → TaskManager → App/TUI 的唯一顺序组装。
+1. 按 Registry.Seal → ModelCatalog → agentrole.Manager → RunnerFactory → subagent.Manager → App/TUI 的唯一顺序组装。
 2. 让生产入口和候选/测试入口复用同一组装函数，补齐角色目录、模型别名和 subagent limits 示例。
 
 **验证：** `go test ./cmd/xagent ./internal/app -run 'Test.*Assembly|Test.*Lifecycle'`；两条入口的依赖图一致。
@@ -437,7 +437,7 @@
 
 **步骤：**
 
-1. 让 App 常驻排空 TaskManager EventHub，TUI 通过窄服务订阅，不把任务事件写入普通 stale envelope。
+1. 让 App 常驻排空 `subagent.Service` 事件流，TUI 通过该窄服务订阅，不把任务事件写入普通 stale envelope。
 2. 接入 `AwaitForeground`：终态返回同步结果，Detach 返回接受后台且保持事件连续。
 
 **验证：** `go test ./internal/app ./internal/tui -run 'Test.*Event|Test.*AwaitForeground|Test.*Detach'`。

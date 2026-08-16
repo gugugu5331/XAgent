@@ -44,10 +44,22 @@ type canonicalMessagesV1 struct {
 }
 
 type canonicalMessageV1 struct {
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	CreatedAt canonicalTimeV1 `json:"created_at"`
-	Tool      canonicalToolV1 `json:"tool"`
+	Role      string                           `json:"role"`
+	Content   string                           `json:"content"`
+	CreatedAt canonicalTimeV1                  `json:"created_at"`
+	Tool      canonicalToolV1                  `json:"tool"`
+	Subagent  *canonicalSubagentNotificationV1 `json:"subagent_notification,omitempty"`
+}
+
+type canonicalSubagentNotificationV1 struct {
+	NotificationID   string          `json:"notification_id"`
+	TaskID           string          `json:"task_id"`
+	Status           string          `json:"status"`
+	Summary          string          `json:"summary"`
+	SummaryTruncated bool            `json:"summary_truncated"`
+	TruncationReason string          `json:"truncation_reason"`
+	StopReason       string          `json:"stop_reason"`
+	CreatedAt        canonicalTimeV1 `json:"created_at"`
 }
 
 type canonicalToolV1 struct {
@@ -172,11 +184,38 @@ func canonicalMessageFromV2(message Message) (canonicalMessageV1, error) {
 	if err != nil {
 		return canonicalMessageV1{}, err
 	}
+	subagent, err := canonicalSubagentNotificationFromV2(message.Subagent)
+	if err != nil {
+		return canonicalMessageV1{}, err
+	}
 	return canonicalMessageV1{
 		Role:      string(message.Role),
 		Content:   message.Content.Text(),
 		CreatedAt: canonicalTime(message.CreatedAt),
 		Tool:      toolState,
+		Subagent:  subagent,
+	}, nil
+}
+
+func canonicalSubagentNotificationFromV2(notification *SubagentNotificationMessage) (*canonicalSubagentNotificationV1, error) {
+	if notification == nil {
+		return nil, nil
+	}
+	if !validCanonicalStrings(
+		notification.NotificationID,
+		notification.TaskID,
+		notification.Status,
+		notification.Summary.Text(),
+		notification.TruncationReason.Text(),
+		notification.StopReason,
+	) {
+		return nil, errStateDigestEncoding
+	}
+	return &canonicalSubagentNotificationV1{
+		NotificationID: notification.NotificationID, TaskID: notification.TaskID, Status: notification.Status,
+		Summary: notification.Summary.Text(), SummaryTruncated: notification.SummaryTruncated,
+		TruncationReason: notification.TruncationReason.Text(), StopReason: notification.StopReason,
+		CreatedAt: canonicalTime(notification.CreatedAt),
 	}, nil
 }
 

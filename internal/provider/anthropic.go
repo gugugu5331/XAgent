@@ -80,7 +80,10 @@ func (p *AnthropicProvider) StreamChatWithOptions(ctx context.Context, req ChatR
 		return nil, safeProviderError(p.redactor, "anthropic_stream_limits_invalid", "anthropic", err, false)
 	}
 	out := make(chan StreamEvent)
-	params := anthropicMessageParams(p.cfg.Model, req)
+	params, err := anthropicMessageParams(p.cfg.Model, req)
+	if err != nil {
+		return nil, safeProviderError(p.redactor, "anthropic_request_invalid", "anthropic", err, false)
+	}
 	sdkStream := newAnthropicSDKStreamOwner(p.client.Messages.NewStreaming(streamCtx, params))
 	producerDone := make(chan struct{})
 	stream, err := newChatStream(out, streamOptions, func(cleanupCtx context.Context) error {

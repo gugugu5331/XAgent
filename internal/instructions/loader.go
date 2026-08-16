@@ -1,6 +1,7 @@
 package instructions
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,6 +27,20 @@ type Loader struct {
 	ProjectRoot string
 	UserDir     string
 	Config      config.InstructionsConfig
+
+	workspace *workspaceLoaderRoots
+}
+
+type workspaceLoaderRoots struct {
+	project *frozenInstructionRoot
+	user    *frozenInstructionRoot
+	cache   *ExpansionCache
+	config  config.InstructionsConfig
+}
+
+type frozenInstructionRoot struct {
+	path     string
+	identity []byte
 }
 
 // CachedLoader preserves the public loader shape while serializing loads.
@@ -45,6 +60,7 @@ type loaderCache struct {
 type instructionRoot struct {
 	path   string
 	handle *safefs.Root
+	frozen *frozenInstructionRoot
 }
 
 type candidate struct {
@@ -54,6 +70,40 @@ type candidate struct {
 	root     *instructionRoot
 	priority int
 	scope    Scope
+}
+
+// NewWorkspaceLoader constructs a loader whose project and optional user roots
+// are canonical, absolute and bound to their live directory identities. The
+// returned Loader ignores later mutation of its exported compatibility fields.
+func NewWorkspaceLoader(projectRoot, userRoot string, cfg config.InstructionsConfig) (Loader, error) {
+	frozenConfig := cloneInstructionsConfig(normalizedConfig(cfg))
+	if _, err := newInstructionCounter(frozenConfig); err != nil {
+		return Loader{}, errors.New("instruction workspace config is invalid")
+	}
+	project, err := freezeInstructionRoot(projectRoot)
+	if err != nil {
+		return Loader{}, errors.New("instruction project root is invalid")
+	}
+	var user *frozenInstructionRoot
+	if strings.TrimSpace(userRoot) != "" {
+		user, err = freezeInstructionRoot(userRoot)
+		if err != nil {
+			return Loader{}, errors.New("instruction user root is invalid")
+		}
+	}
+	return Loader{
+		ProjectRoot: project.path,
+		UserDir:     frozenInstructionRootPath(user),
+		Config:      cloneInstructionsConfig(frozenConfig),
+		workspace:   &workspaceLoaderRoots{project: project, user: user, cache: &ExpansionCache{}, config: frozenConfig},
+	}, nil
+}
+
+func frozenInstructionRootPath(root *frozenInstructionRoot) string {
+	if root == nil {
+		return ""
+	}
+	return root.path
 }
 
 func (l Loader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
@@ -74,9 +124,21 @@ func (l Loader) load(ctx context.Context) loaderCache {
 			Priority: source.Priority,
 			Content:  content,
 			Stable:   true,
+			Scope:    promptScope(source.Scope),
 		})
 	}
 	return loaderCache{sections: sections, diagnostics: items}
+}
+
+func promptScope(scope Scope) prompt.Scope {
+	switch scope {
+	case ScopeUserDir:
+		return prompt.ScopeUser
+	case ScopeProjectRoot, ScopeProjectDir:
+		return prompt.ScopeProject
+	default:
+		return ""
+	}
 }
 
 func (l Loader) LoadSources(ctx context.Context) ([]Source, []diagnostics.Diagnostic) {
@@ -88,6 +150,9 @@ func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		return nil, []diagnostics.Diagnostic{newDiagnostic("instructions_context_cancelled", "指令加载上下文无效", "instructions", "")}
 	}
 	cfg := normalizedConfig(l.Config)
+	if l.workspace != nil {
+		cfg = cloneInstructionsConfig(l.workspace.config)
+	}
 	counter, err := newInstructionCounter(cfg)
 	if err != nil {
 		return nil, []diagnostics.Diagnostic{newDiagnostic("instructions_budget_invalid", err.Error(), "instructions", "")}
@@ -107,8 +172,13 @@ func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		if !ok {
 			continue
 		}
+		observed := map[string]includeFile{rootFile.path: rootFile}
 		reader := func(ctx context.Context, relative, _ string, maxBytes int64, sourceName string) (includeFile, bool, *diagnostics.Diagnostic) {
-			return readSafefsInstructionFile(ctx, candidate.root.handle, relative, maxBytes, true, sourceName, counter)
+			file, found, item := readSafefsInstructionFile(ctx, candidate.root.handle, relative, maxBytes, true, sourceName, counter)
+			if found {
+				observed[file.path] = file
+			}
+			return file, found, item
 		}
 		expanded, includeDiagnostics, _ := expandIncludesWithDeps(ctx, includeRequest{
 			content:          string(rootFile.content),
@@ -126,6 +196,19 @@ func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 			read:             reader,
 		})
 		items = append(items, includeDiagnostics...)
+		if l.workspace != nil && l.workspace.cache != nil {
+			source, files, edges, graphErr := instructionGraphSnapshot(candidate, rootFile, observed)
+			if graphErr == nil {
+				key, keyErr := NewCacheKey(source, files, edges)
+				if keyErr == nil {
+					if cached, found := l.workspace.cache.lookupCharged(key); found {
+						expanded = cached.Content
+					} else {
+						_ = l.workspace.cache.Store(key, CachedExpansion{Source: source, Content: expanded, Files: files, Edges: edges})
+					}
+				}
+			}
+		}
 		sources = append(sources, Source{
 			Name:     candidate.name,
 			Path:     candidate.path,
@@ -135,10 +218,22 @@ func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		})
 	}
 
+	rootChanged := false
 	for _, root := range roots {
 		if err := root.handle.Close(); err != nil {
-			items = append(items, newDiagnostic("instructions_root_close_failed", "无法关闭指令根目录", "instructions", root.path))
+			path := root.path
+			if root.frozen != nil {
+				path = ""
+			}
+			items = append(items, newDiagnostic("instructions_root_close_failed", "无法关闭指令根目录", "instructions", path))
 		}
+		if root.frozen != nil && !revalidateFrozenInstructionRoot(root.frozen) {
+			rootChanged = true
+		}
+	}
+	if rootChanged {
+		items = append(items, newDiagnostic("instructions_root_changed", "指令根目录稳定身份发生变化，已拒绝本次结果", "instructions", ""))
+		return nil, items
 	}
 	sort.SliceStable(sources, func(i, j int) bool {
 		if sources[i].Priority == sources[j].Priority {
@@ -147,6 +242,52 @@ func (l Loader) loadSources(ctx context.Context) ([]Source, []diagnostics.Diagno
 		return sources[i].Priority < sources[j].Priority
 	})
 	return sources, items
+}
+
+func instructionGraphSnapshot(candidate candidate, rootFile includeFile, observed map[string]includeFile) (GraphSource, []FileVersion, []IncludeEdge, error) {
+	source := GraphSource{
+		Name: candidate.name, Scope: candidate.scope, Priority: candidate.priority,
+		RootPath: candidate.path, Root: rootFile.identity,
+	}
+	ordered := make([]includeFile, 0, len(observed))
+	ordered = append(ordered, rootFile)
+	known := map[FileIdentity]struct{}{rootFile.identity: {}}
+	edges := make([]IncludeEdge, 0, len(observed))
+	var visit func(includeFile)
+	visit = func(parent includeFile) {
+		position := uint64(0)
+		for _, line := range strings.Split(string(parent.content), "\n") {
+			includePath, ok := parseIncludeLine(line)
+			if !ok {
+				continue
+			}
+			childPath := includePath
+			if !pathpkg.IsAbs(childPath) {
+				childPath = pathpkg.Join(pathpkg.Dir(parent.path), childPath)
+			}
+			child, found := observed[childPath]
+			if found && child.identity.valid() {
+				edges = append(edges, IncludeEdge{From: parent.identity, To: child.identity, Position: position})
+				if _, exists := known[child.identity]; !exists {
+					known[child.identity] = struct{}{}
+					ordered = append(ordered, child)
+					visit(child)
+				}
+			}
+			position++
+		}
+	}
+	visit(rootFile)
+	files := make([]FileVersion, 0, len(ordered))
+	for _, file := range ordered {
+		absolute := filepath.Join(candidate.root.path, filepath.FromSlash(file.path))
+		version, err := NewFileVersion(absolute, file.identity, file.content)
+		if err != nil {
+			return GraphSource{}, nil, nil, err
+		}
+		files = append(files, version)
+	}
+	return source, files, edges, nil
 }
 
 func (l *CachedLoader) Load(ctx context.Context) ([]prompt.Section, []diagnostics.Diagnostic) {
@@ -177,6 +318,20 @@ func (l Loader) candidates(ctx context.Context, cfg config.InstructionsConfig) (
 		roots = append(roots, root)
 		build(root)
 	}
+	addFrozenRoot := func(root *frozenInstructionRoot, sourceName string, build func(*instructionRoot)) {
+		if root == nil || ctx.Err() != nil {
+			return
+		}
+		opened, diag := openFrozenInstructionRoot(ctx, root, sourceName)
+		if diag != nil {
+			items = append(items, *diag)
+		}
+		if opened == nil {
+			return
+		}
+		roots = append(roots, opened)
+		build(opened)
+	}
 	addCandidate := func(root *instructionRoot, name string, priority int, scope Scope, parts ...string) {
 		relative, err := canonicalInstructionRelative(parts...)
 		if err != nil {
@@ -193,13 +348,27 @@ func (l Loader) candidates(ctx context.Context, cfg config.InstructionsConfig) (
 		})
 	}
 
-	addRoot(strings.TrimSpace(l.ProjectRoot), "项目指令根目录", func(root *instructionRoot) {
+	addProject := addRoot
+	addUser := addRoot
+	projectPath := strings.TrimSpace(l.ProjectRoot)
+	userPath := l.userDir(cfg)
+	if l.workspace != nil {
+		addProject = func(_ string, sourceName string, build func(*instructionRoot)) {
+			addFrozenRoot(l.workspace.project, sourceName, build)
+		}
+		addUser = func(_ string, sourceName string, build func(*instructionRoot)) {
+			addFrozenRoot(l.workspace.user, sourceName, build)
+		}
+		projectPath = ""
+		userPath = ""
+	}
+	addProject(projectPath, "项目指令根目录", func(root *instructionRoot) {
 		for offset, projectFile := range projectFiles(cfg) {
 			addCandidate(root, "项目根指令", PriorityProjectRoot+offset, ScopeProjectRoot, projectFile)
 		}
 		addCandidate(root, "项目目录指令", PriorityProjectDir, ScopeProjectDir, cfg.ProjectDir, cfg.ProjectFile)
 	})
-	addRoot(l.userDir(cfg), "用户指令根目录", func(root *instructionRoot) {
+	addUser(userPath, "用户指令根目录", func(root *instructionRoot) {
 		addCandidate(root, "用户指令", PriorityUserDir, ScopeUserDir, cfg.ProjectFile)
 	})
 	if err := ctx.Err(); err != nil {
@@ -237,6 +406,127 @@ func openInstructionRoot(ctx context.Context, rootPath, sourceName string) (*ins
 		return nil, &item
 	}
 	return &instructionRoot{path: absolute, handle: opened.Root}, nil
+}
+
+func freezeInstructionRoot(rootPath string) (*frozenInstructionRoot, error) {
+	canonical, err := canonicalInstructionRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := safefs.Bootstrap(canonical, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		return nil, errors.New("instruction root identity is unavailable")
+	}
+	identity, marshalErr := opened.Root.Identity().MarshalBinary()
+	stablePath, pathErr := canonicalInstructionRoot(canonical)
+	closeErr := opened.Root.Close()
+	if marshalErr != nil || pathErr != nil || stablePath != canonical || closeErr != nil {
+		return nil, errors.New("instruction root identity is unavailable")
+	}
+	return &frozenInstructionRoot{path: canonical, identity: append([]byte(nil), identity...)}, nil
+}
+
+func openFrozenInstructionRoot(ctx context.Context, frozen *frozenInstructionRoot, sourceName string) (*instructionRoot, *diagnostics.Diagnostic) {
+	if frozen == nil || len(frozen.identity) == 0 {
+		item := newDiagnostic("instructions_root_changed", "指令根目录稳定身份不可用，已拒绝", sourceName, "")
+		return nil, &item
+	}
+	if err := ctx.Err(); err != nil {
+		item := newDiagnostic("instructions_context_cancelled", err.Error(), sourceName, "")
+		return nil, &item
+	}
+	if !frozenInstructionPathStable(frozen) {
+		item := newDiagnostic("instructions_root_changed", "指令根目录稳定身份发生变化，已拒绝", sourceName, "")
+		return nil, &item
+	}
+	opened, err := safefs.Bootstrap(frozen.path, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		item := newDiagnostic("instructions_root_changed", "指令根目录稳定身份发生变化，已拒绝", sourceName, "")
+		return nil, &item
+	}
+	live, marshalErr := opened.Root.Identity().MarshalBinary()
+	if marshalErr != nil || !bytes.Equal(frozen.identity, live) || !frozenInstructionPathStable(frozen) {
+		_ = opened.Root.Close()
+		item := newDiagnostic("instructions_root_changed", "指令根目录稳定身份发生变化，已拒绝", sourceName, "")
+		return nil, &item
+	}
+	return &instructionRoot{path: frozen.path, handle: opened.Root, frozen: frozen}, nil
+}
+
+func revalidateFrozenInstructionRoot(frozen *frozenInstructionRoot) bool {
+	if frozen == nil || len(frozen.identity) == 0 || !frozenInstructionPathStable(frozen) {
+		return false
+	}
+	opened, err := safefs.Bootstrap(frozen.path, safefs.Policy{})
+	if err != nil || opened.Root == nil {
+		return false
+	}
+	live, marshalErr := opened.Root.Identity().MarshalBinary()
+	closeErr := opened.Root.Close()
+	return marshalErr == nil && closeErr == nil && bytes.Equal(frozen.identity, live) && frozenInstructionPathStable(frozen)
+}
+
+func frozenInstructionPathStable(frozen *frozenInstructionRoot) bool {
+	if frozen == nil || frozen.path == "" {
+		return false
+	}
+	canonical, err := canonicalInstructionRoot(frozen.path)
+	return err == nil && canonical == frozen.path
+}
+
+func canonicalInstructionRoot(rootPath string) (string, error) {
+	rootPath = strings.TrimSpace(rootPath)
+	if rootPath == "" || len(rootPath) > maxGraphPathBytes || !filepath.IsAbs(rootPath) || filepath.Clean(rootPath) != rootPath {
+		return "", errors.New("instruction root path is invalid")
+	}
+	resolved, err := filepath.EvalSymlinks(rootPath)
+	if err != nil || !filepath.IsAbs(resolved) {
+		return "", errors.New("instruction root path is invalid")
+	}
+	return canonicalInstructionExistingPath(resolved)
+}
+
+func canonicalInstructionExistingPath(path string) (string, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return "", errors.New("instruction path is not absolute")
+	}
+	path = filepath.Clean(path)
+	volume := filepath.VolumeName(path)
+	current := volume + string(filepath.Separator)
+	if volume == "" {
+		current = string(filepath.Separator)
+	}
+	remainder := strings.TrimPrefix(path, current)
+	if remainder == "" {
+		return current, nil
+	}
+	for _, component := range strings.Split(remainder, string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." {
+			return "", errors.New("instruction path is invalid")
+		}
+		candidate := filepath.Join(current, component)
+		candidateInfo, err := os.Lstat(candidate)
+		if err != nil {
+			return "", err
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", err
+		}
+		actual := ""
+		for _, entry := range entries {
+			entryInfo, infoErr := entry.Info()
+			if infoErr == nil && os.SameFile(candidateInfo, entryInfo) {
+				actual = entry.Name()
+				break
+			}
+		}
+		if actual == "" {
+			return "", errors.New("instruction path identity is unavailable")
+		}
+		current = filepath.Join(current, actual)
+	}
+	return filepath.Clean(current), nil
 }
 
 func readSafefsInstructionFile(ctx context.Context, root *safefs.Root, relative string, maxBytes int64, reportMissing bool, sourceName string, counter *budget.Counter) (includeFile, bool, *diagnostics.Diagnostic) {
@@ -408,7 +698,7 @@ func canonicalInstructionRelative(parts ...string) (string, error) {
 	cleaned := make([]string, len(parts))
 	for index, part := range parts {
 		part = strings.TrimSpace(part)
-		if part == "" || strings.Contains(part, "\\") || pathpkg.IsAbs(part) || pathpkg.Clean(part) != part {
+		if part == "" || len(part) > maxGraphPathBytes || strings.Contains(part, "\\") || pathpkg.IsAbs(part) || pathpkg.Clean(part) != part {
 			return "", errors.New("instruction path is invalid")
 		}
 		for _, component := range strings.Split(part, "/") {
@@ -418,7 +708,11 @@ func canonicalInstructionRelative(parts ...string) (string, error) {
 		}
 		cleaned[index] = part
 	}
-	return pathpkg.Join(cleaned...), nil
+	joined := pathpkg.Join(cleaned...)
+	if len(joined) > maxGraphPathBytes {
+		return "", errors.New("instruction path is too long")
+	}
+	return joined, nil
 }
 
 func projectFiles(cfg config.InstructionsConfig) []string {
@@ -473,6 +767,15 @@ func normalizedConfig(cfg config.InstructionsConfig) config.InstructionsConfig {
 		cfg.MaxExpandedBytes = defaultIncludeMaxExpandedBytes
 	}
 	return cfg
+}
+
+func cloneInstructionsConfig(cfg config.InstructionsConfig) config.InstructionsConfig {
+	cloned := cfg
+	if cfg.Enabled != nil {
+		enabled := *cfg.Enabled
+		cloned.Enabled = &enabled
+	}
+	return cloned
 }
 
 func newDiagnostic(code string, message string, source string, path string) diagnostics.Diagnostic {

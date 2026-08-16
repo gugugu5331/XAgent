@@ -19,6 +19,7 @@ type PartialAppConfig struct {
 	Memory       PartialMemoryConfig       `yaml:"memory"`
 	Diagnostics  PartialDiagnosticsConfig  `yaml:"diagnostics"`
 	Lifecycle    PartialLifecycleConfig    `yaml:"lifecycle"`
+	Subagent     PartialSubagentConfig     `yaml:"subagent"`
 }
 
 type PartialLLMConfig struct {
@@ -29,6 +30,13 @@ type PartialLLMConfig struct {
 	RequestTimeoutMS Optional[int64]       `yaml:"request_timeout_ms"`
 	Thinking         PartialThinkingConfig `yaml:"thinking"`
 	Stream           PartialStreamConfig   `yaml:"stream"`
+	ModelAliases     PartialModelAliases   `yaml:"model_aliases"`
+}
+
+type PartialModelAliases struct {
+	Haiku  Optional[string] `yaml:"haiku"`
+	Sonnet Optional[string] `yaml:"sonnet"`
+	Opus   Optional[string] `yaml:"opus"`
 }
 
 type PartialThinkingConfig struct {
@@ -161,4 +169,104 @@ type PartialDiagnosticsConfig struct {
 
 type PartialLifecycleConfig struct {
 	CleanupTimeoutMS Optional[int64] `yaml:"cleanup_timeout_ms"`
+}
+
+type PartialSubagentConfig struct {
+	RoleLimits                       PartialRoleLimits     `yaml:"role_limits"`
+	Worktree                         PartialWorktreeConfig `yaml:"worktree"`
+	MaxTaskBytes                     Optional[int64]       `yaml:"max_task_bytes"`
+	MaxConcurrent                    Optional[int64]       `yaml:"max_concurrent"`
+	MaxQueued                        Optional[int64]       `yaml:"max_queued"`
+	MaxRetainedTasks                 Optional[int64]       `yaml:"max_retained_tasks"`
+	MaxTaskTombstones                Optional[int64]       `yaml:"max_task_tombstones"`
+	MaxGlobalEvents                  Optional[int64]       `yaml:"max_global_events"`
+	MaxEventsPerTask                 Optional[int64]       `yaml:"max_events_per_task"`
+	MaxEventBytes                    Optional[int64]       `yaml:"max_event_bytes"`
+	MaxSubscriberBuffer              Optional[int64]       `yaml:"max_subscriber_buffer"`
+	MaxResultBytes                   Optional[int64]       `yaml:"max_result_bytes"`
+	MaxPendingResults                Optional[int64]       `yaml:"max_pending_results"`
+	MaxResultTotalBytes              Optional[int64]       `yaml:"max_result_total_bytes"`
+	MaxResultsPerClaim               Optional[int64]       `yaml:"max_results_per_claim"`
+	ReadCacheMaxEntries              Optional[int64]       `yaml:"read_cache_max_entries"`
+	ReadCacheMaxBytes                Optional[int64]       `yaml:"read_cache_max_bytes"`
+	ReadCacheMaxValueBytes           Optional[int64]       `yaml:"read_cache_max_value_bytes"`
+	ReadCacheMaxDependenciesPerEntry Optional[int64]       `yaml:"read_cache_max_dependencies_per_entry"`
+	MaxRoleNameBytes                 Optional[int64]       `yaml:"max_role_name_bytes"`
+	AutoBackgroundAfterMS            Optional[int64]       `yaml:"auto_background_after_ms"`
+	MaxTaskDurationMS                Optional[int64]       `yaml:"max_task_duration_ms"`
+	BackgroundTools                  Optional[[]string]    `yaml:"background_tools"`
+}
+
+type PartialWorktreeConfig struct {
+	Lifecycle PartialWorktreeLifecycleConfig `yaml:"lifecycle"`
+	Limits    PartialWorktreeLimits          `yaml:"limits"`
+	Init      PartialWorktreeInitConfig      `yaml:"init"`
+}
+
+type PartialWorktreeLifecycleConfig struct {
+	RetentionTTLMS    Optional[int64] `yaml:"retention_ttl_ms"`
+	JanitorIntervalMS Optional[int64] `yaml:"janitor_interval_ms"`
+	GitTimeoutMS      Optional[int64] `yaml:"git_timeout_ms"`
+	LockTimeoutMS     Optional[int64] `yaml:"lock_timeout_ms"`
+	InitTimeoutMS     Optional[int64] `yaml:"init_timeout_ms"`
+	RecoveryTimeoutMS Optional[int64] `yaml:"recovery_timeout_ms"`
+	SettleTimeoutMS   Optional[int64] `yaml:"settle_timeout_ms"`
+	JanitorTimeoutMS  Optional[int64] `yaml:"janitor_timeout_ms"`
+}
+
+type PartialWorktreeLimits struct {
+	MaxActive             Optional[int64] `yaml:"max_active"`
+	MaxRetained           Optional[int64] `yaml:"max_retained"`
+	MaxNameBytes          Optional[int64] `yaml:"max_name_bytes"`
+	MaxSegmentBytes       Optional[int64] `yaml:"max_segment_bytes"`
+	MaxDepth              Optional[int64] `yaml:"max_depth"`
+	MaxInitFiles          Optional[int64] `yaml:"max_init_files"`
+	MaxInitBytes          Optional[int64] `yaml:"max_init_bytes"`
+	MaxInitDepth          Optional[int64] `yaml:"max_init_depth"`
+	MaxJanitorCandidates  Optional[int64] `yaml:"max_janitor_candidates"`
+	MaxJanitorConcurrency Optional[int64] `yaml:"max_janitor_concurrency"`
+}
+
+type PartialWorktreeInitConfig struct {
+	Copy        Optional[[]PartialWorktreeCopyRule] `yaml:"copy"`
+	Link        Optional[[]PartialWorktreeLinkRule] `yaml:"link"`
+	IgnoredCopy Optional[[]PartialWorktreeCopyRule] `yaml:"ignored_copy"`
+	GitHooks    PartialWorktreeGitHooksRule         `yaml:"git_hooks"`
+}
+
+type PartialWorktreeCopyRule struct {
+	Source string `yaml:"source"`
+	Target string `yaml:"target"`
+}
+
+type PartialWorktreeLinkRule struct {
+	Source string `yaml:"source"`
+	Target string `yaml:"target"`
+}
+
+type PartialWorktreeGitHooksRule struct {
+	Enabled Optional[bool]   `yaml:"enabled"`
+	Path    Optional[string] `yaml:"path"`
+}
+
+type PartialRoleLimits struct {
+	MaxFiles            Optional[int64] `yaml:"max_files"`
+	MaxEntryBytes       Optional[int64] `yaml:"max_entry_bytes"`
+	MaxFrontmatterBytes Optional[int64] `yaml:"max_frontmatter_bytes"`
+	MaxBodyBytes        Optional[int64] `yaml:"max_body_bytes"`
+	MaxNameBytes        Optional[int64] `yaml:"max_name_bytes"`
+	MaxDescriptionBytes Optional[int64] `yaml:"max_description_bytes"`
+	MaxInstructionBytes Optional[int64] `yaml:"max_instruction_bytes"`
+	MaxToolNameBytes    Optional[int64] `yaml:"max_tool_name_bytes"`
+	MaxToolListBytes    Optional[int64] `yaml:"max_tool_list_bytes"`
+	MaxOriginBytes      Optional[int64] `yaml:"max_origin_bytes"`
+	MaxSourceIDBytes    Optional[int64] `yaml:"max_source_id_bytes"`
+	MaxProviderIDBytes  Optional[int64] `yaml:"max_provider_id_bytes"`
+	MaxRootBytes        Optional[int64] `yaml:"max_root_bytes"`
+	MaxModelBytes       Optional[int64] `yaml:"max_model_bytes"`
+	MaxTotalBytes       Optional[int64] `yaml:"max_total_bytes"`
+	MaxToolNames        Optional[int64] `yaml:"max_tool_names"`
+	MaxProviders        Optional[int64] `yaml:"max_providers"`
+	MaxCandidates       Optional[int64] `yaml:"max_candidates"`
+	MaxDiagnostics      Optional[int64] `yaml:"max_diagnostics"`
 }

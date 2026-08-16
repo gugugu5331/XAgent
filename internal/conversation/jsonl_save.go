@@ -200,6 +200,10 @@ func cloneV2MessageSlice(source []Message) []Message {
 	cloned := make([]Message, len(source))
 	copy(cloned, source)
 	for index := range source {
+		if source[index].Subagent != nil {
+			notification := *source[index].Subagent
+			cloned[index].Subagent = &notification
+		}
 		if source[index].Tool == nil {
 			continue
 		}

@@ -52,6 +52,21 @@ type assemblyOwnerScope struct {
 
 type assemblyOwnerRegistrar func(ownerClose) error
 
+// registerStartedOwner transfers shutdown ownership before starting a
+// background service. If registration fails, the service remains inert and
+// the caller still owns its close action. Once this returns nil, the registry
+// is the only shutdown owner and reverse-order rollback will stop the service.
+func registerStartedOwner(register func() error, start func()) error {
+	if register == nil || start == nil {
+		return errors.New("started assembly owner registration is invalid")
+	}
+	if err := register(); err != nil {
+		return err
+	}
+	start()
+	return nil
+}
+
 func newAssemblyOwnerScope(stage assemblyStage, owners *ownershipRegistry) *assemblyOwnerScope {
 	return &assemblyOwnerScope{
 		active: true,

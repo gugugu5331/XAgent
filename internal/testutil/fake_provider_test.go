@@ -64,7 +64,7 @@ func TestFakeProviderServerStreamsBashFailureToolCall(t *testing.T) {
 
 	stream, err = llm.StreamChat(context.Background(), provider.ChatRequest{Messages: []provider.ModelMessage{
 		{Role: provider.ModelMessageRoleUser, Content: fakeSafeText("run failing bash")},
-		{Role: provider.ModelMessageRoleToolResult, ToolCallID: "call_bash_fail", ToolResult: fakeSafeText(`{"status":"error"}`), ToolResultStatus: "error"},
+		{Role: provider.ModelMessageRoleToolResult, ToolCallID: "call_bash_fail", ToolName: "Bash", ToolResult: fakeSafeText(`{"status":"error"}`), ToolResultStatus: "error"},
 	}})
 	if err != nil {
 		t.Fatal(err)

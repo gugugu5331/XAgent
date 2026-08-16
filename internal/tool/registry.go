@@ -3,6 +3,7 @@ package tool
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 )
 
 type AnthropicDefinition struct {
@@ -29,14 +30,19 @@ type ToolDescriptor struct {
 	Description  string
 	Schema       Schema
 	Risk         Risk
+	Route        ExecutionRoute
 	Policy       ExecutionPolicy
+	Workspace    WorkspacePolicy
 	TargetDigest *[32]byte
 }
 
 // RegistrationOptions contains only locally trusted policy and target data.
 // Remote annotations may remove local capabilities but can never add them.
 type RegistrationOptions struct {
+	Route             ExecutionRoute
 	Policy            ExecutionPolicy
+	Workspace         WorkspacePolicy
+	WorkspaceBinder   WorkspaceBinder
 	TargetDigest      *[32]byte
 	RemoteAnnotations json.RawMessage
 }
@@ -50,12 +56,23 @@ type SafeResultProducer interface {
 }
 
 type Registry struct {
-	tools         map[string]Definition
-	executors     map[string]Tool
-	descriptors   map[string]ToolDescriptor
-	order         []string
-	immutable     bool
-	safeCandidate bool
+	tools            map[string]Definition
+	executors        map[string]Tool
+	descriptors      map[string]ToolDescriptor
+	workspaceBinders map[string]WorkspaceBinder
+	order            []string
+	lineage          *registryLineage
+	immutable        bool
+	sealed           bool
+	safeCandidate    bool
+}
+
+// registryLineage is an opaque identity shared only by monotonic views made
+// from the same registration snapshot. It prevents an atomic placement switch
+// from swapping in same-named tools backed by different execution targets.
+type registryLineage struct {
+	identity byte
+	names    map[string]struct{}
 }
 
 // NewSafeCandidateRegistry returns an empty registry that accepts only tools
@@ -73,15 +90,15 @@ func NewRegistry(projectRoot string) (*Registry, error) {
 		tool   Tool
 		policy ExecutionPolicy
 	}{
-		{tool: NewReadTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
+		{tool: NewReadTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
 		{tool: NewWriteTool(projectRoot)},
 		{tool: NewEditTool(projectRoot)},
 		{tool: NewBashTool(projectRoot)},
-		{tool: NewGlobTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
-		{tool: NewGrepTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}},
+		{tool: NewGlobTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
+		{tool: NewGrepTool(projectRoot), policy: ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true}},
 	}
 	for _, item := range defaults {
-		if err := registry.RegisterWithOptions(item.tool, RegistrationOptions{Policy: item.policy}); err != nil {
+		if err := registry.RegisterWithOptions(item.tool, builtinRegistrationOptions(item.tool, item.policy)); err != nil {
 			return nil, err
 		}
 	}
@@ -96,11 +113,47 @@ func NewReadOnlyRegistry(projectRoot string) (*Registry, error) {
 		NewGrepTool(projectRoot),
 	}
 	for _, tool := range defaults {
-		if err := registry.RegisterWithOptions(tool, RegistrationOptions{Policy: ExecutionPolicy{ReadOnly: true, ConcurrentSafe: true}}); err != nil {
+		if err := registry.RegisterWithOptions(tool, builtinRegistrationOptions(tool, ExecutionPolicy{ReadOnly: true, SideEffectFree: true, ConcurrentSafe: true})); err != nil {
 			return nil, err
 		}
 	}
 	return registry, nil
+}
+
+func builtinRegistrationOptions(target Tool, policy ExecutionPolicy) RegistrationOptions {
+	options, _ := applyBuiltinWorkspaceDefaults(target, RegistrationOptions{Policy: policy})
+	return options
+}
+
+func applyBuiltinWorkspaceDefaults(target Tool, options RegistrationOptions) (RegistrationOptions, error) {
+	switch target.(type) {
+	case loadSkillTool, agentTool:
+		if options.Workspace.Mode != WorkspaceUnknown && options.Workspace.Mode != WorkspaceFixed {
+			return RegistrationOptions{}, fmt.Errorf("system tool workspace policy must be fixed")
+		}
+		if options.WorkspaceBinder != nil {
+			return RegistrationOptions{}, fmt.Errorf("system tool workspace binder is invalid")
+		}
+		options.Workspace = WorkspacePolicy{Mode: WorkspaceFixed}
+	case *ReadTool, *GlobTool, *GrepTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceContextual}
+			options.WorkspaceBinder = target.(WorkspaceBinder)
+		}
+	case *WriteTool, *EditTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceContextual, WriteContainment: true}
+			options.WorkspaceBinder = target.(WorkspaceBinder)
+		}
+	case *BashTool:
+		if options.Workspace.Mode == WorkspaceUnknown && options.WorkspaceBinder == nil {
+			// A protected task Bash requires a task-owned protection plan and root.
+			// The assembly-root instance cannot manufacture either, so it remains
+			// fixed until Workspace Factory supplies an explicit trusted binder.
+			options.Workspace = WorkspacePolicy{Mode: WorkspaceFixed}
+		}
+	}
+	return options, nil
 }
 
 func (r *Registry) Register(tool Tool) error {
@@ -112,7 +165,7 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 		return fmt.Errorf("工具注册中心不能为空")
 	}
 	if r.immutable {
-		return fmt.Errorf("工具过滤视图不可修改")
+		return fmt.Errorf("工具注册中心已封存")
 	}
 	if tool == nil {
 		return fmt.Errorf("工具不能为空")
@@ -130,6 +183,11 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	if _, exists := r.tools[name]; exists {
 		return fmt.Errorf("工具 %q 已注册", name)
 	}
+	var err error
+	options, err = applyBuiltinWorkspaceDefaults(tool, options)
+	if err != nil {
+		return fmt.Errorf("工具 %q workspace metadata 无效: %w", name, err)
+	}
 	schema := cloneSchema(tool.Schema())
 	if err := validateSchemaDefinition(schema); err != nil {
 		return fmt.Errorf("工具 %q schema 无效: %w", name, err)
@@ -137,6 +195,22 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	policy, err := restrictPolicyWithRemoteAnnotations(options.Policy, options.RemoteAnnotations)
 	if err != nil {
 		return fmt.Errorf("工具 %q annotations 无效: %w", name, err)
+	}
+	if err := options.Workspace.validate(); err != nil {
+		return fmt.Errorf("工具 %q workspace policy 无效: %w", name, err)
+	}
+	if options.Workspace.Mode == WorkspaceContextual && options.WorkspaceBinder == nil {
+		return fmt.Errorf("工具 %q contextual workspace binder 缺失", name)
+	}
+	if options.Workspace.Mode != WorkspaceContextual && options.WorkspaceBinder != nil {
+		return fmt.Errorf("工具 %q 非 contextual workspace binder 无效", name)
+	}
+	route := options.Route
+	if routed, ok := tool.(interface{ executionRoute() ExecutionRoute }); ok {
+		route = routed.executionRoute()
+	}
+	if !route.valid() {
+		return fmt.Errorf("工具 %q route 无效", name)
 	}
 	if r.tools == nil {
 		r.tools = make(map[string]Definition)
@@ -149,7 +223,9 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 		Description:  tool.Description(),
 		Schema:       schema,
 		Risk:         tool.Risk(),
+		Route:        route,
 		Policy:       policy,
+		Workspace:    options.Workspace,
 		TargetDigest: cloneDigest(options.TargetDigest),
 	}
 	if r.executors == nil {
@@ -158,12 +234,70 @@ func (r *Registry) RegisterWithOptions(tool Tool, options RegistrationOptions) e
 	r.tools[name] = &registeredTool{descriptor: cloneDescriptor(descriptor)}
 	r.executors[name] = tool
 	r.descriptors[name] = descriptor
+	if options.WorkspaceBinder != nil {
+		if r.workspaceBinders == nil {
+			r.workspaceBinders = make(map[string]WorkspaceBinder)
+		}
+		r.workspaceBinders[name] = options.WorkspaceBinder
+	}
 	r.order = append(r.order, name)
 	return nil
 }
 
+// Seal performs the one registration-to-execution transition. It rejects a
+// tool whose public definition changed after Register, then makes metadata,
+// ordering and execution-target associations immutable.
+func (r *Registry) Seal() error {
+	if r == nil {
+		return fmt.Errorf("工具注册中心不能为空")
+	}
+	if r.sealed || r.immutable {
+		return fmt.Errorf("工具注册中心已经封存")
+	}
+	for _, name := range r.order {
+		executor, ok := r.executors[name]
+		if !ok || executor == nil {
+			return fmt.Errorf("工具 %q execution target drift", name)
+		}
+		descriptor, ok := r.descriptors[name]
+		if !ok || executor.Name() != descriptor.Name || executor.Description() != descriptor.Description || executor.Risk() != descriptor.Risk || !reflect.DeepEqual(cloneSchema(executor.Schema()), descriptor.Schema) {
+			return fmt.Errorf("工具 %q definition drift", name)
+		}
+	}
+	r.sealed = true
+	r.immutable = true
+	if r.lineage == nil {
+		r.lineage = &registryLineage{}
+	}
+	r.lineage.names = make(map[string]struct{}, len(r.order))
+	for _, name := range r.order {
+		r.lineage.names[name] = struct{}{}
+	}
+	return nil
+}
+
+// IsSealed reports whether registration has permanently ended. Filtered
+// views are sealed at construction.
+func (r *Registry) IsSealed() bool {
+	return r != nil && r.sealed
+}
+
+func (r *Registry) knowsRegisteredName(name string) bool {
+	if r == nil {
+		return false
+	}
+	if _, ok := r.tools[name]; ok {
+		return true
+	}
+	if r.lineage == nil {
+		return false
+	}
+	_, ok := r.lineage.names[name]
+	return ok
+}
+
 func newEmptyRegistry() *Registry {
-	return &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor)}
+	return &Registry{tools: make(map[string]Definition), executors: make(map[string]Tool), descriptors: make(map[string]ToolDescriptor), workspaceBinders: make(map[string]WorkspaceBinder), lineage: &registryLineage{}}
 }
 
 func (r *Registry) Get(name string) (Definition, bool) {
@@ -187,7 +321,9 @@ func (r *Registry) Names() []string {
 	if r == nil {
 		return nil
 	}
-	return append([]string(nil), r.order...)
+	names := make([]string, len(r.order))
+	copy(names, r.order)
+	return names
 }
 
 func (r *Registry) List() []Definition {
@@ -285,10 +421,12 @@ func restrictPolicyWithRemoteAnnotations(policy ExecutionPolicy, raw json.RawMes
 	}
 	if annotations.ReadOnlyHint != nil && !*annotations.ReadOnlyHint {
 		policy.ReadOnly = false
+		policy.SideEffectFree = false
 		policy.ConcurrentSafe = false
 	}
 	if annotations.DestructiveHint != nil && *annotations.DestructiveHint {
 		policy.ReadOnly = false
+		policy.SideEffectFree = false
 		policy.ConcurrentSafe = false
 	}
 	if annotations.IdempotentHint != nil && !*annotations.IdempotentHint {

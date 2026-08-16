@@ -1,6 +1,10 @@
 package provider
 
-import "xagent/internal/tool"
+import (
+	"strings"
+
+	"xagent/internal/tool"
+)
 
 type openAIRequest struct {
 	Model         string                  `json:"model"`
@@ -36,14 +40,21 @@ type openAIToolFunction struct {
 // DTO to OpenAI wire types. CachePolicy is deliberately not serialized because
 // the OpenAI-compatible request format has no approved equivalent for the
 // Anthropic cache_control fields.
-func newOpenAIRequest(req ChatRequest, defaultModel string) openAIRequest {
+func newOpenAIRequest(req ChatRequest, defaultModel string) (openAIRequest, error) {
+	if err := req.Validate(); err != nil {
+		return openAIRequest{}, err
+	}
+	messages, err := toOpenAIMessages(req)
+	if err != nil {
+		return openAIRequest{}, err
+	}
 	return openAIRequest{
 		Model:         requestModel(req.Model, defaultModel),
 		Stream:        true,
 		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
-		Messages:      toOpenAIMessages(req),
+		Messages:      messages,
 		Tools:         openAITools(req),
-	}
+	}, nil
 }
 
 func openAITools(req ChatRequest) []tool.OpenAIDefinition {
@@ -65,7 +76,7 @@ func openAITools(req ChatRequest) []tool.OpenAIDefinition {
 	return tools
 }
 
-func toOpenAIMessages(req ChatRequest) []openAIMessage {
+func toOpenAIMessages(req ChatRequest) ([]openAIMessage, error) {
 	systemCount := 1
 	if usesOrderedSystem(req) {
 		systemCount = len(req.System)
@@ -102,7 +113,15 @@ func toOpenAIMessages(req ChatRequest) []openAIMessage {
 				ToolCallID: message.ToolCallID,
 				Content:    message.ToolResult.Text(),
 			})
+		case ModelMessageRoleSubagentResult:
+			messages = append(messages, openAIMessage{Role: "user", Content: markedSubagentResult(message.Content.Text())})
+		default:
+			return nil, ErrInvalidChatRequest
 		}
 	}
-	return messages
+	return messages, nil
+}
+
+func markedSubagentResult(payload string) string {
+	return SubagentResultMarker + "\n" + strings.TrimSpace(payload)
 }

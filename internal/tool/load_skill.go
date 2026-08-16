@@ -39,6 +39,8 @@ func (loadSkillTool) Schema() Schema {
 
 func (loadSkillTool) Risk() Risk { return RiskSafe }
 
+func (loadSkillTool) executionRoute() ExecutionRoute { return RouteSystem }
+
 func (t loadSkillTool) UsesSafeResultBoundary() bool { return t.resultFactory != nil }
 
 func (t loadSkillTool) Execute(_ context.Context, input Input) Result {

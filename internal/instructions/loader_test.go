@@ -47,22 +47,22 @@ func TestInstructionCacheKeyBindsFileContentAndIncludeOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FileIdentityFromBinding child: %v", err)
 	}
-	rootVersion, err := NewFileVersion(rootIdentity, []byte("root"))
+	rootVersion, err := NewFileVersion(filepath.Join(projectRoot, "root.md"), rootIdentity, []byte("root"))
 	if err != nil {
 		t.Fatalf("NewFileVersion root: %v", err)
 	}
-	childVersion, err := NewFileVersion(childIdentity, []byte("child"))
+	childVersion, err := NewFileVersion(filepath.Join(projectRoot, "child.md"), childIdentity, []byte("child"))
 	if err != nil {
 		t.Fatalf("NewFileVersion child: %v", err)
 	}
-	source := GraphSource{Name: "项目根指令", Scope: ScopeProjectRoot, Priority: PriorityProjectRoot, Root: rootIdentity}
+	source := GraphSource{Name: "项目根指令", Scope: ScopeProjectRoot, Priority: PriorityProjectRoot, RootPath: filepath.Join(projectRoot, "root.md"), Root: rootIdentity}
 	edge := IncludeEdge{From: rootIdentity, To: childIdentity, Position: 0}
 	key, err := NewCacheKey(source, []FileVersion{rootVersion, childVersion}, []IncludeEdge{edge})
 	if err != nil {
 		t.Fatalf("NewCacheKey: %v", err)
 	}
 
-	changedChild, err := NewFileVersion(childIdentity, []byte("changed child"))
+	changedChild, err := NewFileVersion(filepath.Join(projectRoot, "child.md"), childIdentity, []byte("changed child"))
 	if err != nil {
 		t.Fatalf("NewFileVersion changed child: %v", err)
 	}
@@ -81,9 +81,11 @@ func TestInstructionCacheKeyBindsFileContentAndIncludeOrder(t *testing.T) {
 
 func TestInstructionCacheStillConsumesExpansionBudget(t *testing.T) {
 	const content = "cached expansion"
-	key := CacheKey{digest: [32]byte{1}}
+	root := t.TempDir()
+	writeInstructionFile(t, filepath.Join(root, "MEWCODE.md"), "same content")
+	key, source, files := instructionWorkspaceGraph(t, root, ScopeProjectRoot)
 	cache := &ExpansionCache{}
-	if err := cache.Store(key, CachedExpansion{Content: content}); err != nil {
+	if err := cache.Store(key, CachedExpansion{Source: source, Content: content, Files: files}); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -300,6 +302,29 @@ func TestLoadSourcesReturnsScopeMetadata(t *testing.T) {
 		if sources[i].Scope != scope {
 			t.Fatalf("sources[%d].Scope = %q, want %q", i, sources[i].Scope, scope)
 		}
+	}
+}
+
+func TestLoaderMapsInstructionScopesToPromptScopes(t *testing.T) {
+	projectRoot := t.TempDir()
+	userRoot := t.TempDir()
+	cfg := testConfig()
+	writeInstructionFile(t, filepath.Join(projectRoot, cfg.ProjectFile), "project root")
+	writeInstructionFile(t, filepath.Join(projectRoot, cfg.ProjectDir, cfg.ProjectFile), "project dir")
+	writeInstructionFile(t, filepath.Join(userRoot, cfg.ProjectFile), "user")
+
+	sections, items := (Loader{ProjectRoot: projectRoot, UserDir: userRoot, Config: cfg}).Load(context.Background())
+	if len(items) != 0 || len(sections) != 3 {
+		t.Fatalf("load result sections=%#v diagnostics=%#v", sections, items)
+	}
+	want := []prompt.Scope{prompt.ScopeProject, prompt.ScopeProject, prompt.ScopeUser}
+	for index, scope := range want {
+		if sections[index].Scope != scope {
+			t.Fatalf("sections[%d].Scope = %q, want %q", index, sections[index].Scope, scope)
+		}
+	}
+	if got := promptScope(Scope("future")); got.Valid() {
+		t.Fatalf("unknown instruction scope mapped to valid prompt scope %q", got)
 	}
 }
 

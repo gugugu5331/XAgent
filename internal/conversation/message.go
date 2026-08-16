@@ -3,6 +3,7 @@ package conversation
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -14,14 +15,23 @@ import (
 type MessageRole string
 
 const (
-	RoleUser            MessageRole = "user"
-	RoleAssistant       MessageRole = "assistant"
-	RoleThinking        MessageRole = "thinking"
-	RoleToolCall        MessageRole = "tool_call"
-	RoleToolResult      MessageRole = "tool_result"
-	RoleContextSummary  MessageRole = "context_summary"
-	RoleContextBoundary MessageRole = "context_boundary"
+	RoleUser                 MessageRole = "user"
+	RoleAssistant            MessageRole = "assistant"
+	RoleThinking             MessageRole = "thinking"
+	RoleToolCall             MessageRole = "tool_call"
+	RoleToolResult           MessageRole = "tool_result"
+	RoleContextSummary       MessageRole = "context_summary"
+	RoleContextBoundary      MessageRole = "context_boundary"
+	RoleSubagentNotification MessageRole = "subagent_notification"
 )
+
+const (
+	SubagentNotificationMaxIDBytes               = 128
+	SubagentNotificationMaxSummaryBytes          = 64 << 10
+	SubagentNotificationMaxTruncationReasonBytes = 256
+)
+
+var ErrInvalidSubagentNotification = errors.New("invalid subagent notification")
 
 // Message is the only message shape reachable from primary Conversation.
 type Message struct {
@@ -29,6 +39,85 @@ type Message struct {
 	Content   redact.SafeText
 	CreatedAt time.Time
 	Tool      *ToolState
+	Subagent  *SubagentNotificationMessage
+}
+
+// SubagentNotificationMessage is the bounded persistence-only projection of
+// a terminal child task. It deliberately has no parent routing identity,
+// ToolCallID, provider payload, or execution trace.
+type SubagentNotificationMessage struct {
+	NotificationID   string
+	TaskID           string
+	Status           string
+	Summary          redact.SafeText
+	SummaryTruncated bool
+	TruncationReason redact.SafeText
+	StopReason       string
+	CreatedAt        time.Time
+}
+
+// AppendSubagentNotification appends a terminal task notification exactly
+// once. NotificationID is the idempotency key used for event replay/reconnect.
+func AppendSubagentNotification(conversation *Conversation, notification SubagentNotificationMessage) error {
+	if conversation == nil || !validSubagentNotification(notification) {
+		return ErrInvalidSubagentNotification
+	}
+	for index := range conversation.Messages {
+		existing := conversation.Messages[index].Subagent
+		if conversation.Messages[index].Role == RoleSubagentNotification && existing != nil && existing.NotificationID == notification.NotificationID {
+			return nil
+		}
+	}
+	copy := notification
+	conversation.Messages = append(conversation.Messages, Message{
+		Role:      RoleSubagentNotification,
+		Content:   notification.Summary,
+		CreatedAt: notification.CreatedAt,
+		Subagent:  &copy,
+	})
+	if notification.CreatedAt.After(conversation.UpdatedAt) {
+		conversation.UpdatedAt = notification.CreatedAt
+	}
+	return nil
+}
+
+func validSubagentNotification(notification SubagentNotificationMessage) bool {
+	if !validBoundedNotificationID(notification.NotificationID) || !validBoundedNotificationID(notification.TaskID) ||
+		notification.CreatedAt.IsZero() || !utf8.ValidString(notification.Summary.Text()) ||
+		len(notification.Summary.Text()) > SubagentNotificationMaxSummaryBytes ||
+		!utf8.ValidString(notification.TruncationReason.Text()) ||
+		len(notification.TruncationReason.Text()) > SubagentNotificationMaxTruncationReasonBytes {
+		return false
+	}
+	reason := notification.TruncationReason.Text()
+	if notification.SummaryTruncated != (reason != "") {
+		return false
+	}
+	return validSubagentTerminalPair(notification.Status, notification.StopReason)
+}
+
+func validBoundedNotificationID(value string) bool {
+	return len(value) <= SubagentNotificationMaxIDBytes && validRecordIdentifier(value)
+}
+
+func validSubagentTerminalPair(status, stopReason string) bool {
+	if strings.TrimSpace(status) != status || strings.TrimSpace(stopReason) != stopReason {
+		return false
+	}
+	switch status {
+	case "completed":
+		return stopReason == "completed"
+	case "failed":
+		return stopReason == "provider_error" || stopReason == "tool_error" || stopReason == "internal_error"
+	case "cancelled":
+		return stopReason == "cancelled" || stopReason == "application_closed"
+	case "timed_out":
+		return stopReason == "task_timeout"
+	case "limit_reached":
+		return stopReason == "max_iterations" || stopReason == "unknown_tool_limit"
+	default:
+		return false
+	}
 }
 
 type ToolState struct {

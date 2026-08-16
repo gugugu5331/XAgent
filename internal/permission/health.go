@@ -1,6 +1,9 @@
 package permission
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // SafetyEpochAdvancer invalidates execution capabilities issued under an
 // earlier permission safety state.
@@ -61,6 +64,20 @@ func (h *Health) Degraded() bool {
 	degraded := h.degraded
 	h.mu.RUnlock()
 	return degraded
+}
+
+func (h *Health) corruptLayerKinds() []SourceKind {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	kinds := make([]SourceKind, 0, len(h.corruptLayers))
+	for kind := range h.corruptLayers {
+		kinds = append(kinds, kind)
+	}
+	h.mu.RUnlock()
+	sort.Slice(kinds, func(first, second int) bool { return kinds[first] < kinds[second] })
+	return kinds
 }
 
 func sameCorruptLayers(left, right map[SourceKind]struct{}) bool {

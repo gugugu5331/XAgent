@@ -45,7 +45,7 @@ func DynamicBlocksFromSafe(req SafeDynamicRequest) ([]Block, error) {
 func DynamicBlocks(req BuildRequest) []Block {
 	blocks := make([]Block, 0, 2)
 	if active := strings.TrimSpace(req.ActiveSkills); active != "" {
-		blocks = append(blocks, Block{Name: ActiveSkillsBlockName, Content: active, Stable: false})
+		blocks = append(blocks, Block{Name: ActiveSkillsBlockName, Content: active, Stable: false, Scope: ScopeRuntime})
 	}
 	iteration := req.Iteration
 	if iteration <= 0 {
@@ -60,7 +60,7 @@ func DynamicBlocks(req BuildRequest) []Block {
 	}
 	parts = append(parts, modeInstruction(req.Mode, iteration))
 	parts = append(parts, "</system-reminder>")
-	return append(blocks, Block{Name: "runtime-system-reminder", Content: strings.Join(parts, "\n"), Stable: false})
+	return append(blocks, Block{Name: "runtime-system-reminder", Content: strings.Join(parts, "\n"), Stable: false, Scope: ScopeRuntime})
 }
 
 func modeInstruction(mode RunMode, iteration int) string {

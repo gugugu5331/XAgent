@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"xagent/internal/artifact"
+	promptpkg "xagent/internal/prompt"
 	"xagent/internal/provider"
 	"xagent/internal/redact"
 )
@@ -138,6 +139,9 @@ func TestUpdateAsyncDoesNotBlockAndAppliesDecisions(t *testing.T) {
 	}
 	if len(provider.request.Messages) != 1 || !strings.Contains(provider.request.Messages[0].Content.Text(), "回答简洁中文") {
 		t.Fatalf("memory request did not use safe Provider DTO: %#v", provider.request.Messages)
+	}
+	if len(provider.request.StableSystem) != 1 || provider.request.StableSystem[0].Scope != promptpkg.ScopeRuntime {
+		t.Fatalf("memory update system scope = %#v, want runtime", provider.request.StableSystem)
 	}
 }
 

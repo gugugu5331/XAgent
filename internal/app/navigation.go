@@ -268,10 +268,15 @@ func (state *navigationState) commitNavigationCandidate(
 	} else {
 		// Reloading the current ActiveID refreshes persisted content without
 		// pretending that the user switched sessions or clearing live mode,
-		// input, Skill Activity, request state, or notices.
-		target.conversation.Messages = cloneNavigationSafeTexts(snapshot.conversation.Messages)
-		*target.messages = cloneNavigationSafeTexts(snapshot.messages)
-		*target.active = materializeTrackedNavigationConversation(trackedActive, snapshot.active)
+		// input, Skill Activity, request state, or notices. Keep the existing
+		// Store-tracked root pointer: a task notification may have synchronously
+		// advanced that pointer and its JSONL baseline after this Load candidate
+		// was sealed. Merge only those append-only notifications into the frozen
+		// reload before publishing it.
+		refreshed := mergeNavigationTaskNotifications(snapshot.active, *target.active)
+		target.conversation.Messages = navigationMessageProjection(refreshed)
+		*target.messages = navigationMessageProjection(refreshed)
+		*target.active = materializeTrackedNavigationConversation(*target.active, refreshed)
 		*target.screen = snapshot.screen
 	}
 
@@ -294,6 +299,33 @@ func materializeTrackedNavigationConversation(tracked, frozen *conversation.Conv
 	materialized := cloneNavigationConversation(frozen)
 	*tracked = *materialized
 	return tracked
+}
+
+func mergeNavigationTaskNotifications(frozen, live *conversation.Conversation) *conversation.Conversation {
+	merged := cloneNavigationConversation(frozen)
+	if merged == nil || live == nil {
+		return merged
+	}
+	seen := make(map[string]struct{})
+	for _, message := range merged.Messages {
+		if message.Role == conversation.RoleSubagentNotification && message.Subagent != nil {
+			seen[message.Subagent.NotificationID] = struct{}{}
+		}
+	}
+	for _, message := range live.Messages {
+		if message.Role != conversation.RoleSubagentNotification || message.Subagent == nil {
+			continue
+		}
+		if _, exists := seen[message.Subagent.NotificationID]; exists {
+			continue
+		}
+		merged.Messages = append(merged.Messages, cloneNavigationMessage(message))
+		seen[message.Subagent.NotificationID] = struct{}{}
+	}
+	if live.UpdatedAt.After(merged.UpdatedAt) {
+		merged.UpdatedAt = live.UpdatedAt
+	}
+	return merged
 }
 
 // publishNavigationListFailure consumes a current failed List request by
@@ -348,7 +380,7 @@ func validNavigationConversationCommit(snapshot navigationCandidateSnapshot, tar
 		return false
 	}
 	if target.conversation.ActiveID == snapshot.conversation.ActiveID {
-		return true
+		return *target.active != nil && (*target.active).ID == snapshot.conversation.ActiveID
 	}
 	return target.runtime != nil && target.request != nil && target.activity != nil && target.runtime.RequestSequence != math.MaxUint64
 }
@@ -643,6 +675,10 @@ func cloneNavigationConversation(source *conversation.Conversation) *conversatio
 
 func cloneNavigationMessage(source conversation.Message) conversation.Message {
 	clone := source
+	if source.Subagent != nil {
+		notificationClone := *source.Subagent
+		clone.Subagent = &notificationClone
+	}
 	if source.Tool == nil {
 		return clone
 	}

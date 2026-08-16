@@ -3,6 +3,10 @@ llm:
   model: claude-opus-4-7
   base_url: https://api.anthropic.com
   api_key: your-api-key
+  model_aliases:
+    haiku: your-haiku-model
+    sonnet: your-sonnet-model
+    opus: your-opus-model
   thinking:
     enabled: true
     show: false
@@ -12,3 +16,47 @@ ui:
   start_mode: list
 storage:
   data_dir: .xagent/conversations
+
+subagent:
+  max_task_bytes: 32768
+  max_concurrent: 4
+  max_queued: 32
+  max_retained_tasks: 256
+  max_task_tombstones: 1024
+  max_global_events: 8192
+  max_events_per_task: 1024
+  max_event_bytes: 65536
+  max_subscriber_buffer: 128
+  max_result_bytes: 65536
+  max_pending_results: 256
+  max_result_total_bytes: 8388608
+  max_results_per_claim: 32
+  read_cache_max_entries: 128
+  read_cache_max_bytes: 8388608
+  read_cache_max_value_bytes: 1048576
+  read_cache_max_dependencies_per_entry: 4096
+  max_role_name_bytes: 64
+  auto_background_after_ms: 10000
+  max_task_duration_ms: 0
+  # Explicit expansion remains subject to normal Hook/permission checks.
+  background_tools: [Read, Glob, Grep]
+  role_limits:
+    max_files: 256
+    max_entry_bytes: 262144
+    max_frontmatter_bytes: 32768
+    max_body_bytes: 131072
+    max_name_bytes: 64
+    max_description_bytes: 8192
+    max_instruction_bytes: 131072
+    max_tool_name_bytes: 128
+    max_tool_list_bytes: 8192
+    max_origin_bytes: 256
+    max_source_id_bytes: 256
+    max_provider_id_bytes: 256
+    max_root_bytes: 4096
+    max_model_bytes: 256
+    max_total_bytes: 67108864
+    max_tool_names: 128
+    max_providers: 64
+    max_candidates: 512
+    max_diagnostics: 256

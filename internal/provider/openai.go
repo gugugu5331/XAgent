@@ -71,7 +71,11 @@ func (p *OpenAIProvider) StreamChatWithOptions(ctx context.Context, req ChatRequ
 	if err != nil {
 		return nil, safeProviderError(p.redactor, "openai_stream_limits_invalid", "openai", err, false)
 	}
-	body, err := json.Marshal(newOpenAIRequest(req, p.cfg.Model))
+	wireRequest, err := newOpenAIRequest(req, p.cfg.Model)
+	if err != nil {
+		return nil, safeProviderError(p.redactor, "openai_request_invalid", "openai", err, false)
+	}
+	body, err := json.Marshal(wireRequest)
 	if err != nil {
 		return nil, safeProviderError(p.redactor, "openai_request_encode_failed", "openai", fmt.Errorf("构造 OpenAI 请求失败: %w", err), false)
 	}

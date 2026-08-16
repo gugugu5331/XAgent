@@ -175,6 +175,7 @@ type Root struct {
 	policy         compiledPolicy
 	capabilitySeal *capabilitySeal
 	bindingSeal    *bindingSeal
+	protection     *protectionSeal
 	closed         bool
 	closeErr       error
 }
@@ -186,7 +187,7 @@ func Bootstrap(rootPath string, policy Policy) (OpenResult, error) {
 	if err != nil {
 		return OpenResult{}, err
 	}
-	if rootPath == "" || !utf8.ValidString(rootPath) || !filepath.IsAbs(rootPath) || filepath.Clean(rootPath) != rootPath {
+	if !validRootPath(rootPath) {
 		return OpenResult{}, errors.New("safefs bootstrap root is invalid")
 	}
 	backend, err := openPlatformRoot(rootPath)
@@ -226,6 +227,10 @@ func Bootstrap(rootPath string, policy Policy) (OpenResult, error) {
 			protected: Capability{seal: capabilitySeal, class: ProtectedWrite},
 		},
 	}, nil
+}
+
+func validRootPath(rootPath string) bool {
+	return rootPath != "" && utf8.ValidString(rootPath) && filepath.IsAbs(rootPath) && filepath.Clean(rootPath) == rootPath
 }
 
 func (r *Root) Identity() Identity {

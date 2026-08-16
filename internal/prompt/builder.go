@@ -12,7 +12,7 @@ func Build(req BuildRequest) Bundle {
 	stable = append(stable, fixed...)
 	stable = append(stable, optional...)
 	if catalog := strings.TrimSpace(req.SkillCatalog); catalog != "" {
-		stable = append(stable, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true})
+		stable = append(stable, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true, Scope: ScopeProject})
 	}
 	dynamic := DynamicBlocks(req)
 	bundle := Bundle{StableBlocks: stable, DynamicBlocks: dynamic}
@@ -26,7 +26,7 @@ func Build(req BuildRequest) Bundle {
 	ordered = append(ordered, hooks...)
 	ordered = append(ordered, optional...)
 	if catalog := strings.TrimSpace(req.SkillCatalog); catalog != "" {
-		ordered = append(ordered, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true})
+		ordered = append(ordered, Block{Name: SkillCatalogBlockName, Content: catalog, Stable: true, Scope: ScopeProject})
 	}
 	ordered = append(ordered, dynamic...)
 	bundle.OrderedBlocks = ordered
@@ -46,7 +46,7 @@ func normalizedOptionalStableSections(optional []Section) []Section {
 	for _, section := range optional {
 		section.Content = strings.TrimSpace(section.Content)
 		section.Name = strings.TrimSpace(section.Name)
-		if section.Name == "" || section.Content == "" || !section.Stable || seen[section.Name] {
+		if section.Name == "" || section.Content == "" || !section.Stable || !section.Scope.Valid() || seen[section.Name] {
 			continue
 		}
 		seen[section.Name] = true
@@ -76,7 +76,7 @@ func sectionBlocks(sections []Section) []Block {
 		if content == "" {
 			continue
 		}
-		blocks = append(blocks, Block{Name: section.Name, Content: content, Stable: true})
+		blocks = append(blocks, Block{Name: section.Name, Content: content, Stable: true, Scope: section.Scope})
 	}
 	return blocks
 }
@@ -86,7 +86,7 @@ func hookBlocks(blocks []Block) []Block {
 	for _, block := range blocks {
 		block.Name = strings.TrimSpace(block.Name)
 		block.Content = strings.TrimSpace(block.Content)
-		if block.Content == "" {
+		if block.Content == "" || !block.Scope.Valid() {
 			continue
 		}
 		block.Stable = false

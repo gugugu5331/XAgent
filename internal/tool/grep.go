@@ -72,6 +72,15 @@ func NewGrepToolWithResultBoundary(projectRoot string, factory *ResultFactory, c
 	return &GrepTool{projectRoot: projectRoot, limits: defaultGrepLimits(), resultFactory: factory, capture: capture}, nil
 }
 
+func (t *GrepTool) BindWorkspace(binding WorkspaceBinding) (Tool, error) {
+	if t == nil {
+		return nil, errors.New("Grep workspace binder is unavailable")
+	}
+	clone := *t
+	clone.projectRoot = binding.Root
+	return &clone, nil
+}
+
 func (t *GrepTool) Name() string { return "Grep" }
 
 func (t *GrepTool) Description() string {

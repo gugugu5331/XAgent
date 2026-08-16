@@ -20,11 +20,9 @@ func TestSystemBlockSelection(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "ordered wins",
+			name: "ordered layout",
 			req: ChatRequest{
-				System:        []SystemBlock{{Name: "ordered-1", Content: safeText("one")}, {Name: "ordered-2", Content: safeText("two")}},
-				StableSystem:  []SystemBlock{{Content: safeText("stable")}},
-				DynamicSystem: []SystemBlock{{Content: safeText("dynamic")}},
+				System: []SystemBlock{{Name: "ordered-1", Content: safeText("one")}, {Name: "ordered-2", Content: safeText("two")}},
 			},
 			want: []string{"one", "two"},
 		},
@@ -76,7 +74,6 @@ func TestOpenAIOrderedSystemBlocks(t *testing.T) {
 			{Name: localCanary, Content: safeText("hook rules")},
 			{Name: "runtime", Content: safeText("runtime reminder")},
 		},
-		StableSystem: []SystemBlock{{Content: safeText("LEGACY STABLE CANARY")}},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -50,7 +50,7 @@ func TestAssemblyRollsBackEveryInitializationPoint(t *testing.T) {
 	})
 
 	t.Run("cancellation after a middle-stage owner keeps its exact prefix", func(t *testing.T) {
-		const middleSecuritySlot = 4 // security/artifact-store in the 16-slot manifest.
+		const middleSecuritySlot = 4 // security/artifact-store in the owner manifest.
 		trace := newT428SlotTrace()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -221,15 +221,20 @@ func t428ProductionOwnerSlots() []t428OwnerSlot {
 		{assemblyStageAdapters, "adapters/hook-http"},
 		{assemblyStageAdapters, "adapters/hook-engine"},
 		{assemblyStageAdapters, "adapters/mcp-manager"},
+		{assemblyStageOrchestration, "orchestration/worktree-manager"},
+		{assemblyStageOrchestration, "orchestration/workspace-factory"},
 		{assemblyStageOrchestration, "orchestration/orchestrator"},
+		{assemblyStageOrchestration, "orchestration/subagent-result-inbox"},
+		{assemblyStageOrchestration, "orchestration/subagent-manager"},
+		{assemblyStageOrchestration, "orchestration/worktree-janitor"},
 		{assemblyStageUI, "ui/candidate"},
 	}
 }
 
 func assertT428ProductionOwnerManifest(t *testing.T, slots []t428OwnerSlot) {
 	t.Helper()
-	if len(slots) != 16 {
-		t.Fatalf("T4.28 owner manifest has %d slots, want 16", len(slots))
+	if len(slots) != 21 {
+		t.Fatalf("T4.28 owner manifest has %d slots, want 21", len(slots))
 	}
 	wantCounts := make(map[assemblyStage]int, assemblyStageCount)
 	previous := assemblyStage(0)

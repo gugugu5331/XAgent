@@ -82,6 +82,17 @@ func TestV2TypesContainNoRawPathOrUnsafeText(t *testing.T) {
 			{"Content", reflect.TypeOf(redact.SafeText{})},
 			{"CreatedAt", reflect.TypeOf(time.Time{})},
 			{"Tool", reflect.TypeOf((*ToolState)(nil))},
+			{"Subagent", reflect.TypeOf((*SubagentNotificationMessage)(nil))},
+		})
+		assertStructFields(t, reflect.TypeOf(SubagentNotificationMessage{}), []fieldShape{
+			{"NotificationID", reflect.TypeOf("")},
+			{"TaskID", reflect.TypeOf("")},
+			{"Status", reflect.TypeOf("")},
+			{"Summary", reflect.TypeOf(redact.SafeText{})},
+			{"SummaryTruncated", reflect.TypeOf(false)},
+			{"TruncationReason", reflect.TypeOf(redact.SafeText{})},
+			{"StopReason", reflect.TypeOf("")},
+			{"CreatedAt", reflect.TypeOf(time.Time{})},
 		})
 		assertStructFields(t, reflect.TypeOf(ToolState{}), []fieldShape{
 			{"CallID", reflect.TypeOf("")},
@@ -197,7 +208,9 @@ func allowedV2String(path string, current reflect.Type) bool {
 		return true
 	}
 	switch path {
-	case "Conversation.ID", "Conversation.Messages.Tool.CallID", "Conversation.Messages.Tool.Name", "Conversation.Messages.Tool.Error.Code":
+	case "Conversation.ID", "Conversation.Messages.Tool.CallID", "Conversation.Messages.Tool.Name", "Conversation.Messages.Tool.Error.Code",
+		"Conversation.Messages.Subagent.NotificationID", "Conversation.Messages.Subagent.TaskID",
+		"Conversation.Messages.Subagent.Status", "Conversation.Messages.Subagent.StopReason":
 		return current == reflect.TypeOf("")
 	default:
 		return false

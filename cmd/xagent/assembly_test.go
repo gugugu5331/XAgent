@@ -1008,7 +1008,7 @@ func TestAssemblyDistributesCapabilitiesWithoutEscalation(t *testing.T) {
 	if len(execution.permissions.authorizer.LoadErrors) != 0 {
 		t.Fatal("permission authorizer retained loader errors outside the shared health state")
 	}
-	wantTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", tool.LoadSkillToolName}
+	wantTools := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", tool.LoadSkillToolName, tool.AgentToolName}
 	if !reflect.DeepEqual(execution.registry.Names(), wantTools) || execution.executor.Registry != execution.registry {
 		t.Fatal("safe registry and executor did not share the fixed built-in tool set")
 	}

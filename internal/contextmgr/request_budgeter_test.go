@@ -472,6 +472,45 @@ func TestMeasureRequestRejectsUnknownShape(t *testing.T) {
 	}
 }
 
+func TestMeasureConversationTurnExcludesSubagentNotification(t *testing.T) {
+	budgeter := NewRequestBudgeter()
+	redactor := redact.NewRuntimeRedactor()
+	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	conversationState := conversation.NewConversation("parent", now)
+	conversation.AppendUserMessage(conversationState, "visible user message")
+	if err := conversation.AppendSubagentNotification(conversationState, conversation.SubagentNotificationMessage{
+		NotificationID: "notification-budget", TaskID: "task-budget", Status: "completed",
+		Summary: redactor.Redact("must not enter provider context"), StopReason: "completed", CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	withNotification, err := budgeter.MeasureConversationTurn(context.Background(), conversationState.Messages)
+	if err != nil {
+		t.Fatalf("measure conversation with notification: %v", err)
+	}
+	withoutNotification, err := budgeter.MeasureConversationTurn(context.Background(), conversationState.Messages[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withNotification != withoutNotification {
+		t.Fatalf("notification changed Provider context measure: with=%#v without=%#v", withNotification, withoutNotification)
+	}
+}
+
+func TestMeasureRequestAcceptsValidatedSubagentResult(t *testing.T) {
+	payload := `{"schema_version":1,"task_id":"task-budget","status":"completed","summary":"safe result","summary_truncated":false,"truncation_reason":"","stop_reason":"completed","usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"error":null}`
+	request := provider.ChatRequest{Messages: []provider.ModelMessage{{
+		Role: provider.ModelMessageRoleSubagentResult, Content: redact.NewRuntimeRedactor().Redact(payload),
+	}}}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("provider fixture invalid: %v", err)
+	}
+	measure, err := NewRequestBudgeter().MeasureRequest(context.Background(), request)
+	if err != nil || measure.Bytes <= int64(len(payload)) {
+		t.Fatalf("subagent result measure = (%#v,%v)", measure, err)
+	}
+}
+
 func TestMeasureRequestCoversToolSchemaCallsResultsAndFraming(t *testing.T) {
 	budgeter := NewRequestBudgeter()
 	redactor := redact.NewRuntimeRedactor()

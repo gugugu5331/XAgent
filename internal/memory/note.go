@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"xagent/internal/redact"
+	"xagent/internal/safefs"
 )
 
 type Scope string
@@ -46,6 +48,7 @@ type ProjectIdentity struct {
 	RootRealPath string
 	ConfigHash   string
 	ID           string
+	rootObject   safefs.Identity
 }
 
 func NewProjectIdentity(projectRoot string, configDigest string) (ProjectIdentity, error) {
@@ -53,19 +56,84 @@ func NewProjectIdentity(projectRoot string, configDigest string) (ProjectIdentit
 	if root == "" {
 		return ProjectIdentity{}, fmt.Errorf("项目根目录不能为空")
 	}
-	realRoot, err := filepath.EvalSymlinks(root)
+	realRoot, err := canonicalProjectExistingRoot(root)
 	if err != nil {
 		return ProjectIdentity{}, fmt.Errorf("解析项目根目录失败: %w", err)
 	}
-	realRoot, err = filepath.Abs(realRoot)
+	opened, err := safefs.Bootstrap(realRoot, safefs.Policy{})
 	if err != nil {
-		return ProjectIdentity{}, fmt.Errorf("解析项目根绝对路径失败: %w", err)
+		return ProjectIdentity{}, fmt.Errorf("打开项目根目录失败")
 	}
-	realRoot = filepath.Clean(realRoot)
+	rootObject := opened.Root.Identity()
+	objectIdentity, identityErr := rootObject.MarshalBinary()
+	closeErr := opened.Root.Close()
+	if identityErr != nil || closeErr != nil {
+		return ProjectIdentity{}, fmt.Errorf("读取项目根身份失败")
+	}
 	normalized := normalizeProjectPath(realRoot)
 	configHash := hashText(strings.TrimSpace(configDigest))
-	id := hashText(normalized + "\x00" + configHash)
-	return ProjectIdentity{RootRealPath: realRoot, ConfigHash: configHash, ID: id[:16]}, nil
+	id := hashText(normalized + "\x00" + hex.EncodeToString(objectIdentity) + "\x00" + configHash)
+	return ProjectIdentity{RootRealPath: realRoot, ConfigHash: configHash, ID: id, rootObject: rootObject}, nil
+}
+
+func (identity ProjectIdentity) matchesLiveRoot() bool {
+	canonical, err := canonicalProjectExistingRoot(identity.RootRealPath)
+	if err != nil || canonical != identity.RootRealPath {
+		return false
+	}
+	opened, err := safefs.Bootstrap(identity.RootRealPath, safefs.Policy{})
+	if err != nil {
+		return false
+	}
+	actual := opened.Root.Identity()
+	return opened.Root.Close() == nil && actual == identity.rootObject
+}
+
+func canonicalProjectExistingRoot(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil || !filepath.IsAbs(resolved) {
+		return "", fmt.Errorf("project path is not absolute")
+	}
+	resolved = filepath.Clean(resolved)
+	volume := filepath.VolumeName(resolved)
+	current := volume + string(filepath.Separator)
+	if volume == "" {
+		current = string(filepath.Separator)
+	}
+	remainder := strings.TrimPrefix(resolved, current)
+	if remainder == "" {
+		return current, nil
+	}
+	for _, component := range strings.Split(remainder, string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." || filepath.Base(component) != component {
+			return "", fmt.Errorf("project path is invalid")
+		}
+		candidateInfo, err := os.Lstat(filepath.Join(current, component))
+		if err != nil {
+			return "", err
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", err
+		}
+		actual := ""
+		for _, entry := range entries {
+			entryInfo, infoErr := entry.Info()
+			if infoErr == nil && os.SameFile(candidateInfo, entryInfo) {
+				actual = entry.Name()
+				break
+			}
+		}
+		if actual == "" {
+			return "", fmt.Errorf("project path identity is unavailable")
+		}
+		current = filepath.Join(current, actual)
+	}
+	return filepath.Clean(current), nil
 }
 
 func normalizeProjectPath(path string) string {

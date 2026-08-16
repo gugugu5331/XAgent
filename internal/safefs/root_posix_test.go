@@ -68,6 +68,50 @@ func TestRootRejectsSymlinkSwap(t *testing.T) {
 	}
 }
 
+func TestProtectionReadonlyProbeRejectsSymlinkAndIdentitySwap(t *testing.T) {
+	sharedPath := t.TempDir()
+	shared := mustBootstrap(t, sharedPath, Policy{})
+	defer mustClose(t, shared.Root)
+	plan, err := NewProtectionPlan(ProtectionPlanOptions{Readonly: []*Root{shared.Root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ProbeReadonlyPath(sharedPath); err != nil {
+		t.Fatalf("initial readonly probe: %v", err)
+	}
+	held := sharedPath + "-held"
+	if err := os.Rename(sharedPath, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sharedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ProbeReadonlyPath(sharedPath); err == nil {
+		t.Fatal("replacement directory retained readonly authorization")
+	}
+	if err := os.Remove(sharedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(held, sharedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ProbeReadonlyPath(sharedPath); err == nil {
+		t.Fatal("symlink alias was authorized as a readonly root")
+	}
+}
+
+func TestProtectionReadonlyPolicyRejectsExistingSymlink(t *testing.T) {
+	rootPath := t.TempDir()
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(rootPath, "shared")); err != nil {
+		t.Fatal(err)
+	}
+	if opened, err := Bootstrap(rootPath, Policy{ReadonlySlots: []string{"shared"}}); err == nil {
+		_ = opened.Root.Close()
+		t.Fatal("readonly policy accepted an existing symlink slot")
+	}
+}
+
 func TestBindUsesOpenedIdentity(t *testing.T) {
 	rootPath := t.TempDir()
 	original := filepath.Join(rootPath, "original.txt")

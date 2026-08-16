@@ -17,14 +17,14 @@
               ├─────────────── sealed tool.Registry
               │
 主 Agent Agent 工具 ─┐
-TUI /agent 入口 ────┴──► subagent.TaskManager
+TUI /agent 入口 ────┴──► subagent.Service（实现：Manager）
                               │
              ┌────────────────┼────────────────┐
              ▼                ▼                ▼
           排队/并发        前后台切换       任务事件/结果
                               │
                               ▼
-                 orchestrator.SubagentRunner
+              orchestrator.SubagentRunnerFactory
                               │
           ┌───────────────────┼───────────────────┐
           ▼                   ▼                   ▼
@@ -45,9 +45,9 @@ TUI /agent 入口 ────┴──► subagent.TaskManager
 
 2. internal/tool 增加一个稳定 Agent 系统工具定义。它只负责向模型公开参数 Schema，不直接启动任务；模型调用和 TUI 显式入口都转换成同一个 typed Submit 请求。Agent 与 load_skill 使用系统路由，普通 Executor 不会直接执行它们。
 
-3. internal/subagent.TaskManager 负责任务登记、准入、FIFO 队列、并发上限、状态机、任务级取消、前后台承载方式、确认 Broker、事件日志、终态保留和结果 Inbox。它不复用现有 runTracker 或 Hook 异步池，因此后台任务不会阻塞普通会话的 idle、导航或切换会话。
+3. `internal/subagent.Manager` 通过 `subagent.Service` 暴露任务登记、准入、FIFO 队列、并发上限、状态机、任务级取消、前后台承载方式、确认 Broker、事件日志、终态保留和结果 Inbox。它不复用现有 runTracker 或 Hook 异步池，因此后台任务不会阻塞普通会话的 idle、导航或切换会话。
 
-4. orchestrator.SubagentRunner 是唯一真正运行子 Agent Loop 的组件。它复用现有 Provider、Hook、工具 Executor 和循环逻辑，但为每个任务创建独立的 RuntimeState：
+4. `orchestrator.SubagentRunnerFactory` 是唯一创建子 Agent Loop 运行实例的组件。它复用现有 Provider、Hook、工具 Executor 和循环逻辑，但为每个任务创建独立的 RuntimeState：
 
    - Defined 从空白子会话构造标准系统/安全指令、项目指令、角色正文和任务内容；
    - Fork 在委派瞬间捕获父请求的不可变消息、系统块、工具定义和缓存策略，后续只追加角色提示与任务消息；
@@ -72,11 +72,11 @@ TUI /agent 入口 ────┴──► subagent.TaskManager
 
 8. Fork 的 Provider 请求保留父请求的稳定系统前缀和缓存策略。若角色或安全过滤改变工具定义，则只复用仍然一致的系统缓存边界，并关闭不再匹配的工具缓存断点；不为了缓存重新暴露被过滤工具。OpenAI 路径忽略 Anthropic 专属缓存元数据，但保持请求正确性。
 
-9. 每个任务的原始事件由 TaskManager 持续排空并包装为带任务标识、全局修订号和任务内序号的机器事件。TUI 使用独立任务订阅，不把后台事件放入主请求的 stale-envelope。任务详情显示状态、角色、类型、来源、时间、停止原因、摘要、用量、确认卡片和有界的最近轨迹。
+9. 每个任务的原始事件由 `subagent.Manager` 持续排空并包装为带任务标识、全局修订号和任务内序号的机器事件。TUI 使用独立任务订阅，不把后台事件放入主请求的 stale-envelope。任务详情显示状态、角色、类型、来源、时间、停止原因、摘要、用量、确认卡片和有界的最近轨迹。
 
-10. 终态只构造一次不可变 Completion，同一份快照用于 TaskManager、终端事件、TUI 和结果 Inbox。主 Agent 正在运行时，结果只在下一安全的模型/工具回灌边界提供；主轮已结束时保留到下一次请求消费，绝不自动发起新的模型回合。思考内容和完整工具轨迹不进入主会话。
+10. 终态只构造一次不可变 Completion，同一份快照用于 `subagent.Manager`、终端事件、TUI 和结果 Inbox。主 Agent 正在运行时，结果只在下一安全的模型/工具回灌边界提供；主轮已结束时保留到下一次请求消费，绝不自动发起新的模型回合。思考内容和完整工具轨迹不进入主会话。
 
-11. Assembly 接线顺序为：解析模型别名 → 注册内置工具、Skill 系统工具和 Agent 工具 → 注册 MCP 工具 → 封存工具注册表 → 构建角色 Manager 与 TaskManager → 注入 Orchestrator → 由 App/TUI 使用窄任务服务。应用关闭时先停止任务准入、取消并有界收尾所有子任务，再关闭普通交互、Hook、MCP 和 Provider。
+11. Assembly 接线顺序为：解析模型别名 → 注册内置工具、Skill 系统工具和 Agent 工具 → 注册 MCP 工具 → 封存工具注册表 → 构建角色 Manager 与 `subagent.Manager` → 注入 Orchestrator → 由 App/TUI 使用 `subagent.Service`。应用关闭时先停止任务准入、取消并有界收尾所有子任务，再关闭普通交互、Hook、MCP 和 Provider。
 
 本轮仍明确不包含 Worktree 文件隔离、团队编排、跨会话/跨进程任务恢复、插件目录扫描和新 Provider 协议。
 
@@ -867,6 +867,18 @@ type PreparedTask interface {
     Metadata() PreparedMetadata
 }
 
+type PreparedPlacementController interface {
+    MoveToBackground() bool
+}
+
+type PreparedConfirmationController interface {
+    ResolveConfirmation(events.ToolConfirmationDecision) error
+}
+
+type FirstProviderRequestObservable interface {
+    SetFirstProviderRequestObserver(func(context.Context))
+}
+
 type RunnerFactory interface {
     // Prepare is called before queue publication. It must capture and freeze
     // role generation, parent Conversation/Prompt/Tool/Mode snapshots and
@@ -874,6 +886,8 @@ type RunnerFactory interface {
     Prepare(context.Context, ID, SubmitInput) (PreparedTask, error)
 }
 ~~~
+
+`PreparedPlacementController` 是前台任务切后台时的可选、非阻塞幂等边界；`PreparedConfirmationController` 把任务决定路由到任务独占 Broker；`FirstProviderRequestObservable` 在首个 Provider 请求开始前安装自动后台观察器。任务需要对应行为却未实现窄接口时，Manager 必须 fail-closed，不能绕过能力收窄、确认隔离或自动后台语义。
 
 ~~~go
 type EventKind string
@@ -1076,7 +1090,7 @@ ResultInbox 以 ConversationID 作为跨主请求 owner key，原 ExecutionID/Re
 
 模型可见的异步结果使用版本化固定 schema：`ResultMessage{schema_version, task_id, status, summary, summary_truncated, truncation_reason, stop_reason, usage, error:{code,message,recoverable?}}`，字段按该顺序以安全 JSON/固定 marker 投影，通知按 `CompletionRevision`、TaskID 排序后逐条追加；不包含 ParentRef、路径、完整工具轨迹或原始凭据。
 
-TaskManager 的 EventReducer 是 TaskSnapshot 的唯一写入点：`ToolWaitingConfirmation` 设置 waiting/pending；确认 resolve、ToolRunning 或 ToolDenied 清空 pending 并恢复 running；usage 先由 Runner 转成任务累计值，Reducer 只接受非负、单调且不溢出的累计快照。内层 Agent Loop 的 `events.Done/Error` 只作为 Runner stop input，不直接发布外层终态；终态由 `completeOnce` 原子构造。
+`subagent.Manager` 的 EventReducer 是 TaskSnapshot 的唯一写入点：`ToolWaitingConfirmation` 设置 waiting/pending；确认 resolve、ToolRunning 或 ToolDenied 清空 pending 并恢复 running；usage 先由 Runner 转成任务累计值，Reducer 只接受非负、单调且不溢出的累计快照。内层 Agent Loop 的 `events.Done/Error` 只作为 Runner stop input，不直接发布外层终态；终态由 `completeOnce` 原子构造。
 
 Manager 验证 Runner 返回的 Completion：ID 必须匹配、Status 必须终态、EndedAt/Usage/StopReason/Error 组合合法，所有文本已脱敏并在限额内；panic 或不合法返回值统一映射为 `internal`。Summary 由固定 projector 从已安全收集的最终 assistant 文本生成，不额外调用模型；失败/取消时保留已产生的安全文本，没有文本则使用固定状态摘要，超长时 UTF-8 截断并显式标记。TaskSnapshot 终态字段、terminal Event、ResultNotification 和 TUI 都只能从这份 Completion 深拷贝投影。若终态后的 Inbox Publish 因内部故障失败，不修改 Completion，而是发布 `result_publish_failed` 诊断并从 Manager 保留的终态快照有界重试到 Shutdown。
 
@@ -1095,6 +1109,8 @@ type RuntimeProfile struct {
     ForegroundTools   tool.CapabilitySet
     BackgroundTools   tool.CapabilitySet
     MaxIterations     int
+    MaxRequestBytes   int64
+    MaxRequestPlanningTokens int64
 }
 
 type CancelBridge interface {
@@ -1121,6 +1137,7 @@ type TaskRuntimeState struct {
     Usage          provider.Usage
     Iteration      int
     Prompt         provider.PromptPrefixSnapshot
+    RequestBudgeter contextmgr.RequestBudgeter
     HookSessionID  string
     HookExecution  hook.ExecutionRef
     Context        context.Context
@@ -1146,6 +1163,11 @@ type TaskScope struct {
     Authorizer *Authorizer
     Issuer     TicketIssuer
     Verifier   TicketVerifier
+}
+
+type ScopedTicketVerifier interface {
+    TicketVerifier
+    ScopeID() string
 }
 
 func (a *Authorizer) NewTaskScope(TaskScopeOptions) (TaskScope, error)
@@ -1257,7 +1279,7 @@ Registry.Seal()
       ├─ Seal Plugin Role Providers
       └─ 创建 agentrole.Manager
       ▼
-Orchestrator + RunnerFactory + TaskManager
+Orchestrator + RunnerFactory + subagent.Manager
       ▼
 App/TUI 订阅任务事件
 ~~~
@@ -1404,7 +1426,7 @@ background queued → running / waiting_confirmation
 Runner raw event
       │
       ▼
-TaskManager EventHub
+subagent.Manager EventHub
   ├─ 深拷贝/脱敏/限长
   ├─ 分配 Revision
   ├─ 分配 TaskID 内 Sequence
@@ -1425,7 +1447,7 @@ TaskManager EventHub
 ~~~text
 Completion
    │
-   ├─ TaskManager terminal snapshot
+   ├─ subagent.Manager terminal snapshot
    ├─ terminal task event
    ├─ TUI 完成/失败通知
    └─ ResultInbox.Publish(ParentRef)
@@ -1441,7 +1463,7 @@ Completion
        internal ResultClaim / subagent_result projection
 ~~~
 
-安全回灌边界定义为：完整工具 batch 已按模型调用顺序提交且不存在悬空 tool_call 之后、下一次 Provider 请求构造之前。Orchestrator 先完成普通上下文预算/必要 compaction，并为至少一个 `MaxResultBytes` 上限内的固定 schema 消息保留注入空间，再用实际剩余字节 Claim 最老连续前缀；构造、统一 Validate 或 Provider 启动失败/取消时 Release。只有 `StreamChat` 成功返回已启动的 stream、即 Provider 请求接受边界越过后才 Ack；后续流错误不重新投递，避免模型可能已见结果时重复。模型可见 payload 只包含任务 ID、状态、脱敏摘要、停止原因、用量和可选 SafeError code/message；ParentRef 只作内部路由，不序列化。瞬时 `subagent_result` 不作为原 Agent ToolCallID 的 tool_result，也不自动启动模型回合。TUI 第一次展示完成/失败通知时，在主会话 ordered-commit 边界追加一次 `RoleSubagentNotification` 并走现有会话保存；重复 Event/重连按 NotificationID 去重。该持久记录不进入 Provider ContextMessages，详细结果仍只在进程内 TaskManager 中查看。
+安全回灌边界定义为：完整工具 batch 已按模型调用顺序提交且不存在悬空 tool_call 之后、下一次 Provider 请求构造之前。Orchestrator 先完成普通上下文预算/必要 compaction，并为至少一个 `MaxResultBytes` 上限内的固定 schema 消息保留注入空间，再用实际剩余字节 Claim 最老连续前缀；构造、统一 Validate 或 Provider 启动失败/取消时 Release。只有 `StreamChat` 成功返回已启动的 stream、即 Provider 请求接受边界越过后才 Ack；后续流错误不重新投递，避免模型可能已见结果时重复。模型可见 payload 只包含任务 ID、状态、脱敏摘要、停止原因、用量和可选 SafeError code/message；ParentRef 只作内部路由，不序列化。瞬时 `subagent_result` 不作为原 Agent ToolCallID 的 tool_result，也不自动启动模型回合。TUI 第一次展示完成/失败通知时，在主会话 ordered-commit 边界追加一次 `RoleSubagentNotification` 并走现有会话保存；重复 Event/重连按 NotificationID 去重。该持久记录不进入 Provider ContextMessages，详细结果仍只在进程内 `subagent.Manager` 中查看。
 
 ### 角色刷新与运行中任务
 
@@ -1524,8 +1546,7 @@ internal/provider/
 
 internal/hook/
 ├── api.go
-├── engine.go
-├── lifecycle.go     — 每任务 SessionStart/BeginTurn/EndTurn/SessionEnd 契约
+├── engine.go        — 每任务 SessionStart/BeginTurn/EndTurn/SessionEnd 契约
 ├── event.go
 └── *_test.go
 
@@ -1591,7 +1612,7 @@ config.example.yaml       — llm.model_aliases 与顶层 subagent.role_limits/r
 
 明确不修改或不新增第二入口的部分：
 
-`assembly_subagents.go` 提供唯一共享的子 Agent 组装函数；候选 `assembly.go` 和现有生产 `main.go` 都必须调用它并完成同样的 Registry.Seal → agentrole.Manager → TaskManager 接线，不能只接一条入口或保留第二套运行时。
+`assembly_subagents.go` 提供唯一共享的子 Agent 组装函数；候选 `assembly.go` 和现有生产 `main.go` 都必须调用它并完成同样的 Registry.Seal → agentrole.Manager → subagent.Manager 接线，不能只接一条入口或保留第二套运行时。
 
 - 不改造 internal/skill 的领域类型；
 - 不复用 IndependentID 表示任务；
@@ -1617,7 +1638,7 @@ config.example.yaml       — llm.model_aliases 与顶层 subagent.role_limits/r
 | 工具过滤 | 父集合与角色 allow 取交集，再减 deny、全局禁止；仅 background placement 再与后台集合取交集，前台/后台双 View 在 Detach 原子切换 | 每一层只收窄，不允许后层重新开放工具 |
 | 默认后台工具 | ReadOnly、SideEffectFree、ConcurrentSafe 三项同时满足 | 明确区分只读和无副作用；首版包含 Read、Glob、Grep |
 | 后台工具扩展 | 配置可收窄或扩展已注册名称 | 扩展仍经过角色、权限、Plan、Hook 和硬安全链 |
-| 任务调度器 | 独立 TaskManager，不复用 runTracker 或 Hook async pool | 支持稳定 ID、队列、单任务取消和事件查询 |
+| 任务调度器 | 独立 `subagent.Manager`，不复用 runTracker 或 Hook async pool | 支持稳定 ID、队列、单任务取消和事件查询 |
 | 并发限制 | 最多 4 个 Worker、最多 32 个等待项 | 转后台不会突破上限；超限立即返回 queue_full |
 | Context 所有权 | 从提交开始由 Manager 创建任务 Context | 通过可解除取消桥实现父请求与后台任务解耦 |
 | 前后台切换 | Placement 与 Status 正交，Detach 只改承载方式 | 保留 ID、消息、工具进度和事件序号，不重启 |
@@ -1638,14 +1659,14 @@ config.example.yaml       — llm.model_aliases 与顶层 subagent.role_limits/r
 | 用户入口 | /agent、/tasks、/task value-only 意图 | 命令层不依赖 TUI，模型与用户共用任务服务 |
 | 任务界面 | 独立 tasks/task_detail 屏幕 | 后台任务不受会话导航事务阻塞 |
 | 任务持久化 | 仅进程内有界保留 | 符合本轮不做跨会话/跨进程恢复 |
-| 关闭顺序 | 先 TaskManager，再普通交互，最后 Hook/MCP/Provider | 防止任务在共享基础设施关闭后继续工作 |
+| 关闭顺序 | 先 `subagent.Manager`，再普通交互，最后 Hook/MCP/Provider | 防止任务在共享基础设施关闭后继续工作 |
 | 测试隔离 | Runner、Provider、TUI 都提供替代实现 | 可在无真实 Provider/完整 TUI 环境验证核心行为 |
 
 ### 关键取舍
 
 1. Fork 的工具过滤可能改变父请求的工具定义。此时只继承字节一致的系统缓存边界，关闭不匹配的工具缓存断点；安全收窄优先于工具缓存命中。
 
-2. 后台任务不加入普通 runTracker。导航和普通消息只等待交互请求；应用关闭通过 TaskManager 的独立 Shutdown 有界收尾后台任务。
+2. 后台任务不加入普通 runTracker。导航和普通消息只等待交互请求；应用关闭通过 `subagent.Service.Shutdown` 有界收尾后台任务。
 
 3. 子 Agent 不使用现有独立 Skill 的浅拷贝路径。现有独立执行逻辑只复用 Agent Loop、事件脱敏和工具调度算法；权限、确认、消息和读缓存均通过新的任务作用域创建。
 
@@ -1655,12 +1676,12 @@ config.example.yaml       — llm.model_aliases 与顶层 subagent.role_limits/r
 
 | Spec 范围 | 主要归属 |
 |---|---|
-| F1–F4、N1 | Agent 工具、TaskManager Submit、TaskIntent |
+| F1–F4、N1 | Agent 工具、`subagent.Service.Submit`、TaskIntent |
 | F5–F12、N2–N4、N14、N16 | agentrole Parser、Snapshot、ModelCatalog、Config |
 | F13–F18、N5–N9 | RunnerFactory、Conversation/Prompt Snapshot、CapabilitySet、TaskScope |
 | F19–F23、N10、N18 | Orchestrator Agent Loop、Confirmation Broker、Task Context、Shutdown |
 | F24–F28、N8–N9、N19 | Tool View、ExecutionPolicy、Registry Seal、Task Scheduler |
-| F29–F33、N11–N13、N17 | TaskManager、EventHub、TaskSnapshot、Completion |
+| F29–F33、N11–N13、N17 | `subagent.Manager`、EventHub、TaskSnapshot、Completion |
 | F34–F38、N12、N14–N15、N20–N22 | ResultInbox、App/TUI、脱敏投影、Assembly/Lifecycle |
 
 所有 F 需求均有明确模块归属；普通对话、Skill、权限、Plan Mode、Hook、Memory、MCP 和会话存储在无子任务路径下继续使用既有入口。

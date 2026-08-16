@@ -140,7 +140,8 @@ func assertAssemblyOrchestrationConstructor(t *testing.T, file *ast.File) {
 		"Provider": true, "Store": true, "Resources": true, "Thinking": true,
 		"Registry": true, "Executor": true, "Authorizer": true, "ContextManager": true,
 		"CleanupTimeout": true, "LifecycleDiagnostics": true,
-		"ResultFactory": true, "SkillHistoryPolicy": true, "RequestBudgeter": true,
+		"ResultFactory": true, "ResultProjector": true, "Subagents": true, "SubagentLimits": true,
+		"SkillHistoryPolicy": true, "RequestBudgeter": true,
 		"MaxRecordBytes": true, "MaxSessionBytes": true, "SessionContext": true,
 		"Memory": true, "Diagnostics": true, "Agent": true, "SkillManager": true,
 		"DefaultModel": true, "RuntimeRedactor": true, "Redact": true,
@@ -157,10 +158,13 @@ func assertAssemblyOrchestrationConstructor(t *testing.T, file *ast.File) {
 		"Authorizer":           "state.execution.permissions.authorizer",
 		"ContextManager":       "contextServices.contextManager",
 		"ResultFactory":        "state.execution.resultFactory",
+		"ResultProjector":      "subagents.projector",
+		"Subagents":            "subagents.tasks",
+		"SubagentLimits":       "resolved.Subagent.Limits",
 		"SkillHistoryPolicy":   "contextServices.skillHistoryPolicy",
 		"RequestBudgeter":      "contextServices.requestBudgeter",
 		"SessionContext":       "contextServices.sessionContext",
-		"Memory":               "contextServices.memory",
+		"Memory":               "memoryUpdater",
 		"Diagnostics":          "state.adapters.diagnostics",
 		"SkillManager":         "state.execution.skills",
 		"RuntimeRedactor":      "state.configuration.redactor",
@@ -222,7 +226,7 @@ func assertAssemblyOrchestrationConstructor(t *testing.T, file *ast.File) {
 	// The stage must construct its service graph before constructing the
 	// Orchestrator.  A direct call to the constructor from another stage would
 	// bypass this boundary and make the static check above meaningless.
-	order := []string{"newAssemblyContextServices(", "orchestrator.NewWithOptions("}
+	order := []string{"newAssemblyContextServices(", "newAssemblySubagents(", "orchestrator.NewWithOptions("}
 	positions := make([]int, len(order))
 	text := string(mustReadAssembly(t)) + "\n" + string(mustReadAssemblyFile(t, "assembly_context.go"))
 	for index, marker := range order {
@@ -231,8 +235,8 @@ func assertAssemblyOrchestrationConstructor(t *testing.T, file *ast.File) {
 			t.Fatalf("assembly source is missing %q", marker)
 		}
 	}
-	if positions[0] > positions[1] {
-		t.Fatal("Orchestrator is constructed before Context/Session/Memory services")
+	if positions[0] > positions[1] || positions[1] > positions[2] {
+		t.Fatal("Orchestrator is constructed before Context or Subagent services")
 	}
 }
 

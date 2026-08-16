@@ -19,6 +19,20 @@ func NewConfirmationPanel(confirmation ConfirmationView) ConfirmationPanel {
 	return ConfirmationPanel{confirmation: confirmation}
 }
 
+// NewTaskConfirmationPanel renders a task-local decision. Permanent grants
+// are impossible for child tasks and are removed here as a final UI boundary,
+// independently of producer correctness.
+func NewTaskConfirmationPanel(confirmation ConfirmationView) ConfirmationPanel {
+	confirmation.allowPermanent = false
+	confirmation.scopes = cloneSlice(confirmation.scopes)
+	for index := range confirmation.scopes {
+		if strings.EqualFold(strings.TrimSpace(confirmation.scopes[index].scope), "permanent") {
+			confirmation.scopes[index].available = false
+		}
+	}
+	return ConfirmationPanel{confirmation: confirmation}
+}
+
 func (panel *ConfirmationPanel) SetRegion(region Region) {
 	panel.region = Region{
 		X: nonNegative(region.X), Y: nonNegative(region.Y),

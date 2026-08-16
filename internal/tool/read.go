@@ -44,6 +44,15 @@ func NewReadToolWithResultBoundary(projectRoot string, factory *ResultFactory, c
 	return &ReadTool{projectRoot: projectRoot, limits: defaultReadLimits(), resultFactory: factory, capture: capture}, nil
 }
 
+func (t *ReadTool) BindWorkspace(binding WorkspaceBinding) (Tool, error) {
+	if t == nil {
+		return nil, errors.New("Read workspace binder is unavailable")
+	}
+	clone := *t
+	clone.projectRoot = binding.Root
+	return &clone, nil
+}
+
 func (t *ReadTool) Name() string { return "Read" }
 
 func (t *ReadTool) Description() string {
