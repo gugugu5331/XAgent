@@ -2,7 +2,7 @@
 
 > 适用范围：`cmd/` 与 `internal/` 下的 Go 生产代码和测试代码
 >
-> 统计快照：2026-08-16，分支 `codex/subagent-system`
+> 统计快照：2026-08-17，分支 `codex/subagent-system`
 
 ## 1. 文档目的
 
@@ -17,10 +17,10 @@
 | 代码类型 | 文件数 | 有效代码行数 |
 | --- | ---: | ---: |
 | 生产代码 | 371 | 80,560 |
-| 测试代码 | 313 | 90,850 |
-| 合计 | 684 | 171,410 |
+| 测试代码 | 312 | 90,816 |
+| 合计 | 683 | 171,376 |
 
-测试代码约为生产代码的 1.13 倍，占核心 Go 有效代码的 53.0%。测试侧包含 1,585 个 `Test*` 入口和 1 个 Fuzz 入口。
+测试代码约为生产代码的 1.13 倍，占核心 Go 有效代码的 53.0%。测试侧包含 1,583 个普通 `Test*` 入口、1 个 Fuzz 入口和 1 个 `TestMain` 包级入口。
 
 统计规则：
 
@@ -35,7 +35,7 @@
 ```mermaid
 %%{init: {'theme':'base','flowchart':{'curve':'basis','nodeSpacing':26,'rankSpacing':38},'themeVariables':{'primaryTextColor':'#0f172a','lineColor':'#64748b','fontFamily':'PingFang SC, sans-serif'}}}%%
 flowchart LR
-    TEST["XAgent 测试体系\n90,850 行有效测试代码"]
+    TEST["XAgent 测试体系\n90,816 行有效测试代码"]
 
     TEST --> LOOP["Agent 核心\n循环 · 调度 · 取消 · Usage"]
     TEST --> SAFE["工具与安全\nSchema · 权限 · Ticket · 路径"]
@@ -75,11 +75,11 @@ flowchart LR
 
 代表性测试：
 
-- [`internal/orchestrator/chat_test.go`](../internal/orchestrator/chat_test.go)
-- [`internal/orchestrator/tool_scheduler_test.go`](../internal/orchestrator/tool_scheduler_test.go)
-- [`internal/orchestrator/ordered_commit_test.go`](../internal/orchestrator/ordered_commit_test.go)
-- [`internal/orchestrator/cancellation_test.go`](../internal/orchestrator/cancellation_test.go)
-- [`internal/orchestrator/usage_commit_test.go`](../internal/orchestrator/usage_commit_test.go)
+- [`internal/orchestrator/chat_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/orchestrator/chat_test.go)
+- [`internal/orchestrator/tool_scheduler_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/orchestrator/tool_scheduler_test.go)
+- [`internal/orchestrator/ordered_commit_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/orchestrator/ordered_commit_test.go)
+- [`internal/orchestrator/cancellation_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/orchestrator/cancellation_test.go)
+- [`internal/orchestrator/usage_commit_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/orchestrator/usage_commit_test.go)
 
 ### 4.2 工具与安全边界
 
@@ -94,11 +94,11 @@ flowchart LR
 
 代表性测试：
 
-- [`internal/tool/scoped_executor_test.go`](../internal/tool/scoped_executor_test.go)
-- [`internal/tool/workspace_policy_test.go`](../internal/tool/workspace_policy_test.go)
-- [`internal/permission/ticket_test.go`](../internal/permission/ticket_test.go)
-- [`internal/safefs/protection_test.go`](../internal/safefs/protection_test.go)
-- [`internal/redact/runtime_test.go`](../internal/redact/runtime_test.go)
+- [`internal/tool/scoped_executor_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/tool/scoped_executor_test.go)
+- [`internal/tool/workspace_policy_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/tool/workspace_policy_test.go)
+- [`internal/permission/ticket_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/permission/ticket_test.go)
+- [`internal/safefs/protection_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/safefs/protection_test.go)
+- [`internal/redact/runtime_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/redact/runtime_test.go)
 
 ### 4.3 状态、上下文与恢复
 
@@ -112,12 +112,12 @@ flowchart LR
 
 代表性测试：
 
-- [`internal/conversation/jsonl_store_test.go`](../internal/conversation/jsonl_store_test.go)
-- [`internal/conversation/recovery_test.go`](../internal/conversation/recovery_test.go)
-- [`internal/conversation/migration_test.go`](../internal/conversation/migration_test.go)
-- [`internal/contextmgr/request_budgeter_test.go`](../internal/contextmgr/request_budgeter_test.go)
-- [`internal/instructions/include_test.go`](../internal/instructions/include_test.go)
-- [`internal/artifact/file_store_test.go`](../internal/artifact/file_store_test.go)
+- [`internal/conversation/jsonl_store_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/conversation/jsonl_store_test.go)
+- [`internal/conversation/recovery_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/conversation/recovery_test.go)
+- [`internal/conversation/migration_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/conversation/migration_test.go)
+- [`internal/contextmgr/request_budgeter_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/contextmgr/request_budgeter_test.go)
+- [`internal/instructions/include_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/instructions/include_test.go)
+- [`internal/artifact/file_store_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/artifact/file_store_test.go)
 
 ### 4.4 模型协议与扩展能力
 
@@ -131,13 +131,13 @@ flowchart LR
 
 代表性测试：
 
-- [`internal/provider/anthropic_stream_test.go`](../internal/provider/anthropic_stream_test.go)
-- [`internal/provider/openai_stream_test.go`](../internal/provider/openai_stream_test.go)
-- [`internal/provider/sse_decoder_test.go`](../internal/provider/sse_decoder_test.go)
-- [`internal/mcpclient/protocol/codec_test.go`](../internal/mcpclient/protocol/codec_test.go)
-- [`internal/mcpclient/manager_lifecycle_test.go`](../internal/mcpclient/manager_lifecycle_test.go)
-- [`internal/hook/hard_boundary_test.go`](../internal/hook/hard_boundary_test.go)
-- [`internal/skill/manager_test.go`](../internal/skill/manager_test.go)
+- [`internal/provider/anthropic_stream_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/provider/anthropic_stream_test.go)
+- [`internal/provider/openai_stream_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/provider/openai_stream_test.go)
+- [`internal/provider/sse_decoder_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/provider/sse_decoder_test.go)
+- [`internal/mcpclient/protocol/codec_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/mcpclient/protocol/codec_test.go)
+- [`internal/mcpclient/manager_lifecycle_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/mcpclient/manager_lifecycle_test.go)
+- [`internal/hook/hard_boundary_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/hook/hard_boundary_test.go)
+- [`internal/skill/manager_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/skill/manager_test.go)
 
 ### 4.5 SubAgent、Workspace 与 Worktree
 
@@ -153,14 +153,14 @@ flowchart LR
 
 代表性测试：
 
-- [`internal/subagent/manager_test.go`](../internal/subagent/manager_test.go)
-- [`internal/subagent/manager_admission_settlement_test.go`](../internal/subagent/manager_admission_settlement_test.go)
-- [`internal/subagent/result_inbox_test.go`](../internal/subagent/result_inbox_test.go)
-- [`internal/workspace/protection_test.go`](../internal/workspace/protection_test.go)
-- [`internal/worktree/manager_integration_test.go`](../internal/worktree/manager_integration_test.go)
-- [`internal/worktree/recovery_settlement_integration_test.go`](../internal/worktree/recovery_settlement_integration_test.go)
-- [`internal/worktree/concurrency_test.go`](../internal/worktree/concurrency_test.go)
-- [`internal/worktree/janitor_test.go`](../internal/worktree/janitor_test.go)
+- [`internal/subagent/manager_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/subagent/manager_test.go)
+- [`internal/subagent/manager_admission_settlement_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/subagent/manager_admission_settlement_test.go)
+- [`internal/subagent/result_inbox_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/subagent/result_inbox_test.go)
+- [`internal/workspace/protection_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/workspace/protection_test.go)
+- [`internal/worktree/manager_integration_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/worktree/manager_integration_test.go)
+- [`internal/worktree/recovery_settlement_integration_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/worktree/recovery_settlement_integration_test.go)
+- [`internal/worktree/concurrency_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/worktree/concurrency_test.go)
+- [`internal/worktree/janitor_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/worktree/janitor_test.go)
 
 ### 4.6 Assembly、CLI/TUI 与平台差异
 
@@ -174,13 +174,13 @@ flowchart LR
 
 代表性测试：
 
-- [`cmd/xagent/assembly_test.go`](../cmd/xagent/assembly_test.go)
-- [`cmd/xagent/assembly_worktree_unavailable_test.go`](../cmd/xagent/assembly_worktree_unavailable_test.go)
-- [`cmd/xagent/worktree_e2e_test.go`](../cmd/xagent/worktree_e2e_test.go)
-- [`internal/app/lifecycle_test.go`](../internal/app/lifecycle_test.go)
-- [`internal/app/task_events_test.go`](../internal/app/task_events_test.go)
-- [`internal/tui/view_model_test.go`](../internal/tui/view_model_test.go)
-- [`internal/safefs/root_windows_test.go`](../internal/safefs/root_windows_test.go)
+- [`cmd/xagent/assembly_test.go`](https://github.com/gugugu5331/XAgent/blob/main/cmd/xagent/assembly_test.go)
+- [`cmd/xagent/assembly_worktree_unavailable_test.go`](https://github.com/gugugu5331/XAgent/blob/main/cmd/xagent/assembly_worktree_unavailable_test.go)
+- [`cmd/xagent/worktree_e2e_test.go`](https://github.com/gugugu5331/XAgent/blob/main/cmd/xagent/worktree_e2e_test.go)
+- [`internal/app/lifecycle_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/app/lifecycle_test.go)
+- [`internal/app/task_events_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/app/task_events_test.go)
+- [`internal/tui/view_model_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/tui/view_model_test.go)
+- [`internal/safefs/root_windows_test.go`](https://github.com/gugugu5331/XAgent/blob/main/internal/safefs/root_windows_test.go)
 
 ## 5. 异常场景矩阵
 
@@ -211,4 +211,4 @@ XAgent 的测试体系围绕以下原则设计：
 - 本文描述测试代码覆盖的模块和场景，不等同于生产流量覆盖率或线上稳定性证明。
 - 有效代码行数是当前工作区快照，后续代码变化需要重新统计。
 - Fuzz、并发和平台测试用于加强特定边界，不能替代真实模型、真实 MCP Server 和人工终端场景。
-- 详细功能设计可继续参考 [`docs/`](./) 下的各模块 Spec。
+- 详细功能设计可继续参考 [`docs/`](https://github.com/gugugu5331/XAgent/tree/main/docs) 下的各模块 Spec。

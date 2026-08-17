@@ -375,67 +375,218 @@ flowchart TB
 
 这些机制彼此可以组合。例如，一个子 Agent 可以在独立 Worktree 中工作，加载特定 Skill，通过 MCP 查询外部信息，并仍然接受 Hook 和权限系统约束。
 
-## 5. 如何保证 Agent 可靠、避免出错
+## 5. 我如何通过 Spec 实现 XAgent
 
-可靠性不依赖模型“自觉”，而是依靠多层确定性防线：
+XAgent 不是先把所有代码写完，再补一份说明文档。每项较大的能力都会先建立 `spec.md → plan.md → task.md → checklist.md` 四份文件，把需求、设计、实现和验收串成一条可追踪链路。
 
 ```mermaid
-%%{init: {'theme':'base','themeVariables':{'primaryColor':'#fff1f2','primaryTextColor':'#0f172a','primaryBorderColor':'#fb7185','lineColor':'#64748b','secondaryColor':'#ecfdf5','tertiaryColor':'#eff6ff','fontFamily':'PingFang SC, sans-serif'}}}%%
 flowchart LR
-    M["模型意图"] --> S["工具与参数校验"]
-    S --> W["能力范围收窄"]
-    W --> P["权限确认 + Ticket"]
-    P --> E["超时 / 输出受限执行"]
-    E --> F["路径与根身份保护"]
-    F --> R["脱敏结果与状态记录"]
-    R --> C["恢复或保守清理"]
+    R["问题与目标"] --> S["spec.md\n需求、边界、验收标准"]
+    S --> G["评审与确认"]
+    G --> P["plan.md\n架构、接口、数据流"]
+    P --> T["task.md\n有序任务、文件范围"]
+    T --> C["checklist.md\n定义验收项与记录方式"]
+    C --> I["实现代码与测试\n逐项更新 Checklist"]
+    I --> D{"全部满足？"}
+    D -->|"否"| F["定位差距并回写\nSpec / Plan / Task"]
+    F --> G
+    D -->|"是"| B["形成可回归基线"]
 
-    classDef intent fill:#fff1f2,stroke:#fb7185,color:#881337,stroke-width:2px;
+    classDef define fill:#e0f2fe,stroke:#0ea5e9,color:#0c4a6e,stroke-width:1.5px;
+    classDef design fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95,stroke-width:1.5px;
+    classDef build fill:#ecfdf5,stroke:#10b981,color:#064e3b,stroke-width:1.5px;
+    classDef verify fill:#fff7ed,stroke:#fb923c,color:#7c2d12,stroke-width:1.5px;
+    class R,S,G define;
+    class P,T design;
+    class I,B build;
+    class C,D,F verify;
+```
+
+### 5.1 四份文档分别解决什么问题
+
+| 阶段 | 核心问题 | 文档中的主要内容 | 对实现的约束 |
+| --- | --- | --- | --- |
+| `spec.md` | 为什么做、要做到什么 | 背景、目标、功能需求、非功能需求、不做的事、验收标准 | 防止需求边界在编码过程中漂移 |
+| `plan.md` | 准备怎么做 | 模块拆分、核心类型、接口、调用链、状态机、并发与错误策略 | 先确定模块关系和失败行为，再决定文件改动 |
+| `task.md` | 按什么顺序落地 | 文件清单、里程碑、有序任务、每项任务的测试要求 | 把大设计拆成可独立实现和验证的小步骤 |
+| `checklist.md` | 如何证明已经完成 | 功能、异常、安全、集成、端到端和人工验收项 | 未通过或未执行的项目继续保留，不能仅凭“代码已写”宣布完成 |
+
+四份文档不是彼此独立的总结，而是逐层收窄：Spec 中的需求和验收标准进入 Plan，Plan 中的模块设计被拆到 Task，Task 的结果最终回到 Checklist。实现中发现的新边界也需要回写前面的文档，而不是让代码与设计长期分叉。
+
+### 5.2 在项目中的实际落地
+
+仓库当前保留了 15 组同时包含这四份文件的设计目录，覆盖核心循环、工具与权限、上下文与恢复、扩展系统以及多 Agent 隔离。下面列出主要对应关系：
+
+| 能力范围 | 代表 Spec | 主要实现模块 |
+| --- | --- | --- |
+| 模型与核心循环 | [Agent Loop](https://github.com/gugugu5331/XAgent/blob/main/docs/agent-loop/spec.md)、[System Prompt](https://github.com/gugugu5331/XAgent/blob/main/docs/system-prompt/spec.md) | `orchestrator`、`provider`、`prompt`、`events` |
+| 工具与权限 | [Tool System](https://github.com/gugugu5331/XAgent/blob/main/docs/tool-system/spec.md)、[Permission System](https://github.com/gugugu5331/XAgent/blob/main/docs/permission-system/spec.md) | `tool`、`permission`、`safefs`、`proctree` |
+| 上下文与恢复 | [Context Management](https://github.com/gugugu5331/XAgent/blob/main/docs/context-management/spec.md)、[Session Memory Restore](https://github.com/gugugu5331/XAgent/blob/main/docs/session-memory-restore/spec.md) | `contextmgr`、`conversation`、`sessionctx`、`memory`、`artifact` |
+| 扩展机制 | [Command](https://github.com/gugugu5331/XAgent/blob/main/docs/command-system/spec.md)、[Skill](https://github.com/gugugu5331/XAgent/blob/main/docs/skill-system/spec.md)、[Hook](https://github.com/gugugu5331/XAgent/blob/main/docs/hook-system/spec.md)、[MCP](https://github.com/gugugu5331/XAgent/blob/main/docs/mcp-client/spec.md) | `command`、`skill`、`hook`、`mcpclient` |
+| 多 Agent 与隔离 | [SubAgent](https://github.com/gugugu5331/XAgent/blob/main/docs/subagent-system/spec.md)、[Worktree](https://github.com/gugugu5331/XAgent/blob/main/docs/worktree-isolation/spec.md) | `subagent`、`agentrole`、`workspace`、`worktree` |
+
+以权限系统为例，[Spec](https://github.com/gugugu5331/XAgent/blob/main/docs/permission-system/spec.md) 先规定 `allow / deny / ask`、规则优先级、Plan Mode 硬约束和 fail-closed 行为；[Plan](https://github.com/gugugu5331/XAgent/blob/main/docs/permission-system/plan.md) 再把决策集中到 `permission.Authorizer`，要求 Executor 使用一次性授权凭证；[Task](https://github.com/gugugu5331/XAgent/blob/main/docs/permission-system/task.md) 按“离线权限核心 → 执行链接入 → TUI 交互 → 端到端验收”推进；[Checklist](https://github.com/gugugu5331/XAgent/blob/main/docs/permission-system/checklist.md) 最后逐项记录黑名单、路径、规则、确认和失败场景是否满足。这样可以从一条验收项一直追到设计决策、实现包和测试场景。
+
+需要特别区分：**存在四份文档只代表需求链路已经建立，不代表所有验收都已完成。** 真实状态以对应 `checklist.md` 中的完成项、未完成项和保存证据为准。
+
+## 6. Agent 各模块架构
+
+前面的总体架构说明 XAgent 有哪些层，本章进一步说明代码模块如何拆分、各自负责什么，以及它们怎样组成一次完整的 Agent 执行。
+
+### 6.1 模块关系总览
+
+```mermaid
+flowchart TB
+    CMD["cmd/xagent\n启动与依赖装配"] --> APP["app / tui / command\n交互与应用状态"]
+    APP <--> ORC["orchestrator / events\nAgent Loop 与事件流"]
+
+    ORC <--> MODEL["provider / prompt / resources\n模型协议与提示组织"]
+    ORC <--> STATE["conversation / contextmgr / sessionctx\nmemory / instructions / artifact"]
+    ORC <--> EXT["skill / hook / mcpclient\n扩展能力"]
+    ORC --> TOOL["tool\nRegistry / View / Executor"]
+    TOOL --> GUARD["permission / safefs / proctree\nredact / budget"]
+    MODEL --> NET["netpolicy\n外部网络策略"]
+    EXT --> NET
+    EXT --> TOOL
+
+    ORC --> SUB["subagent / agentrole\n子任务与角色"]
+    SUB --> WS["workspace\n任务级运行时"]
+    WS --> WT["worktree\nGit 隔离与成果保护"]
+    WS --> TOOL
+
+    BASE["config / diagnostics / matcher\nrepoaudit 等基础模块"] -. "配置、诊断与公共约束" .-> APP
+    BASE -.-> ORC
+    BASE -.-> EXT
+    BASE -.-> GUARD
+
+    classDef entry fill:#e0f2fe,stroke:#0ea5e9,color:#0c4a6e,stroke-width:1.5px;
+    classDef core fill:#ecfdf5,stroke:#10b981,color:#064e3b,stroke-width:1.6px;
+    classDef data fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95,stroke-width:1.5px;
+    classDef guard fill:#fff1f2,stroke:#fb7185,color:#881337,stroke-width:1.5px;
+    classDef extend fill:#fff7ed,stroke:#fb923c,color:#7c2d12,stroke-width:1.5px;
+    class CMD,APP entry;
+    class ORC,TOOL core;
+    class MODEL,STATE data;
+    class GUARD,NET guard;
+    class EXT,SUB,WS,WT extend;
+```
+
+[`cmd/xagent`](https://github.com/gugugu5331/XAgent/tree/main/cmd/xagent) 是组合根：它按配置、安全、执行、适配器、编排和 UI 六个阶段构造依赖。上层模块通过接口使用下层能力，避免由 TUI 或模型适配器直接创建工具、权限或存储对象。
+
+### 6.2 核心运行模块
+
+| 模块 | 内部架构 | 与其他模块的关系 |
+| --- | --- | --- |
+| [`app`](https://github.com/gugugu5331/XAgent/tree/main/internal/app) | Bubble Tea 应用状态、请求状态、会话列表、确认状态和任务导航 | 接收 TUI 输入，调用 Orchestrator，并把事件投影成界面状态 |
+| [`tui`](https://github.com/gugugu5331/XAgent/tree/main/internal/tui) | 聊天、帮助、任务详情、状态栏等纯展示组件 | 只消费经过整理的状态和安全文本，不直接调用模型或执行工具 |
+| [`command`](https://github.com/gugugu5331/XAgent/tree/main/internal/command) | 命令定义、Registry、解析、补全和 Controller 接口 | 把 `/plan`、`/status`、`/agent` 等输入转换为应用意图 |
+| [`orchestrator`](https://github.com/gugugu5331/XAgent/tree/main/internal/orchestrator) | `Orchestrator`、Agent Loop、流收集、工具分批、停止条件和结果投影 | 是运行时中心，连接 Provider、上下文、工具、权限、Hook、Skill 和 SubAgent |
+| [`events`](https://github.com/gugugu5331/XAgent/tree/main/internal/events) | 统一的文本、Thinking、工具、确认、Usage、进度和完成事件 | 解耦 Orchestrator 与 App/TUI，使后台执行不阻塞界面循环 |
+| [`provider`](https://github.com/gugugu5331/XAgent/tree/main/internal/provider) | Provider 接口、Anthropic/OpenAI-compatible Adapter、SSE 解码和统一 `ChatStream` | 把不同模型协议转换为相同的流事件、工具调用和 Usage |
+| [`prompt`](https://github.com/gugugu5331/XAgent/tree/main/internal/prompt) / [`resources`](https://github.com/gugugu5331/XAgent/tree/main/internal/resources) | 稳定块、动态块、Skill 目录、Hook 注入和内置提示资源 | 为 Provider 请求构造有顺序、有范围的系统上下文 |
+| [`tool`](https://github.com/gugugu5331/XAgent/tree/main/internal/tool) | Schema、Registry、只读/角色 View、Executor、结果工厂和内置工具 | 向模型暴露受限能力，把已授权调用变成文件、搜索和 Bash 操作，并在需要时将大结果外置为 Artifact |
+
+一次主任务由 App 提交给 Orchestrator；Orchestrator 调用 Provider 获得模型响应。如果响应包含工具调用，Orchestrator 再依次经过 Tool Registry、Permission 和 Executor 完成校验、授权与执行，并把结果写入 Conversation 后进入下一轮。Provider 只负责模型协议，不会直接调用 Tool Registry。Agent Loop 决定继续或以明确原因停止，所有进度通过 `events` 返回 App 和 TUI。
+
+### 6.3 状态、安全与扩展模块
+
+| 模块域 | 包 | 架构职责 |
+| --- | --- | --- |
+| 会话与上下文 | [`conversation`](https://github.com/gugugu5331/XAgent/tree/main/internal/conversation)、[`contextmgr`](https://github.com/gugugu5331/XAgent/tree/main/internal/contextmgr)、[`sessionctx`](https://github.com/gugugu5331/XAgent/tree/main/internal/sessionctx) | Conversation 保存消息与工具结果；Context Manager 计算预算、压缩和结果外置；Session Context 组合指令、记忆与稳定提示 |
+| 指令、记忆与大型结果 | [`instructions`](https://github.com/gugugu5331/XAgent/tree/main/internal/instructions)、[`memory`](https://github.com/gugugu5331/XAgent/tree/main/internal/memory)、[`artifact`](https://github.com/gugugu5331/XAgent/tree/main/internal/artifact) | 安全加载项目指令，维护可检索记忆，将大结果保存为不暴露真实路径的 Artifact 引用 |
+| 权限与文件边界 | [`permission`](https://github.com/gugugu5331/XAgent/tree/main/internal/permission)、[`safefs`](https://github.com/gugugu5331/XAgent/tree/main/internal/safefs)、[`matcher`](https://github.com/gugugu5331/XAgent/tree/main/internal/matcher) | Authorizer 给出 allow/deny/ask，Ticket 约束单次执行，SafeFS 校验根与路径身份，Matcher 提供确定性规则匹配 |
+| 进程、网络与资源 | [`proctree`](https://github.com/gugugu5331/XAgent/tree/main/internal/proctree)、[`netpolicy`](https://github.com/gugugu5331/XAgent/tree/main/internal/netpolicy)、[`budget`](https://github.com/gugugu5331/XAgent/tree/main/internal/budget)、[`redact`](https://github.com/gugugu5331/XAgent/tree/main/internal/redact) | 管理子进程取消与保护计划、限制网络端点、统一字节/条目预算，并在展示和持久化前脱敏 |
+| Skill | [`skill`](https://github.com/gugugu5331/XAgent/tree/main/internal/skill) | 发现并解析 Markdown SOP，生成不可变快照，按 shared/isolated 模式收窄模型和工具能力 |
+| Hook | [`hook`](https://github.com/gugugu5331/XAgent/tree/main/internal/hook) | 加载声明式生命周期规则，匹配事件并运行 Command、HTTP 或 Prompt 等动作；工具 Hook 仍不能绕过权限边界 |
+| MCP | [`mcpclient`](https://github.com/gugugu5331/XAgent/tree/main/internal/mcpclient) | 管理 stdio/HTTP 传输、JSON-RPC 会话、工具发现、命名、租约和关闭，并把远程工具注册进统一 Tool Registry |
+| 子 Agent | [`subagent`](https://github.com/gugugu5331/XAgent/tree/main/internal/subagent)、[`agentrole`](https://github.com/gugugu5331/XAgent/tree/main/internal/agentrole) | 管理 Defined/Fork 任务、队列、取消、事件、确认和 Result Inbox；角色快照决定模型、指令、工具和隔离声明 |
+| 任务隔离 | [`workspace`](https://github.com/gugugu5331/XAgent/tree/main/internal/workspace)、[`worktree`](https://github.com/gugugu5331/XAgent/tree/main/internal/worktree) | Workspace 按任务根重建工具、权限、Hook、指令和数据依赖；Worktree 管理 Git 隔离、租约、恢复、结算和保守清理 |
+
+### 6.4 基础支撑模块
+
+| 包 | 作用 |
+| --- | --- |
+| [`config`](https://github.com/gugugu5331/XAgent/tree/main/internal/config) | 解析分层配置、默认值和各模块运行参数，是启动装配的输入 |
+| [`diagnostics`](https://github.com/gugugu5331/XAgent/tree/main/internal/diagnostics) | 收集有界、可脱敏的诊断，不让错误信息本身成为泄漏或资源风险 |
+| [`repoaudit`](https://github.com/gugugu5331/XAgent/tree/main/internal/repoaudit) | 对仓库变更、保留成果和 Worktree 状态形成可验证的审计结果 |
+| [`testutil`](https://github.com/gugugu5331/XAgent/tree/main/internal/testutil) | 提供 Fake Provider、Conversation、Tool、Artifact 等测试夹具，不进入生产运行链 |
+
+模块拆分遵循四个原则：**Orchestrator 负责编排但不直接实现工具；Provider 只适配协议而不决定权限；所有副作用必须经过确定性治理；子 Agent 的能力和数据根必须按任务重新构造。** 这样新增模型、工具或扩展时，不需要把安全规则和状态管理复制到每个接入点。
+
+## 7. 可靠性保障与 Agent 评测
+
+XAgent 的评测分为两个层次：第一层验证运行时本身是否安全、稳定、可恢复；第二层评测模型与 XAgent 组合后，能否稳定完成真实任务。
+
+### 7.1 XAgent 如何保证可靠性
+
+XAgent 不把模型输出直接当成可执行命令，而是通过确定性运行时逐层校验和约束：
+
+```mermaid
+flowchart LR
+    M["模型意图"] --> V["工具与参数校验"]
+    V --> P["能力收窄与权限确认"]
+    P --> E["超时、输出和资源受限执行"]
+    E --> S["路径保护与结果脱敏"]
+    S --> R["状态记录、恢复或保守清理"]
+
+    classDef intent fill:#fff1f2,stroke:#fb7185,color:#881337,stroke-width:1.8px;
     classDef guard fill:#fff7ed,stroke:#fb923c,color:#7c2d12,stroke-width:1.5px;
     classDef execute fill:#ecfdf5,stroke:#10b981,color:#064e3b,stroke-width:1.5px;
     classDef recover fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a,stroke-width:1.5px;
     class M intent;
-    class S,W,P guard;
-    class E,F,R execute;
-    class C recover;
+    class V,P guard;
+    class E,S execute;
+    class R recover;
 ```
 
-| 防错机制 | 主要防止的问题 |
-| --- | --- |
-| 规格、计划、任务和验收清单 | 需求不清、边界遗漏、实现偏离目标 |
-| Schema、Registry、Permission、Ticket | 伪造工具、参数漂移、绕过确认 |
-| Workspace 最小能力 | 子 Agent 获得超出角色的工具 |
-| 状态机、锁和一次性结算 | 重复完成、取消竞态、重复清理 |
-| `safefs` 和 Worktree 身份记录 | 路径逃逸、符号链接风险、误删目录 |
-| 超时、队列和输出上限 | 死循环、工具卡死、资源无限增长 |
-| JSONL 恢复和 Artifact | 中断后数据丢失、上下文被大结果占满 |
-| SafeText、SafeError 和诊断 | 敏感信息泄漏或错误无法定位 |
-| 保守结算 | 状态不确定时误删用户成果 |
+项目通过单元测试、模块集成、并发与故障测试、真实 Git/Worktree 场景和平台差异测试验证这些机制。测试覆盖 Agent 核心、工具与安全、状态与恢复、协议与扩展、多 Agent 隔离、装配与终端体验六个方向，并重点检查超时、取消、损坏输入、竞态、资源上限和清理失败。
 
-### 5.1 常见异常如何处理
+当前可量化的工程数据如下：
 
-| 异常场景 | 系统处理方式 | 可靠性目标 |
+| 量化项 | 当前数据 | 含义 |
+| --- | ---: | --- |
+| 生产 Go 代码 | 371 个文件，80,560 行有效代码 | Agent Runtime 的实现规模 |
+| Go 测试代码 | 312 个文件，90,816 行有效代码 | 确定性测试资产规模 |
+| 测试与生产代码比 | 1.13:1，测试代码占 53.0% | 测试资产与生产实现的静态比例 |
+| 测试入口 | 1,583 个 Test、1 个 Fuzz、1 个 TestMain | 可独立执行的测试入口规模 |
+| 测试场景 | 6 类功能方向、8 类异常风险 | 当前测试覆盖的工程场景宽度 |
+
+这里的 **53.0% 是测试代码的静态占比，不是运行时覆盖率**。当前文档也没有把历史测试记录当作当前分支的通过证据；全量测试、Race、构建和语句覆盖率都需要在固定版本上实际执行后单独记录。详细测试说明见 [测试与可靠性保障](https://github.com/gugugu5331/XAgent/blob/main/docs/testing-reliability.md)。
+
+### 7.2 Agent 如何评测和量化能力（未来工作）
+
+> 以下是需要结合 XAgent 实际应用场景验证的初始方案。
+
+Agent 评测的对象是“模型 + Prompt + XAgent + 工具 + 运行环境”组成的完整系统，重点判断任务是否真正完成，以及过程是否安全、稳定、成本可控。
+
+```mermaid
+flowchart LR
+    A["选择真实任务"] --> B["定义验收规则"]
+    B --> C["隔离并重复执行"]
+    C --> D["自动检查 + 人工复核"]
+    D --> E["汇总指标并回归"]
+```
+
+实际执行流程如下：
+
+1. **建立任务集**：先选择 10～20 个真实场景，例如代码修改、缺陷修复、测试补充和文档生成；每个任务保存代码版本、输入要求、允许修改范围和预期结果。
+2. **定义验收规则**：提前明确测试或构建是否通过、目标文件是否正确、是否存在越界修改，以及哪些行为必须判为失败。
+3. **隔离重复执行**：在临时仓库或 Worktree 中将每个任务重复运行 3 次，并固定模型、Prompt、Skill 和工具版本；保存执行 Trace、代码 Diff、测试结果、耗时和 Token。
+4. **判定结果**：可自动验证的内容由测试、构建和 Diff 检查评分，无法自动判断的内容再人工复核。只要出现权限绕过、敏感信息泄漏、越界修改或误删成果，该次任务直接失败。
+5. **形成回归基线**：汇总任务成功率、重复稳定率、风险事件率和 P95 耗时/Token；版本升级后使用同一任务集重跑，失败案例补充到回归集。
+
+一次执行只有在功能验收通过且未触发安全硬门槛时，才记为成功。建议记录以下量化指标：
+
+| 量化指标 | 计算口径 | 主要说明 |
 | --- | --- | --- |
-| 模型请求不存在的工具或参数不合法 | 在执行前拒绝，并把结构化错误返回 Agent Loop | 不让无效意图变成真实副作用 |
-| 工具需要更高权限 | 根据规则请求用户确认；拒绝后以明确状态结束或继续 | 用户保留高风险操作的决定权 |
-| 工具执行超时或任务被取消 | 传播取消信号、约束子进程，并记录停止原因 | 避免后台任务失控或状态假完成 |
-| 工具输出过大 | 截断展示或外置到 Artifact，只把有界内容送入模型 | 避免界面、会话和上下文被单次结果撑满 |
-| 会话尾部损坏或写入中断 | 校验记录，只恢复可信前缀，不把损坏数据当成历史 | 在可恢复与不伪造状态之间取安全边界 |
-| 子 Agent 重复完成、超时与取消竞争 | 通过状态机和一次性结算只接受一个终态 | 防止重复通知、重复释放或状态回退 |
-| Worktree 中存在未提交或未知成果 | 不自动删除，保留目录和诊断信息 | 清理失败最多留下现场，不应误删成果 |
-| 敏感信息出现在错误或工具结果中 | 在持久化和展示边界使用安全文本与脱敏错误 | 降低凭证进入日志、会话或模型上下文的风险 |
+| **任务成功率** | 成功执行次数 ÷ 总执行次数 | Agent 完成真实任务的能力 |
+| **重复稳定率** | 连续 3 次全部成功的任务数 ÷ 任务总数 | 同一任务能否稳定复现成功结果 |
+| **验收检查通过率** | 所有执行中通过的预设功能检查项数 ÷ 所有执行中的预设功能检查项总数 | 测试、构建、目标文件等要求的完成程度；安全硬门槛单独计入风险 |
+| **非预期改动率** | 出现至少一次无关或越界修改的执行次数 ÷ 总执行次数 | Agent 是否只修改任务需要且允许修改的内容 |
+| **风险事件率** | 触发至少一次安全事件的执行次数 ÷ 总执行次数 | 权限绕过、敏感信息泄漏、越界修改、误删成果等风险；目标应为 0 |
+| **执行效率** | 统计 P50/P95 耗时、Token 和工具调用次数 | 衡量完成任务所需的时间与资源成本 |
 
-### 5.2 测试保障
-
-项目同时使用单元测试、模块集成、并发与故障测试、真实 Git 场景和平台差异测试。代码规模和主要覆盖方向见附录 A，完整说明见 [测试与可靠性保障](./testing-reliability.md)。
-
-### 5.3 信任边界
-
-- 模型、MCP metadata、工具参数、文件路径和持久化内容默认不可信。
-- Hook 是受信自动化，会从固定路径加载且不逐次确认；打开不可信项目之前必须审查。
-- `tool_before allow` 不能代替后续 Permission 和 Ticket。
-- Worktree 是工程隔离，不是操作系统沙箱。
-- 无法证明清理安全时，系统优先保留现场和用户成果。
+首轮评测先生成基线数据，不预设脱离场景的统一分数；后续版本使用同一任务集重跑，并检查成功率和稳定率是否下降、风险率是否上升、成本是否明显增加。方法参考美团技术团队的 [《Agent评测漫谈——由浅入深讲解 Agent 评测》](https://tech.meituan.com/2026/08/07/Agent-Evaluation.html)。
 
 ## 附录 A：代码规模
 
@@ -444,12 +595,12 @@ flowchart LR
 | 代码类型 | 文件数 | 有效代码行数 |
 | --- | ---: | ---: |
 | 生产代码 | 371 | **80,560** |
-| 测试代码 | 313 | **90,850** |
-| 合计 | 684 | **171,410** |
+| 测试代码 | 312 | **90,816** |
+| 合计 | 683 | **171,376** |
 
-测试代码约为生产代码的 **1.13 倍**，占核心 Go 有效代码的 **53.0%**。同一行同时包含代码和注释时仍计为代码，多行字符串中的非空内容按代码数据计入；代码行数不等同于测试覆盖率。
+测试代码约为生产代码的 **1.13 倍**，占核心 Go 有效代码的 **53.0%**。统计快照为 2026-08-17；同一行同时包含代码和注释时仍计为代码，多行字符串中的非空内容按代码数据计入。代码行数不等同于测试覆盖率。
 
-测试主要覆盖 **Agent 核心、工具与安全、状态与恢复、协议与扩展、多 Agent 隔离、装配与终端体验** 六个方面，并重点验证超时、取消、损坏输入、并发竞态、资源上限和清理失败等异常路径。详细设计、代表性测试和场景矩阵见 [测试与可靠性保障](./testing-reliability.md)。
+测试主要覆盖 **Agent 核心、工具与安全、状态与恢复、协议与扩展、多 Agent 隔离、装配与终端体验** 六个方面，并重点验证超时、取消、损坏输入、并发竞态、资源上限和清理失败等异常路径。详细设计、代表性测试和场景矩阵见 [测试与可靠性保障](https://github.com/gugugu5331/XAgent/blob/main/docs/testing-reliability.md)。
 
 ## 附录 B：相关设计资料
 
